@@ -1,0 +1,893 @@
+[manifest]
+name = "may2026-heat-transport"
+data_directory = "data/may2026"
+description = "Run manifest for May 2026 LAPD heat transport and radiative cooling experiments."
+
+[geometry]
+port_2_z_cm = 182.5
+port_spacing_cm = 31.95
+
+[acquisition]
+raw_sample_rate_hz = 100000000.0
+hardware_average_setting = 4
+hardware_average_samples = 16
+n_positions = 51
+n_shots_per_position = 20
+sample_rate_hz = 6250000.0
+sample_dt_s = 0.00000016
+notes = "Five SIS traces were sampled at 100 MS/s. HDF5 SIS3302 metadata stores Sample averaging (hardware)=4 for all runs; this is treated as a 16-sample hardware average. The first data axis is flattened as n_positions * n_shots_per_position."
+
+[experiment_sets."1"]
+label = "nice plasma"
+v_bank = 180.0
+v_puff = 76.4
+description = "Reference plasma condition; discharge voltage/current/power are derived from MSI discharge traces."
+runs = ["01", "02", "03", "04", "05", "06", "07", "08"]
+
+[experiment_sets."2"]
+label = "low bank 140 V"
+v_bank = 140.0
+v_puff = 76.4
+runs = ["21", "22", "23", "24", "25", "26", "27", "28"]
+
+[experiment_sets."3"]
+label = "low bank 100 V"
+v_bank = 100.0
+v_puff = 76.4
+runs = ["31", "32", "33", "34", "35", "36", "37", "38"]
+
+[experiment_sets."4"]
+label = "high puff 100 V bank"
+v_bank = 100.0
+v_puff = 110.0
+runs = ["41", "42", "43", "44", "45", "46", "47", "48"]
+
+[trace_defaults.reference_photodiode]
+hdf5_path = "Raw data + config/SIS crate/Light_Sweep [Slot 5: SIS 3302 ch 1]"
+multiplier = 1.0
+gain = 1.0
+attenuation = 1.0
+normalize_to = "moving_photodiode"
+notes = "Fixed reference photodiode; raw voltage is an arbitrary-unit light signal. Repeated shots can be averaged across an experiment set."
+
+[trace_defaults.moving_photodiode]
+hdf5_path = "Raw data + config/SIS crate/Light_Sweep [Slot 5: SIS 3302 ch 2]"
+multiplier = 1.0
+gain = 1.0
+attenuation = 1.0
+normalize_to = "moving_photodiode"
+notes = "Same physical photodiode moved between runs, fixed during each run. Repeated shots can be averaged within a run."
+
+[trace_defaults.isat]
+hdf5_path = "Raw data + config/SIS crate/Light_Sweep [Slot 7: SIS 3302 ch 1]"
+resistor_ohm = 45.0
+gain = 0.844
+attenuation = 1.0
+multiplier = 1.0
+notes = "Ion saturation current. Current = voltage * attenuation / resistor_ohm / gain."
+
+[trace_defaults.i_sweep]
+hdf5_path = "Raw data + config/SIS crate/Light_Sweep [Slot 7: SIS 3302 ch 2]"
+resistor_ohm = 1.0
+gain = 1.195
+attenuation = 1.0
+multiplier = 1.0
+notes = "Langmuir sweep current. Runs 42-48 override resistor_ohm to 3 ohm."
+
+[trace_defaults.v_sweep]
+hdf5_path = "Raw data + config/SIS crate/Light_Sweep [Slot 7: SIS 3302 ch 3]"
+gain = 1.0
+attenuation = 1.0
+multiplier = 100.0
+notes = "Langmuir sweep voltage. Voltage = trace voltage * 100."
+
+[runs."01"]
+experiment_set = 1
+file = "01_xline_p11_sweep_mach_light_rot0_nx51_dx1cm 2026-05-12 17.24.07.hdf5"
+langmuir_port = 11
+rotation_deg = 0
+[runs."01".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."01".traces.reference_photodiode]
+port = 16
+[runs."01".traces.moving_photodiode]
+port = 21
+[runs."01".traces.isat]
+port = 11
+[runs."01".traces.i_sweep]
+port = 11
+[runs."01".traces.v_sweep]
+port = 11
+
+[runs."02"]
+experiment_set = 1
+file = "02_xline_p21_sweep_mach_light_rot0_nx51_dx1cm 2026-05-12 20.23.24.hdf5"
+langmuir_port = 21
+rotation_deg = 0
+[runs."02".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."02".traces.reference_photodiode]
+port = 16
+[runs."02".traces.moving_photodiode]
+port = 26
+[runs."02".traces.isat]
+port = 21
+attenuation = 2.0
+[runs."02".traces.i_sweep]
+port = 21
+attenuation = 2.0
+[runs."02".traces.v_sweep]
+port = 21
+
+[runs."03"]
+experiment_set = 1
+file = "03_xline_p21_sweep_mach_light_rot180_nx51_dx1cm 2026-05-12 21.26.18.hdf5"
+langmuir_port = 21
+rotation_deg = 180
+[runs."03".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."03".traces.reference_photodiode]
+port = 16
+[runs."03".traces.moving_photodiode]
+port = 26
+[runs."03".traces.isat]
+port = 21
+attenuation = 2.0
+[runs."03".traces.i_sweep]
+port = 21
+attenuation = 2.0
+[runs."03".traces.v_sweep]
+port = 21
+
+[runs."04"]
+experiment_set = 1
+file = "04_xline_p29_sweep_mach_light_rot0_nx51_dx1cm 2026-05-12 23.27.51.hdf5"
+langmuir_port = 29
+rotation_deg = 0
+[runs."04".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."04".traces.reference_photodiode]
+port = 16
+[runs."04".traces.moving_photodiode]
+port = 32
+[runs."04".traces.isat]
+port = 29
+attenuation = 2.0
+[runs."04".traces.i_sweep]
+port = 29
+attenuation = 2.0
+[runs."04".traces.v_sweep]
+port = 29
+
+[runs."05"]
+experiment_set = 1
+file = "05_xline_p29_sweep_mach_light_rot180_nx51_dx1cm 2026-05-13 00.43.48.hdf5"
+langmuir_port = 29
+rotation_deg = 180
+[runs."05".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."05".traces.reference_photodiode]
+port = 16
+[runs."05".traces.moving_photodiode]
+port = 32
+[runs."05".traces.isat]
+port = 29
+attenuation = 2.0
+[runs."05".traces.i_sweep]
+port = 29
+attenuation = 2.0
+[runs."05".traces.v_sweep]
+port = 29
+
+[runs."06"]
+experiment_set = 1
+file = "06_xline_p41_sweep_mach_light_rot0_nx51_dx1cm 2026-05-13 02.16.31.hdf5"
+langmuir_port = 41
+rotation_deg = 0
+[runs."06".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."06".traces.reference_photodiode]
+port = 16
+[runs."06".traces.moving_photodiode]
+port = 44
+[runs."06".traces.isat]
+port = 41
+attenuation = 2.0
+[runs."06".traces.i_sweep]
+port = 41
+attenuation = 2.0
+[runs."06".traces.v_sweep]
+port = 41
+
+[runs."07"]
+experiment_set = 1
+file = "07_xline_p41_sweep_mach_light_rot180_nx51_dx1cm 2026-05-13 03.17.31.hdf5"
+langmuir_port = 41
+rotation_deg = 180
+[runs."07".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."07".traces.reference_photodiode]
+port = 16
+[runs."07".traces.moving_photodiode]
+port = 44
+[runs."07".traces.isat]
+port = 41
+attenuation = 2.0
+[runs."07".traces.i_sweep]
+port = 41
+attenuation = 2.0
+[runs."07".traces.v_sweep]
+port = 41
+
+[runs."08"]
+experiment_set = 1
+file = "08_xline_p50_sweep_mach_light_rot0_nx51_dx1cm 2026-05-13 04.53.51.hdf5"
+langmuir_port = 50
+rotation_deg = 0
+[runs."08".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."08".traces.reference_photodiode]
+port = 18
+[runs."08".traces.moving_photodiode]
+port = 16
+[runs."08".traces.isat]
+port = 50
+[runs."08".traces.i_sweep]
+port = 50
+[runs."08".traces.v_sweep]
+port = 50
+
+[runs."21"]
+experiment_set = 2
+file = "21_xline_p11_sweep_mach_light_rot0_nx51_dx1cm 2026-05-13 13.58.54.hdf5"
+langmuir_port = 11
+rotation_deg = 0
+[runs."21".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."21".traces.reference_photodiode]
+port = 18
+[runs."21".traces.moving_photodiode]
+port = 16
+[runs."21".traces.isat]
+port = 11
+[runs."21".traces.i_sweep]
+port = 11
+[runs."21".traces.v_sweep]
+port = 11
+
+[runs."22"]
+experiment_set = 2
+file = "22_xline_p21_sweep_mach_light_rot0_nx51_dx1cm 2026-05-13 15.20.00.hdf5"
+langmuir_port = 21
+rotation_deg = 0
+[runs."22".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."22".traces.reference_photodiode]
+port = 18
+[runs."22".traces.moving_photodiode]
+port = 21
+[runs."22".traces.isat]
+port = 21
+attenuation = 2.0
+[runs."22".traces.i_sweep]
+port = 21
+attenuation = 2.0
+[runs."22".traces.v_sweep]
+port = 21
+
+[runs."23"]
+experiment_set = 2
+file = "23_xline_p21_sweep_mach_light_rot180_nx51_dx1cm 2026-05-13 16.34.53.hdf5"
+langmuir_port = 21
+rotation_deg = 180
+[runs."23".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."23".traces.reference_photodiode]
+port = 18
+[runs."23".traces.moving_photodiode]
+port = 21
+[runs."23".traces.isat]
+port = 21
+attenuation = 2.0
+[runs."23".traces.i_sweep]
+port = 21
+attenuation = 2.0
+[runs."23".traces.v_sweep]
+port = 21
+
+[runs."24"]
+experiment_set = 2
+file = "24_xline_p29_sweep_mach_light_rot0_nx51_dx1cm 2026-05-13 17.58.55.hdf5"
+langmuir_port = 29
+rotation_deg = 0
+[runs."24".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."24".traces.reference_photodiode]
+port = 18
+[runs."24".traces.moving_photodiode]
+port = 26
+[runs."24".traces.isat]
+port = 29
+attenuation = 2.0
+[runs."24".traces.i_sweep]
+port = 29
+attenuation = 2.0
+[runs."24".traces.v_sweep]
+port = 29
+
+[runs."25"]
+experiment_set = 2
+file = "25_xline_p29_sweep_mach_light_rot180_nx51_dx1cm 2026-05-13 19.03.51.hdf5"
+langmuir_port = 29
+rotation_deg = 180
+[runs."25".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."25".traces.reference_photodiode]
+port = 18
+[runs."25".traces.moving_photodiode]
+port = 26
+[runs."25".traces.isat]
+port = 29
+attenuation = 2.0
+[runs."25".traces.i_sweep]
+port = 29
+attenuation = 2.0
+[runs."25".traces.v_sweep]
+port = 29
+
+[runs."26"]
+experiment_set = 2
+file = "26_xline_p41_sweep_mach_light_rot0_nx51_dx1cm 2026-05-13 21.26.14.hdf5"
+langmuir_port = 41
+rotation_deg = 0
+[runs."26".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."26".traces.reference_photodiode]
+port = 18
+[runs."26".traces.moving_photodiode]
+port = 32
+[runs."26".traces.isat]
+port = 41
+attenuation = 2.0
+[runs."26".traces.i_sweep]
+port = 41
+attenuation = 2.0
+[runs."26".traces.v_sweep]
+port = 41
+
+[runs."27"]
+experiment_set = 2
+file = "27_xline_p41_sweep_mach_light_rot180_nx51_dx1cm 2026-05-13 22.23.29.hdf5"
+langmuir_port = 41
+rotation_deg = 180
+[runs."27".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."27".traces.reference_photodiode]
+port = 18
+[runs."27".traces.moving_photodiode]
+port = 32
+[runs."27".traces.isat]
+port = 41
+attenuation = 2.0
+[runs."27".traces.i_sweep]
+port = 41
+attenuation = 2.0
+[runs."27".traces.v_sweep]
+port = 41
+
+[runs."28"]
+experiment_set = 2
+file = "28_xline_p50_sweep_mach_light_rot0_nx51_dx1cm 2026-05-13 23.45.08.hdf5"
+langmuir_port = 50
+rotation_deg = 0
+[runs."28".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.00025
+tau_cycle_s = 0.0005
+n_cycles = 40
+t0_s = 0.0
+[runs."28".traces.reference_photodiode]
+port = 18
+[runs."28".traces.moving_photodiode]
+port = 44
+[runs."28".traces.isat]
+port = 50
+[runs."28".traces.i_sweep]
+port = 50
+[runs."28".traces.v_sweep]
+port = 50
+
+[runs."31"]
+experiment_set = 3
+file = "31_xline_p11_sweep_mach_light_rot0_nx51_dx1cm 2026-05-14 13.05.19.hdf5"
+langmuir_port = 11
+rotation_deg = 0
+[runs."31".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."31".traces.reference_photodiode]
+port = 18
+[runs."31".traces.moving_photodiode]
+port = 16
+[runs."31".traces.isat]
+port = 11
+[runs."31".traces.i_sweep]
+port = 11
+[runs."31".traces.v_sweep]
+port = 11
+
+[runs."32"]
+experiment_set = 3
+file = "32_xline_p21_sweep_mach_light_rot0_nx51_dx1cm 2026-05-14 14.16.42.hdf5"
+langmuir_port = 21
+rotation_deg = 0
+[runs."32".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."32".traces.reference_photodiode]
+port = 18
+[runs."32".traces.moving_photodiode]
+port = 21
+[runs."32".traces.isat]
+port = 21
+attenuation = 2.0
+[runs."32".traces.i_sweep]
+port = 21
+attenuation = 2.0
+[runs."32".traces.v_sweep]
+port = 21
+
+[runs."33"]
+experiment_set = 3
+file = "33_xline_p21_sweep_mach_light_rot180_nx51_dx1cm 2026-05-14 15.15.21.hdf5"
+langmuir_port = 21
+rotation_deg = 180
+[runs."33".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."33".traces.reference_photodiode]
+port = 18
+[runs."33".traces.moving_photodiode]
+port = 21
+[runs."33".traces.isat]
+port = 21
+attenuation = 2.0
+[runs."33".traces.i_sweep]
+port = 21
+attenuation = 2.0
+[runs."33".traces.v_sweep]
+port = 21
+
+[runs."34"]
+experiment_set = 3
+file = "34_xline_p29_sweep_mach_light_rot0_nx51_dx1cm 2026-05-14 16.40.43.hdf5"
+langmuir_port = 29
+rotation_deg = 0
+[runs."34".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."34".traces.reference_photodiode]
+port = 18
+[runs."34".traces.moving_photodiode]
+port = 26
+[runs."34".traces.isat]
+port = 29
+attenuation = 2.0
+[runs."34".traces.i_sweep]
+port = 29
+attenuation = 2.0
+[runs."34".traces.v_sweep]
+port = 29
+
+[runs."35"]
+experiment_set = 3
+file = "35_xline_p29_sweep_mach_light_rot180_nx51_dx1cm 2026-05-14 17.37.45.hdf5"
+langmuir_port = 29
+rotation_deg = 180
+[runs."35".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."35".traces.reference_photodiode]
+port = 18
+[runs."35".traces.moving_photodiode]
+port = 26
+[runs."35".traces.isat]
+port = 29
+attenuation = 2.0
+[runs."35".traces.i_sweep]
+port = 29
+attenuation = 2.0
+[runs."35".traces.v_sweep]
+port = 29
+
+[runs."36"]
+experiment_set = 3
+file = "36_xline_p41_sweep_mach_light_rot0_nx51_dx1cm 2026-05-14 18.57.17.hdf5"
+langmuir_port = 41
+rotation_deg = 0
+[runs."36".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."36".traces.reference_photodiode]
+port = 18
+[runs."36".traces.moving_photodiode]
+port = 32
+[runs."36".traces.isat]
+port = 41
+attenuation = 2.0
+[runs."36".traces.i_sweep]
+port = 41
+attenuation = 2.0
+[runs."36".traces.v_sweep]
+port = 41
+
+[runs."37"]
+experiment_set = 3
+file = "37_xline_p41_sweep_mach_light_rot180_nx51_dx1cm 2026-05-14 19.59.18.hdf5"
+langmuir_port = 41
+rotation_deg = 180
+[runs."37".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."37".traces.reference_photodiode]
+port = 18
+[runs."37".traces.moving_photodiode]
+port = 32
+[runs."37".traces.isat]
+port = 41
+attenuation = 2.0
+[runs."37".traces.i_sweep]
+port = 41
+attenuation = 2.0
+[runs."37".traces.v_sweep]
+port = 41
+
+[runs."38"]
+experiment_set = 3
+file = "38_xline_p50_sweep_mach_light_rot0_nx51_dx1cm 2026-05-14 21.36.18.hdf5"
+langmuir_port = 50
+rotation_deg = 0
+[runs."38".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."38".traces.reference_photodiode]
+port = 18
+[runs."38".traces.moving_photodiode]
+port = 44
+[runs."38".traces.isat]
+port = 50
+[runs."38".traces.i_sweep]
+port = 50
+[runs."38".traces.v_sweep]
+port = 50
+
+[runs."41"]
+experiment_set = 4
+file = "41_xline_p11_sweep_mach_light_rot0_nx51_dx1cm 2026-05-15 12.48.31.hdf5"
+langmuir_port = 11
+rotation_deg = 0
+[runs."41".sweep]
+ramp_voltage = 75.0
+voltage_start = -75.0
+voltage_end = 75.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."41".traces.reference_photodiode]
+port = 18
+[runs."41".traces.moving_photodiode]
+port = 16
+[runs."41".traces.isat]
+port = 11
+[runs."41".traces.i_sweep]
+port = 11
+[runs."41".traces.v_sweep]
+port = 11
+
+[runs."42"]
+experiment_set = 4
+file = "42_xline_p21_sweep_mach_light_rot0_nx51_dx1cm 2026-05-15 14.20.23.hdf5"
+langmuir_port = 21
+rotation_deg = 0
+[runs."42".sweep]
+ramp_voltage = 20.0
+voltage_start = -20.0
+voltage_end = 20.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."42".traces.reference_photodiode]
+port = 18
+[runs."42".traces.moving_photodiode]
+port = 21
+[runs."42".traces.isat]
+port = 21
+[runs."42".traces.i_sweep]
+port = 21
+resistor_ohm = 3.0
+[runs."42".traces.v_sweep]
+port = 21
+
+[runs."43"]
+experiment_set = 4
+file = "43_xline_p21_sweep_mach_light_rot180_nx51_dx1cm 2026-05-15 15.21.24.hdf5"
+langmuir_port = 21
+rotation_deg = 180
+[runs."43".sweep]
+ramp_voltage = 20.0
+voltage_start = -20.0
+voltage_end = 20.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."43".traces.reference_photodiode]
+port = 18
+[runs."43".traces.moving_photodiode]
+port = 21
+[runs."43".traces.isat]
+port = 21
+[runs."43".traces.i_sweep]
+port = 21
+resistor_ohm = 3.0
+[runs."43".traces.v_sweep]
+port = 21
+
+[runs."44"]
+experiment_set = 4
+file = "44_xline_p29_sweep_mach_light_rot0_nx51_dx1cm 2026-05-15 16.34.13.hdf5"
+langmuir_port = 29
+rotation_deg = 0
+[runs."44".sweep]
+ramp_voltage = 20.0
+voltage_start = -20.0
+voltage_end = 20.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."44".traces.reference_photodiode]
+port = 18
+[runs."44".traces.moving_photodiode]
+port = 26
+[runs."44".traces.isat]
+port = 29
+[runs."44".traces.i_sweep]
+port = 29
+resistor_ohm = 3.0
+[runs."44".traces.v_sweep]
+port = 29
+
+[runs."45"]
+experiment_set = 4
+file = "45_xline_p29_sweep_mach_light_rot180_nx51_dx1cm 2026-05-15 17.30.42.hdf5"
+langmuir_port = 29
+rotation_deg = 180
+[runs."45".sweep]
+ramp_voltage = 20.0
+voltage_start = -20.0
+voltage_end = 20.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."45".traces.reference_photodiode]
+port = 18
+[runs."45".traces.moving_photodiode]
+port = 26
+[runs."45".traces.isat]
+port = 29
+[runs."45".traces.i_sweep]
+port = 29
+resistor_ohm = 3.0
+[runs."45".traces.v_sweep]
+port = 29
+
+[runs."46"]
+experiment_set = 4
+file = "46_xline_p41_sweep_mach_light_rot0_nx51_dx1cm 2026-05-15 19.05.13.hdf5"
+langmuir_port = 41
+rotation_deg = 0
+[runs."46".sweep]
+ramp_voltage = 20.0
+voltage_start = -20.0
+voltage_end = 20.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."46".traces.reference_photodiode]
+port = 18
+[runs."46".traces.moving_photodiode]
+port = 32
+[runs."46".traces.isat]
+port = 41
+[runs."46".traces.i_sweep]
+port = 41
+resistor_ohm = 3.0
+[runs."46".traces.v_sweep]
+port = 41
+
+[runs."47"]
+experiment_set = 4
+file = "47_xline_p41_sweep_mach_light_rot180_nx51_dx1cm 2026-05-15 20.06.01.hdf5"
+langmuir_port = 41
+rotation_deg = 180
+[runs."47".sweep]
+ramp_voltage = 20.0
+voltage_start = -20.0
+voltage_end = 20.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."47".traces.reference_photodiode]
+port = 18
+[runs."47".traces.moving_photodiode]
+port = 32
+[runs."47".traces.isat]
+port = 41
+[runs."47".traces.i_sweep]
+port = 41
+resistor_ohm = 3.0
+[runs."47".traces.v_sweep]
+port = 41
+
+[runs."48"]
+experiment_set = 4
+file = "48_xline_p50_sweep_mach_light_rot0_nx51_dx1cm 2026-05-15 21.33.37.hdf5"
+langmuir_port = 50
+rotation_deg = 0
+[runs."48".sweep]
+ramp_voltage = 20.0
+voltage_start = -20.0
+voltage_end = 20.0
+tau_ramp_s = 0.0005
+tau_cycle_s = 0.001
+n_cycles = 20
+t0_s = 0.0
+[runs."48".traces.reference_photodiode]
+port = 18
+[runs."48".traces.moving_photodiode]
+port = 44
+[runs."48".traces.isat]
+port = 50
+[runs."48".traces.i_sweep]
+port = 50
+resistor_ohm = 3.0
+[runs."48".traces.v_sweep]
+port = 50

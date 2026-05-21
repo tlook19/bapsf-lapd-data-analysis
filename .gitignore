@@ -1,0 +1,20 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.venv/
+.matplotlib/
+build/
+dist/
+*.egg-info/
+
+# LAPD HDF5 data files are large and should remain local.
+data/may2026/*.hdf5
+data/**/*.h5
+data/**/*.hdf5
+
+# Generated figures and Claude session data.
+figures/
+.claude/

@@ -1,0 +1,10 @@
+name: bapsf-lapd-data-analysis
+channels:
+  - conda-forge
+dependencies:
+  - python>=3.14
+  - numpy
+  - scipy
+  - matplotlib
+  - h5py
+  - pytest

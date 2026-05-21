@@ -1,0 +1,2 @@
+run_id,flat_shot,position_index,shot_index,cycle,severity,flag_codes,te_log_ev,te_exp_ev,vp_derivative_v,vp_log_v,vp_exp_v,fit_window_width_v,fit_sample_count,rms_residual_a,max_abs_residual_a,max_jump_a,arc_like_sample_count,error
+46,510,25,10,18,ok,,0.6737679317692382,0.9318572694040286,0.5998996807264584,0.9098029914789194,0.9884363217483068,1.5270481012770316,128,0.0008110933075344851,0.001819588228838832,0.00011784127872322553,0,
