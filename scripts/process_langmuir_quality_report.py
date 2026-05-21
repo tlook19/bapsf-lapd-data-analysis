@@ -1,4 +1,23 @@
-"""Generate Langmuir sweep quality-control reports."""
+"""Generate Langmuir sweep quality-control reports.
+
+Iterates over one or more runs from the May 2026 manifest and writes one CSV
+row per (run, flat_shot, cycle) to the output file.  Pass --run-ids all to
+process every run in the manifest in a single invocation; the CSV is written
+incrementally so a full-dataset run does not hold all rows in memory at once.
+
+Usage examples
+--------------
+# One run, default sampled shots and one cycle (fast smoke-test)
+python scripts/process_langmuir_quality_report.py --run-ids 46
+
+# All runs, five evenly-spaced shots, two cycles
+python scripts/process_langmuir_quality_report.py \\
+    --run-ids all --flat-shots "0,255,510,765,1019" --cycles "0,10"
+
+# Full analysis -- all runs, all positions, all shots, all cycles (long-running)
+python scripts/process_langmuir_quality_report.py \\
+    --run-ids all --flat-shots all --cycles all
+"""
 
 from __future__ import annotations
 
@@ -13,6 +32,7 @@ import numpy as np
 from bapsf_lapd import (
     ChannelKind,
     LapdDataset,
+    LapdRun,
     analyze_langmuir_sweep,
     butterworth_lowpass,
     evaluate_langmuir_quality,
@@ -65,12 +85,21 @@ def _parse_indices(value: str, *, max_value: int | None = None) -> list[int]:
     return sorted(dict.fromkeys(indices))
 
 
-def _load_cycle(run, channel: ChannelKind, flat_shot: int, cycle: int, clip_s: float) -> np.ndarray:
+def _parse_run_ids(value: str, dataset: LapdDataset) -> list[str]:
+    """Return a sorted list of run IDs from a comma-separated string or 'all'."""
+    if value == "all":
+        return dataset.run_ids()
+    return sorted(dict.fromkeys(v.strip() for v in value.split(",") if v.strip()))
+
+
+def _load_cycle(run: LapdRun, channel: ChannelKind, flat_shot: int, cycle: int, clip_s: float) -> np.ndarray:
     ramp_slice = run.sweep_ramp_sample_slices(clip_s=clip_s)[cycle]
     return run.trace(channel, flat_shot, ramp_slice).astype(np.float64)
 
 
-def _filtered_cycle(run, flat_shot: int, cycle: int, clip_us: float, cutoff_khz: float, order: int):
+def _filtered_cycle(
+    run: LapdRun, flat_shot: int, cycle: int, clip_us: float, cutoff_khz: float, order: int
+) -> tuple[np.ndarray, np.ndarray]:
     clip_s = clip_us * 1e-6
     current = _load_cycle(run, ChannelKind.I_SWEEP, flat_shot, cycle, clip_s)
     voltage = _load_cycle(run, ChannelKind.V_SWEEP, flat_shot, cycle, clip_s)
@@ -89,7 +118,9 @@ def _filtered_cycle(run, flat_shot: int, cycle: int, clip_us: float, cutoff_khz:
     return voltage, current
 
 
-def _peer_currents(run, flat_shot: int, cycle: int, clip_us: float, cutoff_khz: float, order: int) -> np.ndarray:
+def _peer_currents(
+    run: LapdRun, flat_shot: int, cycle: int, clip_us: float, cutoff_khz: float, order: int
+) -> np.ndarray:
     position_index = flat_shot // run.shots_per_position()
     clip_s = clip_us * 1e-6
     ramp_slice = run.sweep_ramp_sample_slices(clip_s=clip_s)[cycle]
@@ -109,6 +140,7 @@ def _peer_currents(run, flat_shot: int, cycle: int, clip_us: float, cutoff_khz: 
 
 def build_rows(
     *,
+    run: LapdRun,
     run_id: str,
     flat_shots: list[int],
     cycles: list[int],
@@ -116,8 +148,11 @@ def build_rows(
     cutoff_khz: float,
     order: int,
 ) -> list[QualityRow]:
-    dataset = LapdDataset.from_manifest(MANIFEST)
-    run = dataset.run(run_id)
+    """Analyze every requested (flat_shot, cycle) pair for one run.
+
+    Accepts a pre-loaded LapdRun so that callers iterating over multiple runs
+    can manage dataset loading themselves without redundant HDF5 opens.
+    """
     rows: list[QualityRow] = []
     for flat_shot in flat_shots:
         position_index = flat_shot // run.shots_per_position()
@@ -182,24 +217,19 @@ def build_rows(
     return rows
 
 
-def write_csv(rows: list[QualityRow], output: Path) -> None:
-    output.parent.mkdir(parents=True, exist_ok=True)
-    with output.open("w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=list(rows[0].__dict__))
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(row.__dict__)
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--run-id", default="46")
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument(
+        "--run-ids",
+        default="46",
+        help="Comma-separated run IDs like 01,46 or 'all' for every run in the manifest.",
+    )
     parser.add_argument(
         "--flat-shots",
         default="0,255,510,765,1019",
-        help="Comma list/ranges like 0,510 or 0:1020:20, or all.",
+        help="Comma list/ranges like 0,510 or 0:1020:20, or 'all'.",
     )
-    parser.add_argument("--cycles", default="18", help="Comma list/ranges like 0,18 or all.")
+    parser.add_argument("--cycles", default="18", help="Comma list/ranges like 0,18 or 'all'.")
     parser.add_argument("--clip-us", type=float, default=10.0)
     parser.add_argument("--cutoff-khz", type=float, default=100.0)
     parser.add_argument("--order", type=int, default=4)
@@ -207,21 +237,40 @@ def main() -> None:
     args = parser.parse_args()
 
     dataset = LapdDataset.from_manifest(MANIFEST)
-    run = dataset.run(args.run_id)
-    flat_shots = _parse_indices(args.flat_shots, max_value=run.expected_flat_shot_count())
-    cycles = _parse_indices(args.cycles, max_value=run.config.sweep.n_cycles)
-    rows = build_rows(
-        run_id=args.run_id,
-        flat_shots=flat_shots,
-        cycles=cycles,
-        clip_us=args.clip_us,
-        cutoff_khz=args.cutoff_khz,
-        order=args.order,
-    )
-    write_csv(rows, args.output)
-    severity_counts = {severity: sum(row.severity == severity for row in rows) for severity in ["ok", "warn", "bad"]}
-    sys.stdout.write(f"Wrote {args.output}\n")
-    sys.stdout.write(f"Severity counts: {severity_counts}\n")
+    run_ids = _parse_run_ids(args.run_ids, dataset)
+
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    total_counts: dict[str, int] = {"ok": 0, "warn": 0, "bad": 0}
+    writer: csv.DictWriter | None = None
+
+    with args.output.open("w", newline="") as f:
+        for run_id in run_ids:
+            run = dataset.run(run_id)
+            flat_shots = _parse_indices(args.flat_shots, max_value=run.expected_flat_shot_count())
+            cycles = _parse_indices(args.cycles, max_value=run.config.sweep.n_cycles)
+            rows = build_rows(
+                run=run,
+                run_id=run_id,
+                flat_shots=flat_shots,
+                cycles=cycles,
+                clip_us=args.clip_us,
+                cutoff_khz=args.cutoff_khz,
+                order=args.order,
+            )
+            if writer is None:
+                writer = csv.DictWriter(f, fieldnames=list(QualityRow.__dataclass_fields__))
+                writer.writeheader()
+            if writer is not None:
+                for row in rows:
+                    writer.writerow(row.__dict__)
+            f.flush()
+            counts = {s: sum(r.severity == s for r in rows) for s in ("ok", "warn", "bad")}
+            for s in counts:
+                total_counts[s] += counts[s]
+            sys.stdout.write(f"run {run_id}: {counts}\n")
+
+    sys.stdout.write(f"\nWrote {args.output}  ({sum(total_counts.values())} rows)\n")
+    sys.stdout.write(f"Total severity counts: {total_counts}\n")
 
 
 if __name__ == "__main__":
