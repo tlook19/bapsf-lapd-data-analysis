@@ -226,6 +226,11 @@ def main() -> None:
     parser.add_argument("--cutoff-khz", type=float, default=100.0, help="Low-pass filter cutoff (kHz).")
     parser.add_argument("--order", type=int, default=4, help="Butterworth filter order.")
     parser.add_argument("--output", type=Path, default=HDF5_OUTPUT)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Append to an existing HDF5 and skip runs that are already complete.",
+    )
     args = parser.parse_args()
 
     dataset = LapdDataset.from_manifest(MANIFEST)
@@ -235,22 +240,42 @@ def main() -> None:
         run_ids = sorted(v.strip() for v in args.run_ids.split(",") if v.strip())
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    file_mode = "a" if (args.resume and args.output.exists()) else "w"
 
-    with h5py.File(args.output, "w") as hf:
-        ds = hf.create_dataset("x_cm", data=X_CM)
-        ds.attrs["description"] = (
-            "Probe scan positions: 51 points from -25 to +25 cm, 1 cm spacing, centered at x=0"
-        )
-
-        es_grp = hf.create_group("experiment_sets")
+    with h5py.File(args.output, file_mode) as hf:
+        if "x_cm" not in hf:
+            ds = hf.create_dataset("x_cm", data=X_CM)
+            ds.attrs["description"] = (
+                "Probe scan positions: 51 points from -25 to +25 cm, 1 cm spacing, centered at x=0"
+            )
+        if "experiment_sets" not in hf:
+            hf.create_group("experiment_sets")
+        es_grp = hf["experiment_sets"]
 
         total_ok = total_warn = total_bad = 0
         for run_id in run_ids:
             cfg = dataset.config(run_id)
-            run = dataset.run(run_id)
             exp_set = cfg.experiment_set
             es_id = str(exp_set.id)
 
+            # Skip runs already fully written (presence of cycle_time_s is the
+            # completion marker — it is the last dataset written per run).
+            if (
+                args.resume
+                and es_id in es_grp
+                and run_id in es_grp[es_id]
+                and "cycle_time_s" in es_grp[es_id][run_id]
+            ):
+                sys.stdout.write(f"run {run_id}  — already complete, skipping\n")
+                n_ok = int(es_grp[es_id][run_id]["n_ok"][:].sum())
+                n_warn = int(es_grp[es_id][run_id]["n_warn"][:].sum())
+                n_bad = int(es_grp[es_id][run_id]["n_bad"][:].sum())
+                total_ok += n_ok
+                total_warn += n_warn
+                total_bad += n_bad
+                continue
+
+            # Create experiment-set group if this is the first run in the set.
             if es_id not in es_grp:
                 g = es_grp.create_group(es_id)
                 g.attrs["label"] = exp_set.label
@@ -259,6 +284,11 @@ def main() -> None:
                 if exp_set.description:
                     g.attrs["description"] = exp_set.description
 
+            # Remove a partially-written run group before reprocessing.
+            if run_id in es_grp[es_id]:
+                del es_grp[es_id][run_id]
+
+            run = dataset.run(run_id)
             rot = cfg.probe.rotation_deg
             sys.stdout.write(
                 f"run {run_id}  exp_set={es_id}  port={cfg.probe.port}"
@@ -275,6 +305,9 @@ def main() -> None:
             run_grp.attrs["z_cm"] = float(cfg.probe.z_cm)
             run_grp.attrs["experiment_set_id"] = int(exp_set.id)
             _write_run_group(run_grp, result)
+
+            # Flush after each run so completed work survives a crash.
+            hf.flush()
 
             n_ok = int(result["n_ok"].sum())
             n_warn = int(result["n_warn"].sum())
