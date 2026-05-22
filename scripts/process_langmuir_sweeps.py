@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 
 import h5py
@@ -190,7 +191,8 @@ def _process_run(
     result: dict = {"cycle_time_s": _cycle_start_times(run)}
     for q in QUANTITIES:
         arr = per_shot[q]  # (n_pos, n_shots, n_cycles)
-        with np.errstate(all="ignore"):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
             mean = np.nanmean(arr, axis=1)
             std = np.nanstd(arr, axis=1, ddof=1)
             n_finite = np.isfinite(arr).sum(axis=1)
