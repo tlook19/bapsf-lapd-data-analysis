@@ -34,7 +34,8 @@ class LogLinearFit:
     cost: float
 
     def electron_current(self, voltage: np.ndarray) -> np.ndarray:
-        return np.exp(self.intercept + self.slope * voltage)
+        exponent = np.clip(self.intercept + self.slope * voltage, -700, 700)
+        return np.exp(exponent)
 
 
 @dataclass(frozen=True)
@@ -277,7 +278,8 @@ def _intersection(
         return None
 
     # Prefer the crossing closest to the strongest slope in the I-V curve.
-    derivative_v = grid[np.nanargmax(np.gradient(values, grid))]
+    with np.errstate(invalid="ignore"):
+        derivative_v = grid[np.nanargmax(np.gradient(values, grid))]
     best_index = min(sign_changes, key=lambda idx: abs(grid[idx] - derivative_v))
     try:
         return float(optimize.brentq(difference, grid[best_index], grid[best_index + 1]))
@@ -319,7 +321,8 @@ def analyze_langmuir_sweep(
         smoothed_current = signal.savgol_filter(current, smooth_window, polyorder=2)
     else:
         smoothed_current = current
-    derivative = np.gradient(smoothed_current, voltage)
+    with np.errstate(invalid="ignore"):
+        derivative = np.gradient(smoothed_current, voltage)
     derivative_region = (voltage > np.nanquantile(voltage, 0.15)) & (voltage < np.nanquantile(voltage, 0.92))
     derivative_indices = np.flatnonzero(derivative_region)
     plasma_potential_derivative_v = float(voltage[derivative_indices[np.nanargmax(derivative[derivative_indices])]])

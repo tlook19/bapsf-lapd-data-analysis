@@ -91,6 +91,47 @@ _SEV_WARN = 1
 _SEV_BAD = 2
 _SEV_MAP = {"ok": _SEV_OK, "warn": _SEV_WARN, "bad": _SEV_BAD}
 
+# Filter cutoff policy constants.
+# Edge positions are |x| > EDGE_X_CM; they get a higher filter cutoff to
+# resolve potentially sub-eV temperatures.
+EDGE_X_CM = 10.0          # cm; probe positions outside this are "edge"
+TE_MIN_EV = 0.5           # eV; design target for cold-region resolution
+HE_VP_VF_FACTOR = 4.45    # V_p − V_f ≈ 4.45 × T_e for He⁺
+FILTER_SMEAR_FRACTION = 0.30  # allow at most this fraction of retarding window
+
+
+def _sweep_rate_vs(sweep) -> float:
+    """Total voltage excursion divided by ramp duration (V/s)."""
+    return (sweep.voltage_end - sweep.voltage_start) / sweep.tau_ramp_s
+
+
+def _min_cutoff_hz(sweep_rate_vs: float, te_min_ev: float = TE_MIN_EV) -> float:
+    """Minimum filter cutoff to resolve T_e >= te_min_ev.
+
+    Derived from δV_filter = sweep_rate / (2π f_c) < frac × (V_p − V_f),
+    where V_p − V_f = HE_VP_VF_FACTOR × T_e for helium.
+    """
+    window_v = HE_VP_VF_FACTOR * te_min_ev
+    return sweep_rate_vs / (2.0 * np.pi * FILTER_SMEAR_FRACTION * window_v)
+
+
+def _cutoff_hz_for_run(run: LapdRun, base_cutoff_hz: float) -> tuple[float, float]:
+    """Return (core_cutoff_hz, edge_cutoff_hz) for this run.
+
+    Runs at p50 or p11 in ES4 (expected cold plasma throughout) get the
+    higher cutoff applied to *all* positions.  All other runs use the base
+    cutoff in the core and the higher cutoff at the plasma edge (|x| > EDGE_X_CM).
+    """
+    rate = _sweep_rate_vs(run.config.sweep)
+    high = max(base_cutoff_hz, _min_cutoff_hz(rate))
+
+    cfg = run.config
+    is_p50 = cfg.probe.port == 50
+    is_p11_es4 = cfg.probe.port == 11 and cfg.experiment_set.id == 4
+    if is_p50 or is_p11_es4:
+        return high, high
+    return base_cutoff_hz, high
+
 
 def _cycle_start_times(run: LapdRun) -> np.ndarray:
     """Return the time at the start of each ramp, before any clip offset."""
@@ -102,25 +143,36 @@ def _process_run(
     run: LapdRun,
     *,
     clip_us: float,
-    cutoff_khz: float,
+    base_cutoff_hz: float,
     order: int,
 ) -> dict:
     """Compute position-averaged Langmuir results for every cycle in one run.
 
-    Loads data in bulk per cycle (one HDF5 read per channel per cycle) and
-    applies the Butterworth filter across all 1020 shots at once to avoid
-    redundant I/O and filter setup.
+    Loads data in bulk per cycle (one HDF5 read per channel per cycle).
+    Applies position-group-dependent Butterworth cutoffs: a higher cutoff is
+    used at plasma-edge positions (|x| > EDGE_X_CM) and for p50 / p11-ES4
+    runs throughout, to resolve potentially sub-eV electron temperatures.
+
+    Fitting is done per individual shot before averaging, so shot-to-shot
+    V_plasma fluctuations do not smear the I-V transition in the fit.
 
     Returns a dict whose values are numpy arrays:
       cycle_time_s              (n_cycles,)
       {qty}, {qty}_std,         (n_positions, n_cycles) for each qty in
       {qty}_sem                 QUANTITIES
       n_ok, n_warn, n_bad       (n_positions, n_cycles)  int32
+      cutoff_core_khz           scalar — filter cutoff used at core positions
+      cutoff_edge_khz           scalar — filter cutoff used at edge positions
     """
     n_pos = run.position_count()      # 51
     n_shots = run.shots_per_position()  # 20
     n_cycles = run.config.sweep.n_cycles
     clip_s = clip_us * 1e-6
+
+    core_cutoff_hz, edge_cutoff_hz = _cutoff_hz_for_run(run, base_cutoff_hz)
+    edge_mask = np.abs(X_CM) > EDGE_X_CM          # bool (n_pos,)
+    core_idx = np.where(~edge_mask)[0]
+    edge_idx = np.where(edge_mask)[0]
 
     # Pre-compute zero offsets once (two HDF5 reads total).
     i_offset = run.default_zero_offset_v(ChannelKind.I_SWEEP)
@@ -132,6 +184,8 @@ def _process_run(
     per_shot = {q: np.full((n_pos, n_shots, n_cycles), np.nan) for q in QUANTITIES}
     sev_grid = np.full((n_pos, n_shots, n_cycles), _SEV_BAD, dtype=np.int8)
 
+    sr = run.sample_rate_hz()
+
     for cyc_idx, ramp_slice in enumerate(ramp_slices):
         # Load and calibrate the full (n_pos, n_shots, n_ramp_samples) block.
         # langmuir_traces applies the SIS Scale/Offset headers, the zero-offset
@@ -139,11 +193,25 @@ def _process_run(
         i_all = run.langmuir_traces(ChannelKind.I_SWEEP, ramp_slice, zero_offset_v=i_offset)
         v_all = run.langmuir_traces(ChannelKind.V_SWEEP, ramp_slice, zero_offset_v=v_offset)
 
-        # Filter the entire block at once along the sample axis.
-        sr = run.sample_rate_hz()
-        cutoff = cutoff_khz * 1e3
-        i_filt = butterworth_lowpass(i_all, sample_rate_hz=sr, cutoff_hz=cutoff, order=order, axis=-1)
-        v_filt = butterworth_lowpass(v_all, sample_rate_hz=sr, cutoff_hz=cutoff, order=order, axis=-1)
+        # Apply position-dependent cutoffs.  When core and edge cutoffs are
+        # equal (p50, p11-ES4, or ES3/ES4 where min-cutoff ≤ base), filter
+        # the whole block at once; otherwise filter each group separately.
+        if core_cutoff_hz == edge_cutoff_hz:
+            i_filt = butterworth_lowpass(i_all, sample_rate_hz=sr, cutoff_hz=core_cutoff_hz,
+                                         order=order, axis=-1)
+            v_filt = butterworth_lowpass(v_all, sample_rate_hz=sr, cutoff_hz=core_cutoff_hz,
+                                         order=order, axis=-1)
+        else:
+            i_filt = np.empty_like(i_all)
+            v_filt = np.empty_like(v_all)
+            i_filt[core_idx] = butterworth_lowpass(i_all[core_idx], sample_rate_hz=sr,
+                                                    cutoff_hz=core_cutoff_hz, order=order, axis=-1)
+            v_filt[core_idx] = butterworth_lowpass(v_all[core_idx], sample_rate_hz=sr,
+                                                    cutoff_hz=core_cutoff_hz, order=order, axis=-1)
+            i_filt[edge_idx] = butterworth_lowpass(i_all[edge_idx], sample_rate_hz=sr,
+                                                    cutoff_hz=edge_cutoff_hz, order=order, axis=-1)
+            v_filt[edge_idx] = butterworth_lowpass(v_all[edge_idx], sample_rate_hz=sr,
+                                                    cutoff_hz=edge_cutoff_hz, order=order, axis=-1)
 
         for pos_idx in range(n_pos):
             peer = i_filt[pos_idx]  # (n_shots, n_ramp_samples) for arc detection
@@ -204,12 +272,20 @@ def _process_run(
     result["n_ok"] = (sev_grid == _SEV_OK).sum(axis=1).astype(np.int32)
     result["n_warn"] = (sev_grid == _SEV_WARN).sum(axis=1).astype(np.int32)
     result["n_bad"] = (sev_grid == _SEV_BAD).sum(axis=1).astype(np.int32)
+    result["cutoff_core_khz"] = core_cutoff_hz / 1e3
+    result["cutoff_edge_khz"] = edge_cutoff_hz / 1e3
     return result
+
+
+_SCALAR_ATTRS = {"cutoff_core_khz", "cutoff_edge_khz"}
 
 
 def _write_run_group(grp: h5py.Group, result: dict) -> None:
     for key, value in result.items():
-        grp.create_dataset(key, data=np.asarray(value), compression="gzip", compression_opts=4)
+        if key in _SCALAR_ATTRS:
+            grp.attrs[key] = float(value)
+        else:
+            grp.create_dataset(key, data=np.asarray(value), compression="gzip", compression_opts=4)
 
 
 def main() -> None:
@@ -223,7 +299,14 @@ def main() -> None:
         help="Comma-separated run IDs like 01,46 or 'all' (default).",
     )
     parser.add_argument("--clip-us", type=float, default=10.0, help="Edge trim per ramp side (µs).")
-    parser.add_argument("--cutoff-khz", type=float, default=100.0, help="Low-pass filter cutoff (kHz).")
+    parser.add_argument(
+        "--cutoff-khz", type=float, default=100.0,
+        help=(
+            "Base low-pass filter cutoff (kHz) applied to core positions at standard ports."
+            "  Higher cutoffs are applied automatically to p50 runs, p11 in ES4, and all edge"
+            " positions (|x| > %.0f cm) based on the sweep rate and a %.1f eV resolution target."
+        ) % (EDGE_X_CM, TE_MIN_EV),
+    )
     parser.add_argument("--order", type=int, default=4, help="Butterworth filter order.")
     parser.add_argument("--output", type=Path, default=HDF5_OUTPUT)
     parser.add_argument(
@@ -290,13 +373,20 @@ def main() -> None:
 
             run = dataset.run(run_id)
             rot = cfg.probe.rotation_deg
+            core_c, edge_c = _cutoff_hz_for_run(run, args.cutoff_khz * 1e3)
             sys.stdout.write(
                 f"run {run_id}  exp_set={es_id}  port={cfg.probe.port}"
                 f"  z={cfg.probe.z_cm:.1f} cm  rot={rot:.0f}°"
-                f"  {run.config.sweep.n_cycles} cycles\n"
+                f"  {run.config.sweep.n_cycles} cycles"
+                f"  cutoff={core_c/1e3:.0f}/{edge_c/1e3:.0f} kHz (core/edge)\n"
             )
 
-            result = _process_run(run, clip_us=args.clip_us, cutoff_khz=args.cutoff_khz, order=args.order)
+            result = _process_run(
+                run,
+                clip_us=args.clip_us,
+                base_cutoff_hz=args.cutoff_khz * 1e3,
+                order=args.order,
+            )
 
             run_grp = es_grp[es_id].create_group(run_id)
             run_grp.attrs["run_id"] = run_id

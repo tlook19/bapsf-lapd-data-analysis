@@ -22,6 +22,15 @@ from bapsf_lapd.quality import (
     detect_arc_like_segments,
     evaluate_langmuir_quality,
 )
+from bapsf_lapd.density import (
+    MACH_K,
+    MACH_SHADOW_OFFSET,
+    calibrate_probe_area_m2,
+    density_fwhm_cm,
+    electron_density_m3,
+    inter_sweep_sample_slices,
+    ion_sound_speed_m_s,
+)
 from bapsf_lapd.reader import DischargeSummary, LapdRun, OffsetStats, TraceStats
 
 __all__ = [
@@ -43,10 +52,17 @@ __all__ = [
     "apply_trace_updates",
     "butterworth_lowpass",
     "analyze_langmuir_sweep",
+    "MACH_K",
+    "MACH_SHADOW_OFFSET",
+    "calibrate_probe_area_m2",
+    "density_fwhm_cm",
     "detect_arc_like_segments",
+    "electron_density_m3",
     "evaluate_langmuir_quality",
     "default_attenuation",
     "default_run_config",
     "default_sweep_config",
+    "inter_sweep_sample_slices",
+    "ion_sound_speed_m_s",
     "load_run_manifest",
 ]
