@@ -63,7 +63,7 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
         z = float(rg.attrs["z_cm"])
         if z not in z_groups:
             z_groups[z] = []
-        te = rg["te_exp_ev"][:]        # (n_pos, n_cycles)
+        te = rg["te_log_ev"][:]        # (n_pos, n_cycles)
         n_ok = rg["n_ok"][:]
         n_bad = rg["n_bad"][:]
         z_groups[z].append((te, n_ok, n_bad))
@@ -158,11 +158,11 @@ def plot_subplots(data: dict, output_dir: Path, vmin: float, vmax: float) -> Pat
     # Shared colorbar.
     sm = plt.cm.ScalarMappable(norm=norm, cmap=CMAP)
     cbar = fig.colorbar(sm, ax=axes, shrink=0.5, pad=0.02)
-    cbar.set_label("$T_e$ (eV)", fontsize=9)
+    cbar.set_label("$T_e$ (eV)  [log-linear fit]", fontsize=9)
     cbar.ax.tick_params(labelsize=7)
 
     fig.suptitle(
-        f"$T_e$ vs (x, z) — experiment set {es_id}: {es_label}"
+        f"$T_e$ (log-linear) vs (x, z) — experiment set {es_id}: {es_label}"
         f"  (V_bank = {v_bank} V)",
         fontsize=11,
     )
@@ -194,14 +194,14 @@ def plot_animation(data: dict, output_dir: Path, vmin: float, vmax: float) -> Pa
     mesh = ax.pcolormesh(x_edges, z_edges, te[:, :, 0], cmap=CMAP, norm=norm,
                          rasterized=True)
     cbar = fig.colorbar(mesh, ax=ax)
-    cbar.set_label("$T_e$ (eV)", fontsize=10)
+    cbar.set_label("$T_e$ (eV)  [log-linear]", fontsize=10)
 
     ax.set_xlabel("x (cm)", fontsize=10)
     ax.set_ylabel("z (cm)", fontsize=10)
     title = ax.set_title(f"t = {times[0]:.1f} ms", fontsize=10)
 
     fig.suptitle(
-        f"$T_e$ — ES {es_id}: {es_label}  (V_bank = {v_bank} V)",
+        f"$T_e$ (log-linear) — ES {es_id}: {es_label}  (V_bank = {v_bank} V)",
         fontsize=10,
     )
 

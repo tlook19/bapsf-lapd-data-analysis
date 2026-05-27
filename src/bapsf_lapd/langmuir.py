@@ -161,8 +161,17 @@ def _retarding_mask(
         raise ValueError("Not enough positive electron-current points for retarding fit")
 
     positive_values = electron_current[positive]
-    low = max(np.nanpercentile(positive_values, 8), np.nanmax(positive_values) * 0.015)
-    high = np.nanpercentile(positive_values, 50)
+    i_max = float(np.nanmax(positive_values))
+
+    # Lower bound: exclude numerical noise near zero.
+    low = max(np.nanpercentile(positive_values, 8), i_max * 0.015)
+    # Upper bound: cap at 15 % of the estimated saturation current.  This keeps
+    # the fit in the pure exponential retarding regime (≈ 1.9 e-folds below
+    # saturation) and prevents the saturation knee / sheath-expansion region
+    # from distorting the slope.  The old 50th-percentile upper bound reached
+    # well into the saturation knee for high-amplitude sweeps.
+    high = i_max * 0.15
+
     center_kwargs = {}
     if center_voltage is not None:
         center_kwargs = {"center_voltage": np.array(center_voltage), "voltage": voltage}
@@ -175,8 +184,8 @@ def _retarding_mask(
     # Keep the main rising transition, not isolated noisy islands.
     mask = _contiguous_true_region(mask, **center_kwargs)
     if mask.sum() < 8:
-        # Fall back to a slightly broader window for difficult noisy sweeps.
-        high = np.nanpercentile(positive_values, 68)
+        # Fall back to a broader window (30 % of saturation).
+        high = i_max * 0.30
         broad_mask = positive & (electron_current >= low) & (electron_current <= high)
         if center_voltage is not None:
             broad_mask &= voltage <= center_voltage + max((voltage.max() - voltage.min()) * 0.35, 8.0)
