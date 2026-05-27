@@ -65,8 +65,9 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
             z_groups[z] = []
         te = rg["te_log_ev"][:]        # (n_pos, n_cycles)
         n_ok = rg["n_ok"][:]
+        n_warn = rg["n_warn"][:]
         n_bad = rg["n_bad"][:]
-        z_groups[z].append((te, n_ok, n_bad))
+        z_groups[z].append((te, n_ok, n_warn, n_bad))
         if cycle_time_s is None:
             cycle_time_s = rg["cycle_time_s"][:]
 
@@ -84,8 +85,8 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
         weight = np.zeros((n_x, n_cycles))
         mask_bad = np.zeros((n_x, n_cycles), dtype=bool)
 
-        for te, n_ok, n_bad in entries:
-            # Mask cells where bad shots dominate.
+        for te, n_ok, n_warn, n_bad in entries:
+            # Strict mask: cell hidden when bad shots outnumber ok alone.
             cell_bad = n_bad > n_ok
             mask_bad |= cell_bad
             valid = ~cell_bad
@@ -111,6 +112,74 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
     }
 
 
+def _load_experiment_set_loose(hf: h5py.File, es_id: str) -> dict:
+    """Like _load_experiment_set but masks only when bad > ok+warn.
+
+    warn-severity shots have valid Te estimates (they passed the fitter but
+    triggered a soft quality flag).  This looser threshold includes them in
+    the denominator so cells with mostly-warn populations are not hidden.
+    Produces a second set of plots for comparison with the strict mask.
+    """
+    x_cm = hf["x_cm"][:]
+    eg = hf["experiment_sets"][es_id]
+    es_label = eg.attrs.get("label", f"set {es_id}")
+    v_bank = eg.attrs.get("v_bank_v", "?")
+
+    z_groups: dict[float, list] = {}
+    cycle_time_s = None
+
+    for run_id in sorted(eg.keys()):
+        rg = eg[run_id]
+        z = float(rg.attrs["z_cm"])
+        if z not in z_groups:
+            z_groups[z] = []
+        te = rg["te_log_ev"][:]
+        n_ok = rg["n_ok"][:]
+        n_warn = rg["n_warn"][:]
+        n_bad = rg["n_bad"][:]
+        z_groups[z].append((te, n_ok, n_warn, n_bad))
+        if cycle_time_s is None:
+            cycle_time_s = rg["cycle_time_s"][:]
+
+    z_vals = sorted(z_groups.keys())
+    n_z = len(z_vals)
+    n_x = len(x_cm)
+    n_cycles = len(cycle_time_s)
+
+    te_grid = np.full((n_z, n_x, n_cycles), np.nan)
+
+    for zi, z in enumerate(z_vals):
+        entries = z_groups[z]
+        te_sum = np.zeros((n_x, n_cycles))
+        weight = np.zeros((n_x, n_cycles))
+        mask_bad = np.zeros((n_x, n_cycles), dtype=bool)
+
+        for te, n_ok, n_warn, n_bad in entries:
+            # Loose mask: cell hidden only when bad outnumbers ok+warn.
+            cell_bad = n_bad > (n_ok + n_warn)
+            mask_bad |= cell_bad
+            valid = ~cell_bad
+            te_sum += np.where(valid, te, 0.0)
+            weight += valid.astype(float)
+
+        with np.errstate(invalid="ignore"):
+            te_avg = np.where(weight > 0, te_sum / weight, np.nan)
+        all_bad = mask_bad & (weight == 0)
+        te_avg[all_bad] = np.nan
+
+        te_grid[zi] = te_avg
+
+    return {
+        "te": te_grid,
+        "x_cm": x_cm,
+        "z_cm": np.array(z_vals),
+        "cycle_time_ms": cycle_time_s * 1e3,
+        "es_label": es_label,
+        "v_bank": v_bank,
+        "es_id": es_id,
+    }
+
+
 def _make_frame(ax: plt.Axes, te_2d: np.ndarray, x_edges: np.ndarray,
                 z_edges: np.ndarray, norm, title: str) -> None:
     """Draw a single pcolormesh frame on ax."""
@@ -123,7 +192,8 @@ def _make_frame(ax: plt.Axes, te_2d: np.ndarray, x_edges: np.ndarray,
     ax.tick_params(labelsize=5)
 
 
-def plot_subplots(data: dict, output_dir: Path, vmin: float, vmax: float) -> Path:
+def plot_subplots(data: dict, output_dir: Path, vmin: float, vmax: float,
+                  suffix: str = "") -> Path:
     """Save a static figure with one subplot per cycle."""
     import matplotlib.colors as mcolors
 
@@ -167,14 +237,15 @@ def plot_subplots(data: dict, output_dir: Path, vmin: float, vmax: float) -> Pat
         fontsize=11,
     )
 
-    out_path = output_dir / f"te_contours_expset{es_id}.png"
+    out_path = output_dir / f"te_contours_expset{es_id}{suffix}.png"
     fig.savefig(out_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved {out_path}")
     return out_path
 
 
-def plot_animation(data: dict, output_dir: Path, vmin: float, vmax: float) -> Path:
+def plot_animation(data: dict, output_dir: Path, vmin: float, vmax: float,
+                   suffix: str = "") -> Path:
     """Save an animated GIF cycling through discharge cycles."""
     import matplotlib.colors as mcolors
 
@@ -214,7 +285,7 @@ def plot_animation(data: dict, output_dir: Path, vmin: float, vmax: float) -> Pa
         fig, update, frames=n_cycles, interval=300, blit=False
     )
 
-    out_path = output_dir / f"te_contours_expset{es_id}.gif"
+    out_path = output_dir / f"te_contours_expset{es_id}{suffix}.gif"
     anim.save(str(out_path), writer="pillow", dpi=110)
     plt.close(fig)
     print(f"Saved {out_path}")
@@ -230,15 +301,19 @@ def plot_all(hdf5_path: Path, output_dir: Path, save_animation: bool,
         es_ids = sorted(hf["experiment_sets"].keys(), key=int)
 
         # --- Pass 1: load all data and compute a GLOBAL colour scale ----------
-        all_data: list[dict] = []
+        # Load both strict-mask and loose-mask datasets in one HDF5 pass.
+        strict_data: list[dict] = []
+        loose_data: list[dict] = []
         all_finite: list[np.ndarray] = []
         for es_id in es_ids:
-            data = _load_experiment_set(hf, es_id)
-            finite = data["te"][np.isfinite(data["te"])]
+            s = _load_experiment_set(hf, es_id)
+            l = _load_experiment_set_loose(hf, es_id)
+            finite = s["te"][np.isfinite(s["te"])]
             if finite.size == 0:
                 print(f"ES {es_id}: no finite T_e data, skipping.")
                 continue
-            all_data.append(data)
+            strict_data.append(s)
+            loose_data.append(l)
             all_finite.append(finite)
 
         if not all_finite:
@@ -251,11 +326,13 @@ def plot_all(hdf5_path: Path, output_dir: Path, save_animation: bool,
         src = "manual override" if (vmin_override or vmax_override) else "2nd–98th percentile across all ESs"
         print(f"Global colour scale: vmin={vmin:.2f} eV  vmax={vmax:.2f} eV  ({src})")
 
-        # --- Pass 2: plot each ES with the shared scale -----------------------
-        for data in all_data:
-            plot_subplots(data, output_dir, vmin, vmax)
+        # --- Pass 2: plot each ES — strict mask (default) + loose mask --------
+        for s, l in zip(strict_data, loose_data):
+            plot_subplots(s, output_dir, vmin, vmax)             # te_contours_expsetN.png
+            plot_subplots(l, output_dir, vmin, vmax, suffix="_loose")  # te_contours_expsetN_loose.png
             if save_animation:
-                plot_animation(data, output_dir, vmin, vmax)
+                plot_animation(s, output_dir, vmin, vmax)
+                plot_animation(l, output_dir, vmin, vmax, suffix="_loose")
 
 
 def main() -> None:
