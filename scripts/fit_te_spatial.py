@@ -76,6 +76,14 @@ SMOOTHING_CORE     = 0.05   # tight fit in plasma core
 SMOOTHING_EDGE     = 2.0    # loose fit at plasma edge / scrape-off layer
 SMOOTHING_SENTINEL = 1e-4   # near-exact enforcement of wall boundary conditions
 
+# Z-row coverage threshold: any z-position whose overall fraction of finite cells
+# (summed across all x-positions and cycles) falls below this value is excluded
+# from the RBF data entirely.  The RBF then smoothly extrapolates from the last
+# reliable z-row toward the anode boundary.  ES4's last port has only ~0.3 %
+# coverage (3 cells out of 1020); without this filter those outlier cells corrupt
+# the fit.  10 % keeps ES4's penultimate port (32 %) while dropping the last one.
+MIN_Z_COVERAGE  = 0.10
+
 CMAP            = "plasma"
 
 
@@ -270,9 +278,31 @@ def fill_te_grid(
     te_grid: np.ndarray,        # (n_z, n_x, n_cycles)
     x_cm: np.ndarray,
     z_cm: np.ndarray,
+    *,
+    min_z_coverage: float = MIN_Z_COVERAGE,
     **kwargs,                   # forwarded to fill_te_cycle
 ) -> np.ndarray:
-    """Fill every cycle in the grid; prints progress."""
+    """Fill every cycle in the grid; prints progress.
+
+    Before fitting, any z-row whose fraction of finite cells (pooled over all
+    x-positions and cycles) is below *min_z_coverage* is blanked to NaN in
+    every cycle.  This prevents sparse, noisy outlier cells at poorly-sampled
+    ports from corrupting the RBF interpolant.  The blank rows are then filled
+    by smooth extrapolation from neighbouring valid z-rows and the boundary
+    sentinel points (T_e = te_boundary at the cathode/anode end plates).
+    """
+    n_z = te_grid.shape[0]
+    z_coverage = np.array([np.isfinite(te_grid[zi]).mean() for zi in range(n_z)])
+    sparse = z_coverage < min_z_coverage
+    if sparse.any():
+        te_grid = te_grid.copy()
+        te_grid[sparse] = np.nan
+        for zi in np.flatnonzero(sparse):
+            print(
+                f"    z = {z_cm[zi]:.1f} cm excluded: coverage "
+                f"{100 * z_coverage[zi]:.1f}% < {100 * min_z_coverage:.0f}% threshold"
+            )
+
     n_cycles = te_grid.shape[2]
     filled = np.empty_like(te_grid)
     for ci in range(n_cycles):
@@ -393,6 +423,11 @@ def main() -> None:
                         help="RBF smoothing for core region (low = exact fit).")
     parser.add_argument("--smoothing-edge", type=float, default=SMOOTHING_EDGE,
                         help="RBF smoothing for edge region (high = loose fit).")
+    parser.add_argument("--min-z-coverage", type=float, default=MIN_Z_COVERAGE,
+                        help="Minimum fraction of finite cells (across all x and cycles) "
+                             "for a z-row to be included in the RBF fit. Rows below this "
+                             "threshold are blanked and filled by boundary extrapolation. "
+                             f"Default: {MIN_Z_COVERAGE}.")
     parser.add_argument("--no-plots",       action="store_true",
                         help="skip comparison figures")
     args = parser.parse_args()
@@ -406,14 +441,15 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     fill_kwargs = dict(
-        x_wall         = args.x_wall,
-        z_lo           = args.z_cathode,
-        z_hi           = args.z_anode,
-        te_boundary    = args.te_boundary,
-        x_core         = args.x_core,
-        x_edge         = args.x_edge,
-        smoothing_core = args.smoothing_core,
-        smoothing_edge = args.smoothing_edge,
+        x_wall          = args.x_wall,
+        z_lo            = args.z_cathode,
+        z_hi            = args.z_anode,
+        te_boundary     = args.te_boundary,
+        x_core          = args.x_core,
+        x_edge          = args.x_edge,
+        smoothing_core  = args.smoothing_core,
+        smoothing_edge  = args.smoothing_edge,
+        min_z_coverage  = args.min_z_coverage,
     )
 
     with h5py.File(args.input, "r") as hf_in, \
