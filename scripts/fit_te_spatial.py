@@ -306,9 +306,14 @@ def _plot_comparison(data: dict, te_filled: np.ndarray, output_dir: Path) -> Non
         n_cycles - 1,
     ]
 
-    # Shared colour scale from filled data (has no NaN)
-    vmin = max(0.0, float(np.percentile(te_filled, 2)))
-    vmax = float(np.percentile(te_filled, 98))
+    # Colour scale from the masked finite values — matches plot_te_contours.py.
+    # (Using te_filled would compress the scale because boundary-fill adds many
+    # 0.1 eV points, making the masked top row look darker than in te_contours.)
+    finite = te_masked[np.isfinite(te_masked)]
+    if finite.size == 0:
+        finite = te_filled.ravel()
+    vmin = max(0.0, float(np.percentile(finite, 2)))
+    vmax = float(np.percentile(finite, 98))
     norm = mcolors.Normalize(vmin=vmin, vmax=vmax)
 
     def edges(arr):
