@@ -36,7 +36,8 @@ HDF5 layout
       vp_exp_v_sem              (51, n_cycles)
       n_ok                      (51, n_cycles)  int32, shots with severity ok
       n_warn                    (51, n_cycles)  int32
-      n_bad                     (51, n_cycles)  int32
+      n_bad                     (51, n_cycles)  int32  (includes n_arc)
+      n_arc                     (51, n_cycles)  int32, subset of n_bad: pre-excluded by arc detector
 
 rotation_deg is stored as a run attribute so rot-0 and rot-180 runs can be
 identified separately during plotting without parsing run IDs.
@@ -60,6 +61,7 @@ Usage
 from __future__ import annotations
 
 import argparse
+import csv
 import sys
 import warnings
 from pathlib import Path
@@ -79,6 +81,7 @@ from bapsf_lapd import (
 
 MANIFEST = Path("config/may2026_run_manifest.toml")
 HDF5_OUTPUT = Path("processed/langmuir_sweeps.hdf5")
+ARC_EXCLUSIONS_CSV = Path("processed/isweep_frontside_arc_shot_exclusions.csv")
 
 # Probe scan positions: 51 points, 1 cm spacing, centered at x=0.
 X_CM = np.linspace(-25.0, 25.0, 51)
@@ -98,6 +101,41 @@ EDGE_X_CM = 10.0          # cm; probe positions outside this are "edge"
 TE_MIN_EV = 0.5           # eV; design target for cold-region resolution
 HE_VP_VF_FACTOR = 4.45    # V_p − V_f ≈ 4.45 × T_e for He⁺
 FILTER_SMEAR_FRACTION = 0.30  # allow at most this fraction of retarding window
+
+
+def _load_arc_exclusions(csv_path: Path) -> dict[str, list[tuple[int, int, int]]]:
+    """Read the arc-shot exclusion CSV and return {run_id: [(pos, shot, cyc), ...]}.
+
+    Only rows with exclude_i_sweep == 1 are loaded.  The result covers all
+    runs present in the file; runs with no exclusions are absent from the dict.
+    """
+    exclusions: dict[str, list[tuple[int, int, int]]] = {}
+    with open(csv_path, newline="") as fh:
+        for row in csv.DictReader(fh):
+            if int(row["exclude_i_sweep"]) != 1:
+                continue
+            rid = row["run_id"]
+            if rid not in exclusions:
+                exclusions[rid] = []
+            exclusions[rid].append(
+                (int(row["position_index"]), int(row["shot_index"]), int(row["cycle_index"]))
+            )
+    return exclusions
+
+
+def _build_arc_mask(
+    run_id: str,
+    exclusions: dict[str, list[tuple[int, int, int]]],
+    n_pos: int,
+    n_shots: int,
+    n_cycles: int,
+) -> np.ndarray:
+    """Return bool (n_pos, n_shots, n_cycles) mask; True = arc-excluded."""
+    mask = np.zeros((n_pos, n_shots, n_cycles), dtype=bool)
+    for pos, shot, cyc in exclusions.get(run_id, []):
+        if pos < n_pos and shot < n_shots and cyc < n_cycles:
+            mask[pos, shot, cyc] = True
+    return mask
 
 
 def _sweep_rate_vs(sweep) -> float:
@@ -145,6 +183,7 @@ def _process_run(
     clip_us: float,
     base_cutoff_hz: float,
     order: int,
+    arc_mask: np.ndarray | None = None,
 ) -> dict:
     """Compute position-averaged Langmuir results for every cycle in one run.
 
@@ -156,11 +195,16 @@ def _process_run(
     Fitting is done per individual shot before averaging, so shot-to-shot
     V_plasma fluctuations do not smear the I-V transition in the fit.
 
+    arc_mask : bool (n_pos, n_shots, n_cycles), optional
+        Pre-computed arc-shot exclusion mask.  True entries are counted in
+        n_arc and n_bad and are skipped by the I-V fitter.
+
     Returns a dict whose values are numpy arrays:
       cycle_time_s              (n_cycles,)
       {qty}, {qty}_std,         (n_positions, n_cycles) for each qty in
       {qty}_sem                 QUANTITIES
       n_ok, n_warn, n_bad       (n_positions, n_cycles)  int32
+      n_arc                     (n_positions, n_cycles)  int32, subset of n_bad
       cutoff_core_khz           scalar — filter cutoff used at core positions
       cutoff_edge_khz           scalar — filter cutoff used at edge positions
     """
@@ -183,6 +227,11 @@ def _process_run(
     # Accumulators: (n_pos, n_shots, n_cycles).
     per_shot = {q: np.full((n_pos, n_shots, n_cycles), np.nan) for q in QUANTITIES}
     sev_grid = np.full((n_pos, n_shots, n_cycles), _SEV_BAD, dtype=np.int8)
+    # Arc-excluded shots: pre-marked bad before fitting so the fitter never
+    # sees contaminated sweeps.  Tracked separately for diagnostic output.
+    arc_grid = np.zeros((n_pos, n_shots, n_cycles), dtype=bool)
+    if arc_mask is not None:
+        arc_grid[:] = arc_mask
 
     sr = run.sample_rate_hz()
 
@@ -216,6 +265,10 @@ def _process_run(
         for pos_idx in range(n_pos):
             peer = i_filt[pos_idx]  # (n_shots, n_ramp_samples) for arc detection
             for shot_idx in range(n_shots):
+                if arc_grid[pos_idx, shot_idx, cyc_idx]:
+                    # Shot flagged by pre-computed arc detector; skip fitting.
+                    # sev_grid already initialised to _SEV_BAD.
+                    continue
                 voltage = v_filt[pos_idx, shot_idx]
                 current = i_filt[pos_idx, shot_idx]
                 try:
@@ -272,6 +325,8 @@ def _process_run(
     result["n_ok"] = (sev_grid == _SEV_OK).sum(axis=1).astype(np.int32)
     result["n_warn"] = (sev_grid == _SEV_WARN).sum(axis=1).astype(np.int32)
     result["n_bad"] = (sev_grid == _SEV_BAD).sum(axis=1).astype(np.int32)
+    # n_arc is a subset of n_bad: shots excluded by the arc detector before fitting.
+    result["n_arc"] = arc_grid.sum(axis=1).astype(np.int32)
     result["cutoff_core_khz"] = core_cutoff_hz / 1e3
     result["cutoff_edge_khz"] = edge_cutoff_hz / 1e3
     return result
@@ -310,11 +365,36 @@ def main() -> None:
     parser.add_argument("--order", type=int, default=4, help="Butterworth filter order.")
     parser.add_argument("--output", type=Path, default=HDF5_OUTPUT)
     parser.add_argument(
+        "--exclusions",
+        type=Path,
+        default=None,
+        metavar="CSV",
+        help=(
+            "Arc-shot exclusion CSV produced by the arc detector.  Defaults to"
+            f" {ARC_EXCLUSIONS_CSV} if that file exists, otherwise no exclusions"
+            " are applied."
+        ),
+    )
+    parser.add_argument(
         "--resume",
         action="store_true",
         help="Append to an existing HDF5 and skip runs that are already complete.",
     )
     args = parser.parse_args()
+
+    # Resolve arc exclusion CSV.
+    excl_path = args.exclusions
+    if excl_path is None and ARC_EXCLUSIONS_CSV.exists():
+        excl_path = ARC_EXCLUSIONS_CSV
+    if excl_path is not None:
+        sys.stdout.write(f"Loading arc exclusions from {excl_path}\n")
+        arc_exclusions = _load_arc_exclusions(excl_path)
+        n_excl_runs = len(arc_exclusions)
+        n_excl_total = sum(len(v) for v in arc_exclusions.values())
+        sys.stdout.write(f"  {n_excl_total} exclusions across {n_excl_runs} runs\n")
+    else:
+        arc_exclusions = {}
+        sys.stdout.write("No arc exclusion file found; all shots will be fitted.\n")
 
     dataset = LapdDataset.from_manifest(MANIFEST)
     if args.run_ids == "all":
@@ -381,11 +461,22 @@ def main() -> None:
                 f"  cutoff={core_c/1e3:.0f}/{edge_c/1e3:.0f} kHz (core/edge)\n"
             )
 
+            n_pos = run.position_count()
+            n_shots = run.shots_per_position()
+            n_cycles = run.config.sweep.n_cycles
+            arc_mask = _build_arc_mask(
+                run_id, arc_exclusions, n_pos, n_shots, n_cycles
+            )
+            n_arc_run = int(arc_mask.sum())
+            if n_arc_run:
+                sys.stdout.write(f"  arc exclusions: {n_arc_run} shot-cycles pre-excluded\n")
+
             result = _process_run(
                 run,
                 clip_us=args.clip_us,
                 base_cutoff_hz=args.cutoff_khz * 1e3,
                 order=args.order,
+                arc_mask=arc_mask,
             )
 
             run_grp = es_grp[es_id].create_group(run_id)
