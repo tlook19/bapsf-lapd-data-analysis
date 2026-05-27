@@ -221,24 +221,38 @@ def plot_animation(data: dict, output_dir: Path, vmin: float, vmax: float) -> Pa
     return out_path
 
 
-def plot_all(hdf5_path: Path, output_dir: Path, save_animation: bool) -> None:
+def plot_all(hdf5_path: Path, output_dir: Path, save_animation: bool,
+             vmin_override: float | None = None,
+             vmax_override: float | None = None) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
     with h5py.File(hdf5_path, "r") as hf:
         es_ids = sorted(hf["experiment_sets"].keys(), key=int)
 
+        # --- Pass 1: load all data and compute a GLOBAL colour scale ----------
+        all_data: list[dict] = []
+        all_finite: list[np.ndarray] = []
         for es_id in es_ids:
             data = _load_experiment_set(hf, es_id)
-            te = data["te"]
-
-            # Compute a common color scale across all cycles for this ES.
-            finite = te[np.isfinite(te)]
+            finite = data["te"][np.isfinite(data["te"])]
             if finite.size == 0:
                 print(f"ES {es_id}: no finite T_e data, skipping.")
                 continue
-            vmin = max(0.0, float(np.percentile(finite, 2)))
-            vmax = float(np.percentile(finite, 98))
+            all_data.append(data)
+            all_finite.append(finite)
 
+        if not all_finite:
+            print("No finite T_e data found in any experiment set.")
+            return
+
+        combined = np.concatenate(all_finite)
+        vmin = vmin_override if vmin_override is not None else max(0.0, float(np.percentile(combined, 2)))
+        vmax = vmax_override if vmax_override is not None else float(np.percentile(combined, 98))
+        src = "manual override" if (vmin_override or vmax_override) else "2nd–98th percentile across all ESs"
+        print(f"Global colour scale: vmin={vmin:.2f} eV  vmax={vmax:.2f} eV  ({src})")
+
+        # --- Pass 2: plot each ES with the shared scale -----------------------
+        for data in all_data:
             plot_subplots(data, output_dir, vmin, vmax)
             if save_animation:
                 plot_animation(data, output_dir, vmin, vmax)
@@ -253,6 +267,12 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
     parser.add_argument("--no-animation", action="store_true",
                         help="skip saving animated GIFs")
+    parser.add_argument("--vmin", type=float, default=None,
+                        help="Override colour scale minimum (eV). "
+                             "Default: 2nd percentile across all experiment sets.")
+    parser.add_argument("--vmax", type=float, default=None,
+                        help="Override colour scale maximum (eV). "
+                             "Default: 98th percentile across all experiment sets.")
     args = parser.parse_args()
 
     if not args.input.exists():
@@ -260,7 +280,9 @@ def main() -> None:
             f"{args.input} not found — run process_langmuir_sweeps.py first."
         )
 
-    plot_all(args.input, args.output_dir, save_animation=not args.no_animation)
+    plot_all(args.input, args.output_dir,
+             save_animation=not args.no_animation,
+             vmin_override=args.vmin, vmax_override=args.vmax)
 
 
 if __name__ == "__main__":
