@@ -66,7 +66,16 @@ X_WALL_CM       = 35.0    # x boundary (outside ±25 cm scan)
 Z_CATHODE_CM    = PORT_2_Z_CM - 2 * PORT_SPACING_CM   # ≈ 119 cm (before port 1)
 Z_ANODE_CM      = PORT_2_Z_CM + 64 * PORT_SPACING_CM  # ≈ 2227 cm (past last port)
 
-RBF_SMOOTHING   = 0.3     # allows small deviations from data to prevent ringing
+# Per-zone RBF smoothing: lower → surface fits that point more exactly.
+# Core points (|x| ≤ X_CORE_CM) are trusted most; edge points (|x| ≥ X_EDGE_CM)
+# are allowed to deviate more because the signal is noisier there.
+# Values between X_CORE_CM and X_EDGE_CM get linearly interpolated smoothing.
+X_CORE_CM          = 10.0   # inner boundary of transition zone (cm)
+X_EDGE_CM          = 15.0   # outer boundary of transition zone (cm)
+SMOOTHING_CORE     = 0.05   # tight fit in plasma core
+SMOOTHING_EDGE     = 2.0    # loose fit at plasma edge / scrape-off layer
+SMOOTHING_SENTINEL = 1e-4   # near-exact enforcement of wall boundary conditions
+
 CMAP            = "plasma"
 
 
@@ -176,21 +185,44 @@ def _normalise(x: np.ndarray, z: np.ndarray,
     return np.column_stack([x_n, z_n])
 
 
+def _point_smoothing(
+    x_pts: np.ndarray,
+    *,
+    x_core:          float = X_CORE_CM,
+    x_edge:          float = X_EDGE_CM,
+    smoothing_core:  float = SMOOTHING_CORE,
+    smoothing_edge:  float = SMOOTHING_EDGE,
+) -> np.ndarray:
+    """Per-point smoothing that increases from core to edge.
+
+    |x| ≤ x_core            → smoothing_core  (tight: surface must fit closely)
+    x_core < |x| < x_edge   → linearly interpolated
+    |x| ≥ x_edge            → smoothing_edge  (loose: noisier edge data)
+    """
+    t = np.clip((np.abs(x_pts) - x_core) / (x_edge - x_core), 0.0, 1.0)
+    return smoothing_core + t * (smoothing_edge - smoothing_core)
+
+
 def fill_te_cycle(
     te_2d: np.ndarray,          # (n_z, n_x)  NaN where masked
     x_cm: np.ndarray,
     z_cm: np.ndarray,
     *,
-    x_wall:      float = X_WALL_CM,
-    z_lo:        float = Z_CATHODE_CM,
-    z_hi:        float = Z_ANODE_CM,
-    te_boundary: float = TE_BOUNDARY_EV,
-    smoothing:   float = RBF_SMOOTHING,
+    x_wall:          float = X_WALL_CM,
+    z_lo:            float = Z_CATHODE_CM,
+    z_hi:            float = Z_ANODE_CM,
+    te_boundary:     float = TE_BOUNDARY_EV,
+    x_core:          float = X_CORE_CM,
+    x_edge:          float = X_EDGE_CM,
+    smoothing_core:  float = SMOOTHING_CORE,
+    smoothing_edge:  float = SMOOTHING_EDGE,
 ) -> np.ndarray:
     """Return filled (n_z, n_x) T_e array with no NaN cells.
 
-    Uses a thin-plate-spline RBF fit through the valid data points and the
-    machine-boundary sentinels, evaluated on the full (x, z) grid.
+    Uses a thin-plate-spline RBF with position-dependent smoothing:
+      |x| ≤ x_core  → smoothing_core (fit closely; trusted core data)
+      |x| ≥ x_edge  → smoothing_edge (fit loosely; noisy edge data)
+    Sentinel boundary points use smoothing=0 (exact enforcement).
     """
     zz, xx = np.meshgrid(z_cm, x_cm, indexing="ij")  # (n_z, n_x) each
     valid = np.isfinite(te_2d)
@@ -200,16 +232,24 @@ def fill_te_cycle(
     data_values = te_2d[valid]
 
     if data_values.size < 4:
-        # Too few points; return boundary value everywhere.
         return np.full_like(te_2d, te_boundary)
 
-    # Sentinel coordinates and values
+    # Per-point smoothing for data points
+    data_smoothing = _point_smoothing(
+        data_coords[:, 0],
+        x_core=x_core, x_edge=x_edge,
+        smoothing_core=smoothing_core, smoothing_edge=smoothing_edge,
+    )
+
+    # Sentinel coordinates, values, and smoothing (exact = 0)
     sent_coords, sent_values = _build_sentinel_points(
         x_cm, z_cm, x_wall=x_wall, z_lo=z_lo, z_hi=z_hi, te_boundary=te_boundary
     )
+    sent_smoothing = np.full(len(sent_values), SMOOTHING_SENTINEL)
 
-    all_coords = np.vstack([data_coords, sent_coords])
-    all_values = np.concatenate([data_values, sent_values])
+    all_coords    = np.vstack([data_coords,    sent_coords])
+    all_values    = np.concatenate([data_values,    sent_values])
+    all_smoothing = np.concatenate([data_smoothing, sent_smoothing])
 
     # Normalise to unit square (avoids ~25× z/x aspect ratio skewing kernel)
     all_norm = _normalise(all_coords[:, 0], all_coords[:, 1], x_wall, z_lo, z_hi)
@@ -217,7 +257,7 @@ def fill_te_cycle(
     rbf = RBFInterpolator(
         all_norm, all_values,
         kernel="thin_plate_spline",
-        smoothing=smoothing,
+        smoothing=all_smoothing,
     )
 
     # Evaluate on full grid
@@ -230,7 +270,7 @@ def fill_te_grid(
     te_grid: np.ndarray,        # (n_z, n_x, n_cycles)
     x_cm: np.ndarray,
     z_cm: np.ndarray,
-    **kwargs,
+    **kwargs,                   # forwarded to fill_te_cycle
 ) -> np.ndarray:
     """Fill every cycle in the grid; prints progress."""
     n_cycles = te_grid.shape[2]
@@ -336,11 +376,19 @@ def main() -> None:
                         help="z position of cathode end-plate boundary (cm)")
     parser.add_argument("--z-anode",     type=float, default=Z_ANODE_CM,
                         help="z position of anode end-plate boundary (cm)")
-    parser.add_argument("--te-boundary", type=float, default=TE_BOUNDARY_EV,
-                        help="T_e boundary value (eV)")
-    parser.add_argument("--smoothing",   type=float, default=RBF_SMOOTHING,
-                        help="RBF smoothing parameter (0 = exact interpolation)")
-    parser.add_argument("--no-plots",    action="store_true",
+    parser.add_argument("--te-boundary",    type=float, default=TE_BOUNDARY_EV,
+                        help="T_e boundary value at machine walls (eV)")
+    parser.add_argument("--x-core",         type=float, default=X_CORE_CM,
+                        help="Inner edge of weighting transition zone (cm). "
+                             "Points with |x| ≤ x-core get smoothing-core.")
+    parser.add_argument("--x-edge",         type=float, default=X_EDGE_CM,
+                        help="Outer edge of weighting transition zone (cm). "
+                             "Points with |x| ≥ x-edge get smoothing-edge.")
+    parser.add_argument("--smoothing-core", type=float, default=SMOOTHING_CORE,
+                        help="RBF smoothing for core region (low = exact fit).")
+    parser.add_argument("--smoothing-edge", type=float, default=SMOOTHING_EDGE,
+                        help="RBF smoothing for edge region (high = loose fit).")
+    parser.add_argument("--no-plots",       action="store_true",
                         help="skip comparison figures")
     args = parser.parse_args()
 
@@ -353,11 +401,14 @@ def main() -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     fill_kwargs = dict(
-        x_wall      = args.x_wall,
-        z_lo        = args.z_cathode,
-        z_hi        = args.z_anode,
-        te_boundary = args.te_boundary,
-        smoothing   = args.smoothing,
+        x_wall         = args.x_wall,
+        z_lo           = args.z_cathode,
+        z_hi           = args.z_anode,
+        te_boundary    = args.te_boundary,
+        x_core         = args.x_core,
+        x_edge         = args.x_edge,
+        smoothing_core = args.smoothing_core,
+        smoothing_edge = args.smoothing_edge,
     )
 
     with h5py.File(args.input, "r") as hf_in, \
