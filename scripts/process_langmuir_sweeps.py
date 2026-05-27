@@ -36,8 +36,11 @@ HDF5 layout
       vp_exp_v_sem              (51, n_cycles)
       n_ok                      (51, n_cycles)  int32, shots with severity ok
       n_warn                    (51, n_cycles)  int32
-      n_bad                     (51, n_cycles)  int32  (includes n_arc)
+      n_bad                     (51, n_cycles)  int32  (includes n_arc, n_te_outlier)
       n_arc                     (51, n_cycles)  int32, subset of n_bad: pre-excluded by arc detector
+      n_te_outlier              (51, n_cycles)  int32, subset of n_bad: rejected by per-cell Te sigma-clip
+      te_log_ev_shots           (51, n_shots, n_cycles)  float32  per-shot Te (log); NaN for bad/arc shots, PRE-sigma-clip
+      sev_shots                 (51, n_shots, n_cycles)  int8     shot quality pre-clip: 0=ok 1=warn 2=bad 3=arc
 
 rotation_deg is stored as a run attribute so rot-0 and rot-180 runs can be
 identified separately during plotting without parsing run IDs.
@@ -98,6 +101,12 @@ _SEV_MAP = {"ok": _SEV_OK, "warn": _SEV_WARN, "bad": _SEV_BAD}
 # Edge positions are |x| > EDGE_X_CM; they get a higher filter cutoff to
 # resolve potentially sub-eV temperatures.
 EDGE_X_CM = 10.0          # cm; probe positions outside this are "edge"
+
+# Per-cell Te sigma-clip threshold.  After all shots in a (position, cycle)
+# cell are fitted, any shot whose Te deviates more than K_SIGMA_CLIP times the
+# MAD-based scale from the median is marked bad and excluded from the mean.
+# Requires ≥ 3 finite shots in the cell; cells with fewer shots are not clipped.
+K_SIGMA_CLIP = 3.0
 TE_MIN_EV = 0.5           # eV; design target for cold-region resolution
 HE_VP_VF_FACTOR = 4.45    # V_p − V_f ≈ 4.45 × T_e for He⁺
 FILTER_SMEAR_FRACTION = 0.30  # allow at most this fraction of retarding window
@@ -136,6 +145,59 @@ def _build_arc_mask(
         if pos < n_pos and shot < n_shots and cyc < n_cycles:
             mask[pos, shot, cyc] = True
     return mask
+
+
+def _sigma_clip_te(
+    per_shot: dict,
+    sev_grid: np.ndarray,
+    *,
+    k_sigma: float = K_SIGMA_CLIP,
+) -> np.ndarray:
+    """In-place MAD sigma-clip of per-shot Te values within each (pos, cycle) cell.
+
+    For each cell that has ≥ 3 finite Te values (ok or warn shots), compute the
+    median and MAD-based scale.  Any shot whose Te deviates more than
+    k_sigma × scale from the median is treated as a Te outlier:
+      - Its entry in per_shot is set to NaN for ALL quantities (te_log, te_exp,
+        vp_derivative, vp_log, vp_exp) so it cannot contaminate any average.
+      - sev_grid is updated to _SEV_BAD for that shot.
+
+    Scale floor: max(1.4826 × MAD, 0.10 × median).  This prevents zero-scale
+    when all shots agree exactly (MAD = 0), giving a clip window of ±10 % × median
+    as a floor.
+
+    Returns
+    -------
+    te_outlier_grid : bool (n_pos, n_shots, n_cycles)
+        True for each shot rejected by this step.  A subset of n_bad.
+    """
+    te_arr = per_shot["te_log_ev"]            # (n_pos, n_shots, n_cycles)
+    n_pos, n_shots, n_cycles = te_arr.shape
+    te_outlier_grid = np.zeros((n_pos, n_shots, n_cycles), dtype=bool)
+
+    for pos_idx in range(n_pos):
+        for cyc_idx in range(n_cycles):
+            shots = te_arr[pos_idx, :, cyc_idx]   # (n_shots,)
+            fin_idx = np.flatnonzero(np.isfinite(shots))
+            if fin_idx.size < 3:
+                continue                           # too few shots to clip reliably
+            te_vals = shots[fin_idx]
+            median  = float(np.median(te_vals))
+            mad     = float(np.median(np.abs(te_vals - median)))
+            scale   = max(1.4826 * mad, 0.10 * median)
+            if scale <= 0:
+                continue
+            outlier = np.abs(te_vals - median) > k_sigma * scale
+            if not outlier.any():
+                continue
+            for local_i, shot_i in enumerate(fin_idx):
+                if outlier[local_i]:
+                    for q in QUANTITIES:
+                        per_shot[q][pos_idx, shot_i, cyc_idx] = np.nan
+                    sev_grid[pos_idx, shot_i, cyc_idx] = _SEV_BAD
+                    te_outlier_grid[pos_idx, shot_i, cyc_idx] = True
+
+    return te_outlier_grid
 
 
 def _sweep_rate_vs(sweep) -> float:
@@ -308,6 +370,29 @@ def _process_run(
 
     sys.stdout.write("\n")
 
+    # Snapshot raw per-shot Te BEFORE sigma-clip for HDF5 storage.
+    # Stored as float32 to halve the footprint; NaN for bad/arc shots.
+    te_log_shots_raw = per_shot["te_log_ev"].copy().astype(np.float32)
+
+    # Shot-level quality array before clip: 0=ok, 1=warn, 2=bad, 3=arc.
+    # Arc shots override whatever sev_grid stored (they never entered the fitter).
+    sev_shots = sev_grid.astype(np.int8).copy()
+    sev_shots[arc_grid] = 3
+
+    # Sigma-clip per-cell Te outliers before averaging.
+    # Any shot whose Te deviates more than K_SIGMA_CLIP × MAD-scale from the
+    # cell median is nulled out and re-classified as bad.  This removes the
+    # single-shot outliers that inflate the cell mean and std without raising
+    # a quality flag (the shot itself may look like a valid I-V curve in
+    # isolation, but is inconsistent with the other shots at that position).
+    te_outlier_grid = _sigma_clip_te(per_shot, sev_grid)
+    n_te_outlier_total = int(te_outlier_grid.sum())
+    if n_te_outlier_total:
+        sys.stdout.write(
+            f"  Te sigma-clip: {n_te_outlier_total} shot(s) removed "
+            f"(>{K_SIGMA_CLIP:.0f}×MAD from cell median)\n"
+        )
+
     # Average over the shot axis (axis=1), excluding bad shots (NaN entries).
     result: dict = {"cycle_time_s": _cycle_start_times(run)}
     for q in QUANTITIES:
@@ -325,8 +410,13 @@ def _process_run(
     result["n_ok"] = (sev_grid == _SEV_OK).sum(axis=1).astype(np.int32)
     result["n_warn"] = (sev_grid == _SEV_WARN).sum(axis=1).astype(np.int32)
     result["n_bad"] = (sev_grid == _SEV_BAD).sum(axis=1).astype(np.int32)
-    # n_arc is a subset of n_bad: shots excluded by the arc detector before fitting.
+    # n_arc and n_te_outlier are subsets of n_bad (non-overlapping with each other).
     result["n_arc"] = arc_grid.sum(axis=1).astype(np.int32)
+    result["n_te_outlier"] = te_outlier_grid.sum(axis=1).astype(np.int32)
+    # Per-shot arrays — stored pre-sigma-clip so downstream code can apply
+    # any filtering strategy (different k, median, etc.) without reprocessing.
+    result["te_log_ev_shots"] = te_log_shots_raw  # (n_pos, n_shots, n_cycles)
+    result["sev_shots"] = sev_shots                # (n_pos, n_shots, n_cycles)
     result["cutoff_core_khz"] = core_cutoff_hz / 1e3
     result["cutoff_edge_khz"] = edge_cutoff_hz / 1e3
     return result
@@ -493,10 +583,15 @@ def main() -> None:
             n_ok = int(result["n_ok"].sum())
             n_warn = int(result["n_warn"].sum())
             n_bad = int(result["n_bad"].sum())
+            n_teo = int(result["n_te_outlier"].sum())
             total_ok += n_ok
             total_warn += n_warn
             total_bad += n_bad
-            sys.stdout.write(f"  → ok={n_ok}  warn={n_warn}  bad={n_bad}\n")
+            sys.stdout.write(
+                f"  → ok={n_ok}  warn={n_warn}  bad={n_bad}"
+                + (f"  (te_outlier={n_teo})" if n_teo else "")
+                + "\n"
+            )
 
     sys.stdout.write(f"\nWrote {args.output}\n")
     sys.stdout.write(f"Grand total — ok={total_ok}  warn={total_warn}  bad={total_bad}\n")
