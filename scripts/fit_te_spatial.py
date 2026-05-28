@@ -92,6 +92,13 @@ N_EDGE_ANCHOR_Z       = 40
 # the fit.  10 % keeps ES4's penultimate port (32 %) while dropping the last one.
 MIN_Z_COVERAGE  = 0.10
 
+# Monotonic-z upper bound.  T_e is expected to decrease monotonically with
+# axial distance z (away from the cathode).  Any downstream cell whose Te
+# exceeds the minimum finite upstream Te by more than this fractional padding
+# is masked before the RBF fill.  25 % gives room for shot-to-shot
+# fluctuations while still capping grossly inflated downstream estimates.
+MONO_Z_PADDING  = 0.25
+
 CMAP            = "plasma"
 
 
@@ -469,6 +476,66 @@ def _plot_comparison(data: dict, te_filled: np.ndarray, output_dir: Path) -> Non
 
 
 # ---------------------------------------------------------------------------
+# Monotonic-z upper bound
+# ---------------------------------------------------------------------------
+def _monotonic_z_bound(
+    te_grid: np.ndarray,        # (n_z, n_x, n_cycles)
+    z_cm: np.ndarray,
+    *,
+    padding: float = MONO_Z_PADDING,
+) -> tuple[np.ndarray, int]:
+    """Mask downstream cells that violate the expected z-monotonicity of T_e.
+
+    For each z-row z_i (i > 0), the upper bound is:
+
+        bound(x, cycle) = min( T_e[z_j, x, cycle]  for j < i, finite ) × (1 + padding)
+
+    i.e. the minimum finite T_e across *all* upstream z-rows, multiplied by a
+    fractional padding to accommodate shot-to-shot fluctuations.  Any cell
+    whose T_e exceeds this bound is set to NaN.
+
+    The bound is only applied where at least one upstream finite value exists.
+    The most-upstream z-row (i=0) is never touched.
+
+    Parameters
+    ----------
+    padding : float
+        Fractional allowance above the upstream minimum.  0.25 → 25 % above
+        the lowest reliable upstream measurement.
+
+    Returns
+    -------
+    te_bounded : (n_z, n_x, n_cycles) — copy of te_grid with outliers masked
+    n_masked   : total number of cells set to NaN by this step
+    """
+    te_out   = te_grid.copy()
+    n_masked = 0
+
+    for zi in range(1, len(z_cm)):
+        # Min T_e across all upstream z-rows per (x, cycle).
+        with np.errstate(all="ignore"):   # nanmin of all-NaN slice → NaN, handled below
+            upstream_min  = np.nanmin(te_grid[:zi], axis=0)  # (n_x, n_cycles)
+        has_upstream  = np.isfinite(upstream_min)
+        upper_bound   = upstream_min * (1.0 + padding)
+
+        exceeds = (
+            np.isfinite(te_grid[zi])
+            & has_upstream
+            & (te_grid[zi] > upper_bound)
+        )
+        if exceeds.any():
+            te_out[zi][exceeds] = np.nan
+            n_masked += int(exceeds.sum())
+            n_ref     = int(has_upstream.sum())
+            print(
+                f"    z = {z_cm[zi]:.1f} cm: {exceeds.sum()} / {n_ref} cells "
+                f"capped  (bound = upstream_min × {1+padding:.2f})"
+            )
+
+    return te_out, n_masked
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -505,6 +572,10 @@ def main() -> None:
                         help="T_e value assigned to SOL edge anchor points (eV).")
     parser.add_argument("--smoothing-edge-anchor", type=float, default=SMOOTHING_EDGE_ANCHOR,
                         help="RBF smoothing for SOL edge anchor points.")
+    parser.add_argument("--mono-z-padding", type=float, default=MONO_Z_PADDING,
+                        help="Fractional allowance above the minimum upstream T_e for the "
+                             "monotonic-z upper bound.  Set to a large value (e.g. 1e6) to "
+                             f"disable.  Default: {MONO_Z_PADDING}.")
     parser.add_argument("--min-z-coverage", type=float, default=MIN_Z_COVERAGE,
                         help="Minimum fraction of finite cells (across all x and cycles) "
                              "for a z-row to be included in the RBF fit. Rows below this "
@@ -554,6 +625,17 @@ def main() -> None:
             n_finite = int(np.isfinite(te_masked).sum())
             n_total  = int(te_masked.size)
             print(f"  {n_finite}/{n_total} cells finite ({100*n_finite/n_total:.1f}%) before fill")
+
+            # Apply monotonic-z upper bound: downstream cells whose Te exceeds
+            # the minimum upstream Te × (1 + padding) are masked before the RBF.
+            print(f"  Monotonic-z bound (padding={args.mono_z_padding:.0%}) …")
+            te_masked, n_mono = _monotonic_z_bound(
+                te_masked, z_cm, padding=args.mono_z_padding
+            )
+            if n_mono:
+                print(f"    {n_mono} cells masked by monotonicity bound")
+            else:
+                print(f"    No cells exceeded the upstream bound")
 
             print(f"  Fitting {te_masked.shape[2]} cycles …")
             te_filled = fill_te_grid(te_masked, x_cm, z_cm, **fill_kwargs)
