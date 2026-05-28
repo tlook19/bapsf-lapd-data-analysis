@@ -76,6 +76,14 @@ SMOOTHING_CORE     = 0.05   # tight fit in plasma core
 SMOOTHING_EDGE     = 2.0    # loose fit at plasma edge / scrape-off layer
 SMOOTHING_SENTINEL = 1e-4   # near-exact enforcement of wall boundary conditions
 
+# Edge prior: measurements near the scan edge are fluctuation-prone and can
+# create unrealistically hot shoulders in the filled profile.  Add low-Te anchor
+# points in the SOL so the RBF is pinned in the core but pulled down near edges.
+EDGE_ANCHOR_CM        = 22.0
+TE_EDGE_ANCHOR_EV     = 0.5
+SMOOTHING_EDGE_ANCHOR = 0.02
+N_EDGE_ANCHOR_Z       = 40
+
 # Z-row coverage threshold: any z-position whose overall fraction of finite cells
 # (summed across all x-positions and cycles) falls below this value is excluded
 # from the RBF data entirely.  The RBF then smoothly extrapolates from the last
@@ -91,7 +99,13 @@ CMAP            = "plasma"
 # Data loading (strict mask: n_bad > n_ok)
 # ---------------------------------------------------------------------------
 def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
-    """Load strict-masked T_e(n_z, n_x, n_cycles) for one experiment set."""
+    """Load strict-masked T_e(n_z, n_x, n_cycles) for one experiment set.
+
+    Only rot=0 runs are used.  Probe shadowing makes rot=180 measurements
+    unreliable for T_e (the downstream face sits in the probe's own shadow).
+    The rotation_deg attribute reflects any known swap corrections (e.g. ES3
+    p21 runs 32/33).
+    """
     x_cm = hf["x_cm"][:]
     eg   = hf["experiment_sets"][es_id]
 
@@ -99,7 +113,10 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
     cycle_time_s = None
 
     for run_id in sorted(eg.keys()):
-        rg = eg[run_id]
+        rg  = eg[run_id]
+        rot = float(rg.attrs.get("rotation_deg", 0))
+        if rot != 0.0:
+            continue                              # skip rot=180 runs
         z  = float(rg.attrs["z_cm"])
         if z not in z_groups:
             z_groups[z] = []
@@ -145,6 +162,31 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
     }
 
 
+def _load_filled_source_experiment_set(hf: h5py.File, es_id: str) -> dict:
+    """Load te_masked from a previous te_filled.hdf5-style product."""
+    grp = hf["experiment_sets"][es_id]
+    return {
+        "te":             grp["te_masked"][()],
+        "x_cm":           grp["x_cm"][()],
+        "z_cm":           grp["z_cm"][()],
+        "cycle_time_ms":  grp["cycle_time_ms"][()],
+        "es_label":       grp.attrs.get("label", f"set {es_id}"),
+        "v_bank":         grp.attrs.get("v_bank_v", "?"),
+        "es_id":          es_id,
+    }
+
+
+def _load_input_experiment_set(hf: h5py.File, es_id: str, input_mode: str) -> dict:
+    if input_mode == "filled":
+        return _load_filled_source_experiment_set(hf, es_id)
+    if input_mode == "langmuir":
+        return _load_experiment_set(hf, es_id)
+    grp = hf["experiment_sets"][es_id]
+    if "te_masked" in grp:
+        return _load_filled_source_experiment_set(hf, es_id)
+    return _load_experiment_set(hf, es_id)
+
+
 # ---------------------------------------------------------------------------
 # 2-D RBF fill
 # ---------------------------------------------------------------------------
@@ -182,6 +224,26 @@ def _build_sentinel_points(
     coords  = np.array(coords)          # (N, 2)  columns: [x, z]
     values  = np.full(len(coords), te_boundary)
     return coords, values
+
+
+def _build_edge_anchor_points(
+    *,
+    x_anchor: float,
+    z_cm: np.ndarray,
+    z_lo: float,
+    z_hi: float,
+    te_edge: float,
+    n_z: int = N_EDGE_ANCHOR_Z,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return low-Te SOL anchor points inside the measured scan envelope."""
+    z_min = max(float(np.nanmin(z_cm)), z_lo)
+    z_max = min(float(np.nanmax(z_cm)), z_hi)
+    z_vals = np.linspace(z_min, z_max, n_z)
+    coords = []
+    for z in z_vals:
+        coords.append((-x_anchor, z))
+        coords.append((x_anchor, z))
+    return np.array(coords), np.full(len(coords), te_edge)
 
 
 def _normalise(x: np.ndarray, z: np.ndarray,
@@ -224,6 +286,9 @@ def fill_te_cycle(
     x_edge:          float = X_EDGE_CM,
     smoothing_core:  float = SMOOTHING_CORE,
     smoothing_edge:  float = SMOOTHING_EDGE,
+    edge_anchor:     float = EDGE_ANCHOR_CM,
+    te_edge_anchor:  float = TE_EDGE_ANCHOR_EV,
+    smoothing_edge_anchor: float = SMOOTHING_EDGE_ANCHOR,
 ) -> np.ndarray:
     """Return filled (n_z, n_x) T_e array with no NaN cells.
 
@@ -255,9 +320,18 @@ def fill_te_cycle(
     )
     sent_smoothing = np.full(len(sent_values), SMOOTHING_SENTINEL)
 
-    all_coords    = np.vstack([data_coords,    sent_coords])
-    all_values    = np.concatenate([data_values,    sent_values])
-    all_smoothing = np.concatenate([data_smoothing, sent_smoothing])
+    edge_coords, edge_values = _build_edge_anchor_points(
+        x_anchor=edge_anchor,
+        z_cm=z_cm,
+        z_lo=z_lo,
+        z_hi=z_hi,
+        te_edge=te_edge_anchor,
+    )
+    edge_smoothing = np.full(len(edge_values), smoothing_edge_anchor)
+
+    all_coords    = np.vstack([data_coords,    edge_coords,    sent_coords])
+    all_values    = np.concatenate([data_values,    edge_values,    sent_values])
+    all_smoothing = np.concatenate([data_smoothing, edge_smoothing, sent_smoothing])
 
     # Normalise to unit square (avoids ~25× z/x aspect ratio skewing kernel)
     all_norm = _normalise(all_coords[:, 0], all_coords[:, 1], x_wall, z_lo, z_hi)
@@ -405,6 +479,8 @@ def main() -> None:
     parser.add_argument("--input",       type=Path,  default=HDF5_INPUT)
     parser.add_argument("--output",      type=Path,  default=HDF5_OUTPUT)
     parser.add_argument("--output-dir",  type=Path,  default=OUTPUT_DIR)
+    parser.add_argument("--input-mode", choices=["auto", "langmuir", "filled"], default="auto",
+                        help="Input layout: process_langmuir_sweeps output, previous te_filled output, or auto-detect.")
     parser.add_argument("--x-wall",      type=float, default=X_WALL_CM,
                         help="x position of drift-tube wall boundary (cm)")
     parser.add_argument("--z-cathode",   type=float, default=Z_CATHODE_CM,
@@ -423,6 +499,12 @@ def main() -> None:
                         help="RBF smoothing for core region (low = exact fit).")
     parser.add_argument("--smoothing-edge", type=float, default=SMOOTHING_EDGE,
                         help="RBF smoothing for edge region (high = loose fit).")
+    parser.add_argument("--edge-anchor", type=float, default=EDGE_ANCHOR_CM,
+                        help="|x| position for low-Te SOL anchor points (cm).")
+    parser.add_argument("--te-edge-anchor", type=float, default=TE_EDGE_ANCHOR_EV,
+                        help="T_e value assigned to SOL edge anchor points (eV).")
+    parser.add_argument("--smoothing-edge-anchor", type=float, default=SMOOTHING_EDGE_ANCHOR,
+                        help="RBF smoothing for SOL edge anchor points.")
     parser.add_argument("--min-z-coverage", type=float, default=MIN_Z_COVERAGE,
                         help="Minimum fraction of finite cells (across all x and cycles) "
                              "for a z-row to be included in the RBF fit. Rows below this "
@@ -449,6 +531,9 @@ def main() -> None:
         x_edge          = args.x_edge,
         smoothing_core  = args.smoothing_core,
         smoothing_edge  = args.smoothing_edge,
+        edge_anchor     = args.edge_anchor,
+        te_edge_anchor  = args.te_edge_anchor,
+        smoothing_edge_anchor = args.smoothing_edge_anchor,
         min_z_coverage  = args.min_z_coverage,
     )
 
@@ -460,7 +545,7 @@ def main() -> None:
 
         for es_id in es_ids:
             print(f"\nES {es_id}:")
-            data = _load_experiment_set(hf_in, es_id)
+            data = _load_input_experiment_set(hf_in, es_id, args.input_mode)
 
             te_masked = data["te"]
             x_cm      = data["x_cm"]

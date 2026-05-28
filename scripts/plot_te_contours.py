@@ -48,7 +48,12 @@ def _pcolormesh_edges(centers: np.ndarray) -> np.ndarray:
 
 
 def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
-    """Load all data for one experiment set, averaging duplicate-z runs."""
+    """Load all data for one experiment set from rot=0 runs only.
+
+    Rot=180 runs are excluded: the downstream probe face sits in the probe's
+    own magnetic shadow, making its T_e estimate unreliable.  The rotation_deg
+    attribute reflects any known swap corrections (e.g. ES3 p21 runs 32/33).
+    """
     x_cm = hf["x_cm"][:]
     eg = hf["experiment_sets"][es_id]
     es_label = eg.attrs.get("label", f"set {es_id}")
@@ -60,6 +65,8 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
 
     for run_id in sorted(eg.keys()):
         rg = eg[run_id]
+        if float(rg.attrs.get("rotation_deg", 0)) != 0.0:
+            continue                              # skip rot=180 runs
         z = float(rg.attrs["z_cm"])
         if z not in z_groups:
             z_groups[z] = []
@@ -113,12 +120,13 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
 
 
 def _load_experiment_set_loose(hf: h5py.File, es_id: str) -> dict:
-    """Like _load_experiment_set but masks only when bad > ok+warn.
+    """Like _load_experiment_set but masks only when bad > ok+warn (rot=0 only).
 
     warn-severity shots have valid Te estimates (they passed the fitter but
     triggered a soft quality flag).  This looser threshold includes them in
     the denominator so cells with mostly-warn populations are not hidden.
     Produces a second set of plots for comparison with the strict mask.
+    Rot=180 runs are excluded for the same shadowing reason as the strict loader.
     """
     x_cm = hf["x_cm"][:]
     eg = hf["experiment_sets"][es_id]
@@ -130,6 +138,8 @@ def _load_experiment_set_loose(hf: h5py.File, es_id: str) -> dict:
 
     for run_id in sorted(eg.keys()):
         rg = eg[run_id]
+        if float(rg.attrs.get("rotation_deg", 0)) != 0.0:
+            continue                              # skip rot=180 runs
         z = float(rg.attrs["z_cm"])
         if z not in z_groups:
             z_groups[z] = []
