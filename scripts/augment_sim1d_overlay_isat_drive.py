@@ -1,12 +1,17 @@
-"""Append the raw drive-window Isat family to a sim1d overlay (schema v3).
+"""Append the raw drive-window Isat family to a sim1d overlay (schema v2/v3/v5).
 
 Adds ``isat_drive_*`` — the upstream ion-saturation current from the
 inter-sweep dead-time cells DURING the drive — to an existing
 ``es{N}_sim1d_overlay.npz``, per the exporter brief in
 ``~/bapsf/docs/notes/CATHODE_IDRIVEN_PLAN.md`` section 7h.  Input may be
-schema v2 (es1 vintage) or v3 (adds the isat_decay source-channel
+schema v2 (es1 vintage), v3 (adds the isat_decay source-channel
 metadata; es2/es3 vintage — v3 was already taken by that export, so the
-drive family is SCHEMA v4, superseding the 7h brief's "v3").  The consumer is
+drive family is SCHEMA v4, superseding the 7h brief's "v3"), or v5 (the
+current export, which adds the per-port ``te_window_spread_frac``).  A v5
+input is written back as SCHEMA v6, so the spread field's presence stays
+readable from the version alone; an augmented version is never itself an
+accepted input, which is what makes a second augmentation fail the gate.
+The consumer is
 ``bapsf-transport/cablp/scripts/compare_sim1d_es1.py --beta-collapse``
 (within-shot area guard + model-free sweep-chain consistency).
 
@@ -32,7 +37,8 @@ Usage::
 
 Writes in place by default (pass --output to write elsewhere).  Old
 fields are copied through unchanged (round-trip gate); refuses to touch
-an overlay that is not schema v2 unless --force.
+an overlay whose schema is not an accepted input unless --force, in which
+case an unrecognised version is written back unchanged.
 """
 
 from __future__ import annotations
@@ -45,6 +51,12 @@ import numpy as np
 
 PROFILES = Path("processed/isweep_deadtime_profiles.hdf5")
 SEAM_WINDOW_MS = 0.25  # first slice of the decay trace used for the seam gate
+
+# Accepted un-augmented exporter schemas mapped to the schema written after the
+# drive family is appended.  Keys are the inputs this script will augment;
+# values are versions it will NOT re-accept, which is what makes an
+# already-augmented overlay fail the gate instead of being augmented twice.
+AUGMENTED_SCHEMA = {2: 4, 3: 4, 5: 6}
 
 
 def _seam_gate(new: dict, decay_t, decay_mean, decay_sem) -> list[str]:
@@ -85,9 +97,10 @@ def augment(overlay_path: Path, profiles_path: Path, experiment_set: int,
             output_path: Path, force: bool) -> int:
     overlay = dict(np.load(overlay_path, allow_pickle=False))
     schema = int(overlay["schema_version"])
-    if schema not in (2, 3) and not force:
+    if schema not in AUGMENTED_SCHEMA and not force:
+        accepted = ", ".join(f"v{v}" for v in sorted(AUGMENTED_SCHEMA))
         raise SystemExit(
-            f"{overlay_path} is schema v{schema}, expected v2 or v3 "
+            f"{overlay_path} is schema v{schema}, expected {accepted} "
             "(already augmented? pass --force to redo)"
         )
     run_ids = [str(r) for r in overlay["isat_decay_run_id"]]
@@ -192,9 +205,10 @@ def augment(overlay_path: Path, profiles_path: Path, experiment_set: int,
     failed = any("SEAM FAIL" in line for line in seam)
 
     overlay.update(new)
-    overlay["schema_version"] = np.array(4)
+    augmented_schema = AUGMENTED_SCHEMA.get(schema, schema)
+    overlay["schema_version"] = np.array(augmented_schema)
     np.savez(output_path, **overlay)
-    print(f"wrote schema v4 -> {output_path}")
+    print(f"wrote schema v{augmented_schema} -> {output_path}")
     return 1 if failed else 0
 
 
@@ -206,7 +220,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=None,
                         help="default: overwrite --overlay in place")
     parser.add_argument("--force", action="store_true",
-                        help="re-augment an overlay that is not schema v2")
+                        help="re-augment an overlay whose schema is not an accepted input")
     args = parser.parse_args()
     raise SystemExit(
         augment(args.overlay, args.profiles, args.experiment_set,
