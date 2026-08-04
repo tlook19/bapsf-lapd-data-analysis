@@ -6,6 +6,7 @@ The NPZ product is self-contained and uses simulation-facing units:
 * core electron temperature and radial SEM in eV;
 * offset-corrected upstream ion-saturation current at x=0 in A;
 * offset-corrected discharge current in A and cathode-anode voltage in V;
+* per-port fractional spread of the fit-window T_e re-fits, dimensionless;
 * all time axes in ms relative to the experimental SIS trigger.
 
 Probe-A density SEM includes the propagated area-calibration uncertainty.
@@ -52,6 +53,7 @@ DENSITY_HDF5 = Path("processed/density_profiles_isweep.hdf5")
 TE_HDF5 = Path("processed/te_filled.hdf5")
 ISAT_PROFILE_HDF5 = Path("processed/isweep_deadtime_profiles.hdf5")
 ZERO_OFFSETS = Path("processed/trace_zero_offsets.toml")
+WINDOW_REFITS_HDF5 = Path("processed/sweep_window_refits.hdf5")
 PORTS = np.array([11, 21, 29, 41, 50], dtype=np.int16)
 X_MIN_CM = -10.0
 X_MAX_CM = 10.0
@@ -214,6 +216,39 @@ def _isat_decay_stats(
     }
 
 
+def _te_window_spread_frac(
+    refits_path: Path,
+    experiment_set_id: int,
+    ports: np.ndarray,
+) -> np.ndarray:
+    """Return the per-port fractional spread of the fit-window ``T_e`` re-fits.
+
+    For each port, ``ptp(te_window_ev) / mean(te_window_ev)`` over the
+    ``p_low`` x ``f_high`` fit-window grid stored in
+    ``processed/sweep_window_refits.hdf5``.  The result is dimensionless, is
+    aligned element-wise with ``ports`` (and hence with the overlay's ``port``
+    and ``z_cm`` axes), and measures how far a port's ``T_e`` moves when the
+    retarding-region fit window is varied rather than how uncertain its mean is.
+
+    The value is ``NaN`` where the experiment set or the port has no re-fit
+    group, and ``NaN`` where a port's grid contains a failed re-fit, since a
+    single missing window makes the full spread undetermined rather than
+    smaller.
+    """
+    spread = np.full(len(ports), np.nan, dtype=np.float64)
+    with h5py.File(refits_path, "r") as refits_hdf:
+        set_group = refits_hdf.get(f"set{experiment_set_id}")
+        if set_group is None:
+            return spread
+        for index, port in enumerate(ports):
+            port_group = set_group.get(f"port{int(port)}")
+            if port_group is None:
+                continue
+            grid = np.asarray(port_group["te_window_ev"][()], dtype=np.float64)
+            spread[index] = np.ptp(grid) / np.mean(grid)
+    return spread
+
+
 def _discharge_stats(
     dataset: LapdDataset,
     experiment_set_id: int,
@@ -285,6 +320,7 @@ def export_overlay(
     manifest_path: Path,
     output_path: Path,
     experiment_set_id: int = 1,
+    window_refits_path: Path = WINDOW_REFITS_HDF5,
 ) -> Path:
     experiment_set_key = str(experiment_set_id)
     with h5py.File(density_path, "r") as density_hdf, h5py.File(te_path, "r") as te_hdf:
@@ -329,10 +365,15 @@ def export_overlay(
             f"do not match expected {PORTS}"
         )
     discharge = _discharge_stats(dataset, experiment_set_id)
+    te_window_spread = _te_window_spread_frac(
+        window_refits_path,
+        experiment_set_id,
+        PORTS,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        schema_version=np.array(3, dtype=np.int16),
+        schema_version=np.array(5, dtype=np.int16),
         experiment_set_id=np.array(experiment_set_id, dtype=np.int16),
         experiment_label=np.array(experiment_label),
         port=PORTS,
@@ -346,6 +387,7 @@ def export_overlay(
         te_mean_ev=te.mean,
         te_sem_ev=te.sem,
         te_core_count=te.count,
+        te_window_spread_frac=te_window_spread,
         core_x_min_cm=np.array(X_MIN_CM),
         core_x_max_cm=np.array(X_MAX_CM),
         probe_a_factor=np.array(factor),
@@ -410,6 +452,7 @@ def main() -> None:
     parser.add_argument("--te-filled", type=Path, default=TE_HDF5)
     parser.add_argument("--isat-profiles", type=Path, default=ISAT_PROFILE_HDF5)
     parser.add_argument("--zero-offsets", type=Path, default=ZERO_OFFSETS)
+    parser.add_argument("--window-refits", type=Path, default=WINDOW_REFITS_HDF5)
     parser.add_argument("--manifest", type=Path, default=MANIFEST)
     parser.add_argument("--experiment-set", type=int, choices=(1, 2, 3, 4), default=1)
     parser.add_argument("--output", type=Path)
@@ -425,6 +468,7 @@ def main() -> None:
         args.manifest,
         output,
         args.experiment_set,
+        args.window_refits,
     )
 
 

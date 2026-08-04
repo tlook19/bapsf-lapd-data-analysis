@@ -25,4 +25,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-pythonpath = ["src"]
+# ``scripts`` is on the path because the script modules import their siblings by
+# bare module name, which only resolves when the script directory itself is
+# importable.
+pythonpath = ["src", "scripts"]
