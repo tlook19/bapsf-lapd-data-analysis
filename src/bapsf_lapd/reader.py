@@ -14,7 +14,11 @@ from bapsf_lapd.config import ChannelKind, RunConfig
 
 @dataclass(frozen=True)
 class DischargeSummary:
-    """Peak discharge values derived from the start/end discharge traces."""
+    """Peak discharge values derived from the start/end discharge traces.
+
+    ``peak_current_a`` and ``peak_power_w`` are computed after the additive
+    discharge-channel zero offset in ``zero_offset_a`` has been subtracted.
+    """
 
     peak_current_a: float
     voltage_at_peak_v: float
@@ -23,6 +27,51 @@ class DischargeSummary:
     trace_index: int
     sample_index: int
     time_s: float
+    zero_offset_a: float
+
+
+@dataclass(frozen=True)
+class DischargeOffsetStats:
+    """Additive zero offset of one run's ``MSI/Discharge`` current channel.
+
+    All currents are in amperes and all times in seconds on the stored
+    ``MSI/Discharge`` time base.  ``offset_a`` is the quantity to subtract from
+    the discharge current; the two cross-check means are reported alongside it
+    but do not enter the correction.
+
+    Attributes
+    ----------
+    offset_a:
+        Primary estimate: the mean current over the post-connect,
+        pre-avalanche window of every stored trace, where the bank is at full
+        voltage and no plasma has formed, so the true current is zero.
+    std_a, stderr_a:
+        Sample standard deviation and standard error of the per-trace window
+        means.
+    n_traces, n_samples:
+        Number of stored traces and the number of window samples per trace.
+    connect_time_s, avalanche_time_s:
+        Trace-averaged bank-connect and avalanche-onset times bounding the
+        window.
+    window_start_s, window_stop_s:
+        Trace-averaged window edges.
+    pre_connect_mean_a:
+        Cross-check over the pre-connect record, where the bank is open.
+    far_tail_mean_a:
+        Cross-check over the far trace tail, after the switch has opened.
+    """
+
+    offset_a: float
+    std_a: float
+    stderr_a: float
+    n_traces: int
+    n_samples: int
+    connect_time_s: float
+    avalanche_time_s: float
+    window_start_s: float
+    window_stop_s: float
+    pre_connect_mean_a: float
+    far_tail_mean_a: float
 
 
 @dataclass(frozen=True)
@@ -58,6 +107,22 @@ class OffsetStats:
         return self.offset_v
 
 
+# Discharge-current zero-offset window definition.  The primary window opens a
+# guard interval after the bank-connect step, which clears the single-sample
+# switching transient, and closes at a fixed fraction of the connect-to-
+# avalanche interval, which keeps it clear of the rising avalanche foot.
+DISCHARGE_CONNECT_GUARD_S = 0.4e-3
+DISCHARGE_PREAVALANCHE_FRACTION = 0.3
+DISCHARGE_AVALANCHE_THRESHOLD_A = 150.0
+DISCHARGE_AVALANCHE_SUSTAIN_SAMPLES = 3
+DISCHARGE_MIN_OFFSET_SAMPLES = 5
+# Cross-check windows: the record before the bank closes, and the far tail
+# after the switch opens again.
+DISCHARGE_PRE_CONNECT_GUARD_S = 1.0e-3
+DISCHARGE_FAR_TAIL_START_S = 60.0e-3
+DISCHARGE_FAR_TAIL_STOP_S = 140.0e-3
+
+
 def _decode(value: Any) -> Any:
     if isinstance(value, bytes | np.bytes_):
         return value.decode("utf-8", errors="replace")
@@ -66,6 +131,62 @@ def _decode(value: Any) -> Any:
     if isinstance(value, np.ndarray):
         return value.tolist()
     return value
+
+
+def discharge_connect_time_s(voltage: np.ndarray, time_s: np.ndarray) -> float:
+    """Return the bank-connect time of one cathode-anode voltage trace.
+
+    The switch close is a single-sample step from zero to the full bank
+    voltage, so the connect time is taken as the linearly interpolated
+    crossing of half the step amplitude.  Raw cathode-anode voltage is
+    negative, so the step is located on the magnitude.  Raises ``ValueError``
+    if the trace carries no step.
+    """
+    magnitude = np.abs(np.asarray(voltage, dtype=np.float64))
+    peak = float(magnitude.max())
+    if peak <= 0.0:
+        raise ValueError("Cathode-anode voltage trace carries no bank-connect step")
+    amplitude = float(np.median(magnitude[magnitude > 0.5 * peak]))
+    half = 0.5 * amplitude
+    above = np.flatnonzero(magnitude >= half)
+    if above.size == 0 or above[0] == 0:
+        raise ValueError("Cathode-anode voltage trace carries no bank-connect step")
+    index = int(above[0])
+    low = magnitude[index - 1]
+    high = magnitude[index]
+    span = float(high - low)
+    if span <= 0.0:
+        return float(time_s[index])
+    return float(time_s[index - 1] + (half - low) * (time_s[index] - time_s[index - 1]) / span)
+
+
+def discharge_avalanche_time_s(
+    current: np.ndarray,
+    time_s: np.ndarray,
+    *,
+    threshold_a: float = DISCHARGE_AVALANCHE_THRESHOLD_A,
+    sustain_samples: int = DISCHARGE_AVALANCHE_SUSTAIN_SAMPLES,
+) -> float:
+    """Return the avalanche-onset time of one discharge-current trace.
+
+    Onset is the first sample of the first run of ``sustain_samples``
+    consecutive samples at or above ``threshold_a``.  Requiring a sustained
+    crossing rejects the single-sample inrush spike that accompanies the
+    switch close.  Raises ``ValueError`` if the trace never crosses.
+    """
+    if sustain_samples < 1:
+        raise ValueError("sustain_samples must be at least 1")
+    above = (np.asarray(current, dtype=np.float64) >= threshold_a).astype(np.int64)
+    if above.size < sustain_samples:
+        raise ValueError("Discharge current trace is shorter than the sustain window")
+    runs = np.convolve(above, np.ones(sustain_samples, dtype=np.int64), mode="valid")
+    sustained = np.flatnonzero(runs == sustain_samples)
+    if sustained.size == 0:
+        raise ValueError(
+            f"Discharge current never sustains {threshold_a} A for "
+            f"{sustain_samples} samples"
+        )
+    return float(time_s[int(sustained[0])])
 
 
 class LapdRun:
@@ -396,14 +517,110 @@ class LapdRun:
             raise ZeroDivisionError("Moving photodiode peak is zero; cannot normalize")
         return peak
 
-    def discharge_summary(self) -> DischargeSummary:
-        """Derive discharge peak current, matching voltage, and peak power."""
+    def discharge_traces(self) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Return the stored discharge current, voltage, and time base.
+
+        Current is in amperes, raw cathode-anode voltage in volts (negative),
+        and time in seconds.  Both trace arrays are ``(n_traces, n_samples)``;
+        no zero-offset correction is applied.
+        """
         with self.open() as h5:
             discharge = h5["MSI/Discharge"]
             current = discharge["Discharge current"][()].astype(np.float64)
             voltage = discharge["Cathode-anode voltage"][()].astype(np.float64)
             start_time = float(discharge.attrs["Start time"])
             timestep = float(discharge.attrs["Timestep"])
+        time_s = start_time + np.arange(current.shape[1], dtype=np.float64) * timestep
+        return current, voltage, time_s
+
+    def discharge_zero_offset_stats(self) -> DischargeOffsetStats:
+        """Estimate the additive zero offset of the discharge-current channel.
+
+        The estimate is the mean current over the post-connect, pre-avalanche
+        window of every stored trace: the bank is closed and at full voltage
+        but no plasma has formed, so the true current is zero and any reading
+        is channel offset.  The window opens
+        ``DISCHARGE_CONNECT_GUARD_S`` after the interpolated bank-connect step
+        and closes at ``DISCHARGE_PREAVALANCHE_FRACTION`` of the interval from
+        connect to avalanche onset.  Offsets are in amperes; the conversion
+        from the shunt is already applied in the stored channel.
+
+        The pre-connect record and the far trace tail are averaged as
+        cross-checks and reported on the result, but only the post-connect
+        window sets ``offset_a``.
+
+        Raises ``ValueError`` if a trace carries no bank-connect step, never
+        reaches avalanche onset, or yields fewer than
+        ``DISCHARGE_MIN_OFFSET_SAMPLES`` window samples.
+        """
+        current, voltage, time_s = self.discharge_traces()
+
+        window_means = []
+        window_counts = []
+        connect_times = []
+        avalanche_times = []
+        window_starts = []
+        window_stops = []
+        pre_connect_means = []
+        for trace_index in range(current.shape[0]):
+            connect_s = discharge_connect_time_s(voltage[trace_index], time_s)
+            avalanche_s = discharge_avalanche_time_s(current[trace_index], time_s)
+            if avalanche_s <= connect_s:
+                raise ValueError(
+                    f"Run {self.config.run_id} trace {trace_index}: avalanche onset "
+                    f"{avalanche_s} s does not follow bank connect {connect_s} s"
+                )
+            start_s = connect_s + DISCHARGE_CONNECT_GUARD_S
+            stop_s = connect_s + DISCHARGE_PREAVALANCHE_FRACTION * (avalanche_s - connect_s)
+            window = (time_s >= start_s) & (time_s < stop_s)
+            n_window = int(window.sum())
+            if n_window < DISCHARGE_MIN_OFFSET_SAMPLES:
+                raise ValueError(
+                    f"Run {self.config.run_id} trace {trace_index}: post-connect "
+                    f"pre-avalanche window holds {n_window} samples, fewer than the "
+                    f"required {DISCHARGE_MIN_OFFSET_SAMPLES}"
+                )
+            pre_connect = time_s <= connect_s - DISCHARGE_PRE_CONNECT_GUARD_S
+            window_means.append(float(current[trace_index][window].mean()))
+            window_counts.append(n_window)
+            connect_times.append(connect_s)
+            avalanche_times.append(avalanche_s)
+            window_starts.append(start_s)
+            window_stops.append(stop_s)
+            pre_connect_means.append(float(current[trace_index][pre_connect].mean()))
+
+        far_tail = (time_s >= DISCHARGE_FAR_TAIL_START_S) & (
+            time_s <= DISCHARGE_FAR_TAIL_STOP_S
+        )
+        per_trace = np.asarray(window_means, dtype=np.float64)
+        n_traces = int(per_trace.size)
+        std = float(per_trace.std(ddof=1)) if n_traces > 1 else 0.0
+        return DischargeOffsetStats(
+            offset_a=float(per_trace.mean()),
+            std_a=std,
+            stderr_a=std / float(np.sqrt(n_traces)) if n_traces > 0 else 0.0,
+            n_traces=n_traces,
+            n_samples=int(np.min(window_counts)),
+            connect_time_s=float(np.mean(connect_times)),
+            avalanche_time_s=float(np.mean(avalanche_times)),
+            window_start_s=float(np.mean(window_starts)),
+            window_stop_s=float(np.mean(window_stops)),
+            pre_connect_mean_a=float(np.mean(pre_connect_means)),
+            far_tail_mean_a=float(current[:, far_tail].mean()),
+        )
+
+    def discharge_summary(self) -> DischargeSummary:
+        """Derive discharge peak current, matching voltage, and peak power.
+
+        The discharge-current zero offset from
+        ``discharge_zero_offset_stats`` is subtracted before the peak is
+        located.
+        """
+        current, voltage, time_s = self.discharge_traces()
+        start_time = float(time_s[0])
+        timestep = float(time_s[1] - time_s[0])
+        zero_offset_a = self.discharge_zero_offset_stats().offset_a
+        current = current - zero_offset_a
 
         flat_index = int(np.nanargmax(current))
         trace_index, sample_index = np.unravel_index(flat_index, current.shape)
@@ -418,4 +635,5 @@ class LapdRun:
             trace_index=int(trace_index),
             sample_index=int(sample_index),
             time_s=float(start_time + sample_index * timestep),
+            zero_offset_a=zero_offset_a,
         )

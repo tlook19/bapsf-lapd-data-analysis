@@ -42,12 +42,19 @@ from bapsf_lapd.density import (
     ion_sound_speed_m_s,
     load_probe_a_area_calibration,
 )
-from bapsf_lapd.reader import DischargeSummary, LapdRun, OffsetStats, TraceStats
+from bapsf_lapd.reader import (
+    DischargeOffsetStats,
+    DischargeSummary,
+    LapdRun,
+    OffsetStats,
+    TraceStats,
+)
 
 __all__ = [
     "AcquisitionConfig",
     "ChannelConfig",
     "ChannelKind",
+    "DischargeOffsetStats",
     "DischargeSummary",
     "ExperimentSet",
     "EFFECTIVE_ROTATION_OVERRIDES",

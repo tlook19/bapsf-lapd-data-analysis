@@ -5,7 +5,7 @@ The NPZ product is self-contained and uses simulation-facing units:
 * core density and total SEM in cm^-3;
 * core electron temperature and radial SEM in eV;
 * offset-corrected upstream ion-saturation current at x=0 in A;
-* discharge current in A and cathode-anode voltage in V;
+* offset-corrected discharge current in A and cathode-anode voltage in V;
 * all time axes in ms relative to the experimental SIS trigger.
 
 Probe-A density SEM includes the propagated area-calibration uncertainty.
@@ -14,10 +14,12 @@ profile pipeline.  A shot is excluded from the continuous decay trace if it is
 flagged in any pre-afterglow inter-sweep cell at x=0.  The retained traces are
 100 kHz low-pass filtered and reduced to approximately 10 us time bins before
 the shot mean and SEM are computed.
-Discharge traces are smoothed with the same 9-sample moving average used by
-``process_discharge_experiment_summary.py`` and averaged over both stored
-traces from all runs in the selected experiment set.  Raw cathode-anode voltage is negative, so the
-exported overlay voltage is multiplied by -1.
+Each run's discharge current has its own additive channel zero offset
+subtracted before smoothing; the per-run values are exported alongside the
+traces.  Discharge traces are smoothed with the same 9-sample moving average
+used by ``process_discharge_experiment_summary.py`` and averaged over both
+stored traces from all runs in the selected experiment set.  Raw cathode-anode
+voltage is negative, so the exported overlay voltage is multiplied by -1.
 """
 
 from __future__ import annotations
@@ -216,25 +218,29 @@ def _discharge_stats(
     dataset: LapdDataset,
     experiment_set_id: int,
 ) -> dict[str, np.ndarray | int]:
+    """Return the offset-corrected experiment-set discharge current and voltage.
+
+    Each run's discharge current has its own additive channel zero offset
+    (``LapdRun.discharge_zero_offset_stats``) subtracted before smoothing, so
+    the exported trace reads zero where no current flows.
+    """
     currents = []
     voltages_raw = []
+    zero_offsets_a = []
+    run_ids = []
     reference_time_s = None
 
     for run_id in dataset.experiment_set_run_ids(experiment_set_id):
         run = dataset.run(run_id)
-        with run.open() as hdf:
-            grp = hdf["MSI/Discharge"]
-            current = grp["Discharge current"][()].astype(np.float64)
-            voltage = grp["Cathode-anode voltage"][()].astype(np.float64)
-            time_s = (
-                float(grp.attrs["Start time"])
-                + np.arange(current.shape[1], dtype=np.float64)
-                * float(grp.attrs["Timestep"])
-            )
+        current, voltage, time_s = run.discharge_traces()
+        zero_offset_a = run.discharge_zero_offset_stats().offset_a
+        current = current - zero_offset_a
         if reference_time_s is None:
             reference_time_s = time_s
         elif not np.allclose(time_s, reference_time_s, rtol=0.0, atol=1e-12):
             raise ValueError(f"Discharge time grid differs for run {run_id}")
+        zero_offsets_a.append(zero_offset_a)
+        run_ids.append(run_id)
         currents.append(
             uniform_filter1d(
                 current,
@@ -266,6 +272,8 @@ def _discharge_stats(
         "voltage_positive_mean_v": -np.mean(voltage_all_raw, axis=0),
         "voltage_sem_v": voltage_std / np.sqrt(n_traces),
         "n_traces": n_traces,
+        "zero_offset_a": np.asarray(zero_offsets_a, dtype=np.float64),
+        "zero_offset_run_id": np.asarray(run_ids),
     }
 
 
@@ -375,6 +383,12 @@ def export_overlay(
         discharge_voltage_positive_mean_v=discharge["voltage_positive_mean_v"],
         discharge_voltage_sem_v=discharge["voltage_sem_v"],
         discharge_n_traces=np.array(discharge["n_traces"], dtype=np.int16),
+        discharge_zero_offset_a=discharge["zero_offset_a"],
+        discharge_zero_offset_run_id=discharge["zero_offset_run_id"],
+        discharge_current_correction=np.array(
+            "per-run additive zero offset from the post-connect pre-avalanche "
+            "window subtracted before smoothing"
+        ),
         discharge_smoothing_samples=np.array(
             DISCHARGE_SMOOTHING_SAMPLES,
             dtype=np.int16,
