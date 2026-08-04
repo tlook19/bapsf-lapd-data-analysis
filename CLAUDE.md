@@ -69,3 +69,8 @@ All run metadata is captured in frozen dataclasses: `ExperimentSet` (plasma cond
 ### Scripts (`scripts/`)
 
 Standalone scripts that import `bapsf_lapd` and write outputs to `processed/` or `figures/`. They are not part of the installable package and are run directly with the `.venv` interpreter.
+
+## TODOs / Calibration Notes
+
+- The canonical p11/p50 Probe A factor is stored in `config/may2026_probe_a_area_calibration.toml`. It is calibrated from experiment-set-1 FWHM-core density over 10--19 ms after one-sided high-current shot rejection, requiring `n_p11 <= n_p21` and `n_p50 >= n_p41`. Apply it exactly once to both Probe A faces in all sets; it is an empirical current-normalization factor, not a direct geometric-area measurement.
+- ES3 filled T_e trusts p11/p29 and ES4 trusts p11. Other later-set axial rows are excluded before filling because they approach the diagnostic's low-T_e limit, and the filled core mean is constrained to decrease monotonically downstream.

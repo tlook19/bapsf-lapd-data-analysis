@@ -1,0 +1,24 @@
+# Canonical empirical Probe A (p11/p50) normalization for May 2026.
+#
+# Derived from ES1 FWHM-core mean density over 10--19 ms after one-sided
+# high-current-shot rejection. The bracket requires scaled p11 density to be
+# no greater than p21 and scaled p50 density to be no less than p41.
+#
+# This is an effective current-to-area normalization, not a claim that the
+# physical probe face is geometrically smaller by this factor. Apply it once
+# to raw Probe A current (or, equivalently, divide its reference area by the
+# factor). The same Probe A body supplies both electrical faces, so this file
+# makes the analysis-wide assumption that the factor applies to both faces.
+
+[probe_A]
+factor = 2.03030067440105
+lower_bound = 2.023366858377941
+upper_bound = 2.0372582517131432
+applies_to_run_suffixes = "1,8"
+applies_to_both_faces = true
+reference_probe = "B"
+calibration_experiment_set = 1
+calibration_time_min_ms = 10.0
+calibration_time_max_ms = 19.0
+calibration_metric = "FWHM-core mean electron density"
+high_current_outliers_excluded = true

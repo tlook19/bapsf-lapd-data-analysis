@@ -8,16 +8,28 @@ Axes
 ----
   x  : probe scan position in cm (−25 to +25)
   y  : axial position z in cm (port locations along the machine)
-  color : T_e (eV) from the exponential fit, mean over ok/warn shots
+  color : T_e (eV) from the best-of-log-or-exp fit, averaged over valid shots
 
-Runs at the same z (rot=0 and rot=180 pairs) are averaged cell-by-cell.
-Bad-dominated cells (n_bad > n_ok + n_warn) are masked.
+Masking
+-------
+Runs at the same z are averaged cell-by-cell, weighted by the number of valid
+shots (n_ok + n_warn) that contributed to each cell's te_best_ev estimate.
+Cells are hidden only when the total number of valid shots across all runs at
+that z falls below --min-shots (default: 2).  This preserves cells with a
+handful of good shots rather than hiding them solely because bad shots
+outnumber good ones — the best-fit selection already discards unreliable fits
+at the per-shot level.
+
+Only rot=0 runs are used; rot=180 runs are excluded because the downstream
+probe face sits in the probe's own magnetic shadow.  The rotation_deg attribute
+reflects any known swap corrections (e.g. ES3 p21 runs 32/33).
 
 Usage
 -----
   MPLCONFIGDIR=.matplotlib ./.venv/bin/python scripts/plot_te_contours.py
   MPLCONFIGDIR=.matplotlib ./.venv/bin/python scripts/plot_te_contours.py \\
-      --input processed/langmuir_sweeps.hdf5 --output-dir figures [--no-animation]
+      --input processed/langmuir_sweeps.hdf5 --output-dir figures \\
+      [--min-shots 2] [--no-animation]
 """
 
 from __future__ import annotations
@@ -38,6 +50,10 @@ CMAP = "plasma"
 SUBPLOT_NCOLS = 8
 SUBPLOT_NROWS = 5  # 8 × 5 = 40 panels for 40 cycles
 
+# Default minimum valid-shot count to show a cell.  Cells with fewer
+# contributing shots (n_ok + n_warn) across all runs at the same z are NaN.
+DEFAULT_MIN_SHOTS = 2
+
 
 def _pcolormesh_edges(centers: np.ndarray) -> np.ndarray:
     """Convert bin centers to edges via midpoint rule, extending the outer bins symmetrically."""
@@ -47,86 +63,14 @@ def _pcolormesh_edges(centers: np.ndarray) -> np.ndarray:
     return np.concatenate([[lo], mids, [hi]])
 
 
-def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
-    """Load all data for one experiment set from rot=0 runs only.
+def _load_experiment_set(hf: h5py.File, es_id: str, min_shots: int = DEFAULT_MIN_SHOTS) -> dict:
+    """Load and average te_best_ev for one experiment set (rot=0 runs only).
 
-    Rot=180 runs are excluded: the downstream probe face sits in the probe's
-    own magnetic shadow, making its T_e estimate unreliable.  The rotation_deg
-    attribute reflects any known swap corrections (e.g. ES3 p21 runs 32/33).
-    """
-    x_cm = hf["x_cm"][:]
-    eg = hf["experiment_sets"][es_id]
-    es_label = eg.attrs.get("label", f"set {es_id}")
-    v_bank = eg.attrs.get("v_bank_v", "?")
-
-    # Group runs by z position and collect te + quality counts.
-    z_groups: dict[float, list] = {}
-    cycle_time_s = None
-
-    for run_id in sorted(eg.keys()):
-        rg = eg[run_id]
-        if float(rg.attrs.get("rotation_deg", 0)) != 0.0:
-            continue                              # skip rot=180 runs
-        z = float(rg.attrs["z_cm"])
-        if z not in z_groups:
-            z_groups[z] = []
-        te = rg["te_log_ev"][:]        # (n_pos, n_cycles)
-        n_ok = rg["n_ok"][:]
-        n_warn = rg["n_warn"][:]
-        n_bad = rg["n_bad"][:]
-        z_groups[z].append((te, n_ok, n_warn, n_bad))
-        if cycle_time_s is None:
-            cycle_time_s = rg["cycle_time_s"][:]
-
-    # Build sorted z array and averaged Te grid: (n_z, n_x, n_cycles).
-    z_vals = sorted(z_groups.keys())
-    n_z = len(z_vals)
-    n_x = len(x_cm)
-    n_cycles = len(cycle_time_s)
-
-    te_grid = np.full((n_z, n_x, n_cycles), np.nan)
-
-    for zi, z in enumerate(z_vals):
-        entries = z_groups[z]
-        te_sum = np.zeros((n_x, n_cycles))
-        weight = np.zeros((n_x, n_cycles))
-        mask_bad = np.zeros((n_x, n_cycles), dtype=bool)
-
-        for te, n_ok, n_warn, n_bad in entries:
-            # Strict mask: cell hidden when bad shots outnumber ok alone.
-            cell_bad = n_bad > n_ok
-            mask_bad |= cell_bad
-            valid = ~cell_bad
-            te_sum += np.where(valid, te, 0.0)
-            weight += valid.astype(float)
-
-        with np.errstate(invalid="ignore"):
-            te_avg = np.where(weight > 0, te_sum / weight, np.nan)
-        # Re-apply the bad mask (all contributing runs flagged bad).
-        all_bad = mask_bad & (weight == 0)
-        te_avg[all_bad] = np.nan
-
-        te_grid[zi] = te_avg
-
-    return {
-        "te": te_grid,           # (n_z, n_x, n_cycles)
-        "x_cm": x_cm,
-        "z_cm": np.array(z_vals),
-        "cycle_time_ms": cycle_time_s * 1e3,
-        "es_label": es_label,
-        "v_bank": v_bank,
-        "es_id": es_id,
-    }
-
-
-def _load_experiment_set_loose(hf: h5py.File, es_id: str) -> dict:
-    """Like _load_experiment_set but masks only when bad > ok+warn (rot=0 only).
-
-    warn-severity shots have valid Te estimates (they passed the fitter but
-    triggered a soft quality flag).  This looser threshold includes them in
-    the denominator so cells with mostly-warn populations are not hidden.
-    Produces a second set of plots for comparison with the strict mask.
-    Rot=180 runs are excluded for the same shadowing reason as the strict loader.
+    Multiple runs at the same z are averaged cell-by-cell, weighted by the
+    number of valid shots (n_ok + n_warn) that contributed to each cell's
+    te_best_ev estimate.  A cell is included in the average only when its
+    valid-shot count meets or exceeds ``min_shots``; cells where no run at
+    that z reaches the threshold are left as NaN.
     """
     x_cm = hf["x_cm"][:]
     eg = hf["experiment_sets"][es_id]
@@ -143,50 +87,41 @@ def _load_experiment_set_loose(hf: h5py.File, es_id: str) -> dict:
         z = float(rg.attrs["z_cm"])
         if z not in z_groups:
             z_groups[z] = []
-        te = rg["te_log_ev"][:]
-        n_ok = rg["n_ok"][:]
-        n_warn = rg["n_warn"][:]
-        n_bad = rg["n_bad"][:]
-        z_groups[z].append((te, n_ok, n_warn, n_bad))
+        te      = rg["te_best_ev"][:]            # (n_pos, n_cycles)
+        n_valid = rg["n_ok"][:] + rg["n_warn"][:]  # shots that went into te_best_ev
+        z_groups[z].append((te, n_valid))
         if cycle_time_s is None:
             cycle_time_s = rg["cycle_time_s"][:]
 
-    z_vals = sorted(z_groups.keys())
-    n_z = len(z_vals)
-    n_x = len(x_cm)
+    z_vals   = sorted(z_groups.keys())
+    n_x      = len(x_cm)
     n_cycles = len(cycle_time_s)
 
-    te_grid = np.full((n_z, n_x, n_cycles), np.nan)
+    te_grid = np.full((len(z_vals), n_x, n_cycles), np.nan)
 
     for zi, z in enumerate(z_vals):
-        entries = z_groups[z]
         te_sum = np.zeros((n_x, n_cycles))
         weight = np.zeros((n_x, n_cycles))
-        mask_bad = np.zeros((n_x, n_cycles), dtype=bool)
 
-        for te, n_ok, n_warn, n_bad in entries:
-            # Loose mask: cell hidden only when bad outnumbers ok+warn.
-            cell_bad = n_bad > (n_ok + n_warn)
-            mask_bad |= cell_bad
-            valid = ~cell_bad
-            te_sum += np.where(valid, te, 0.0)
-            weight += valid.astype(float)
+        for te, n_valid in z_groups[z]:
+            # A cell contributes only when it has enough valid shots and a
+            # finite Te value.  Weight by valid-shot count so runs with more
+            # good shots have proportionally more influence on the average.
+            good = (n_valid >= min_shots) & np.isfinite(te)
+            te_sum += np.where(good, te * n_valid, 0.0)
+            weight += np.where(good, n_valid, 0.0)
 
         with np.errstate(invalid="ignore"):
-            te_avg = np.where(weight > 0, te_sum / weight, np.nan)
-        all_bad = mask_bad & (weight == 0)
-        te_avg[all_bad] = np.nan
-
-        te_grid[zi] = te_avg
+            te_grid[zi] = np.where(weight > 0, te_sum / weight, np.nan)
 
     return {
-        "te": te_grid,
-        "x_cm": x_cm,
-        "z_cm": np.array(z_vals),
+        "te":            te_grid,       # (n_z, n_x, n_cycles)
+        "x_cm":          x_cm,
+        "z_cm":          np.array(z_vals),
         "cycle_time_ms": cycle_time_s * 1e3,
-        "es_label": es_label,
-        "v_bank": v_bank,
-        "es_id": es_id,
+        "es_label":      es_label,
+        "v_bank":        v_bank,
+        "es_id":         es_id,
     }
 
 
@@ -238,11 +173,11 @@ def plot_subplots(data: dict, output_dir: Path, vmin: float, vmax: float,
     # Shared colorbar.
     sm = plt.cm.ScalarMappable(norm=norm, cmap=CMAP)
     cbar = fig.colorbar(sm, ax=axes, shrink=0.5, pad=0.02)
-    cbar.set_label("$T_e$ (eV)  [log-linear fit]", fontsize=9)
+    cbar.set_label("$T_e$ (eV)  [best-fit (log or exp)]", fontsize=9)
     cbar.ax.tick_params(labelsize=7)
 
     fig.suptitle(
-        f"$T_e$ (log-linear) vs (x, z) — experiment set {es_id}: {es_label}"
+        f"$T_e$ (best-fit) vs (x, z) — experiment set {es_id}: {es_label}"
         f"  (V_bank = {v_bank} V)",
         fontsize=11,
     )
@@ -275,14 +210,14 @@ def plot_animation(data: dict, output_dir: Path, vmin: float, vmax: float,
     mesh = ax.pcolormesh(x_edges, z_edges, te[:, :, 0], cmap=CMAP, norm=norm,
                          rasterized=True)
     cbar = fig.colorbar(mesh, ax=ax)
-    cbar.set_label("$T_e$ (eV)  [log-linear]", fontsize=10)
+    cbar.set_label("$T_e$ (eV)  [best-fit]", fontsize=10)
 
     ax.set_xlabel("x (cm)", fontsize=10)
     ax.set_ylabel("z (cm)", fontsize=10)
     title = ax.set_title(f"t = {times[0]:.1f} ms", fontsize=10)
 
     fig.suptitle(
-        f"$T_e$ (log-linear) — ES {es_id}: {es_label}  (V_bank = {v_bank} V)",
+        f"$T_e$ (best-fit) — ES {es_id}: {es_label}  (V_bank = {v_bank} V)",
         fontsize=10,
     )
 
@@ -303,6 +238,7 @@ def plot_animation(data: dict, output_dir: Path, vmin: float, vmax: float,
 
 
 def plot_all(hdf5_path: Path, output_dir: Path, save_animation: bool,
+             min_shots: int = DEFAULT_MIN_SHOTS,
              vmin_override: float | None = None,
              vmax_override: float | None = None) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -311,19 +247,15 @@ def plot_all(hdf5_path: Path, output_dir: Path, save_animation: bool,
         es_ids = sorted(hf["experiment_sets"].keys(), key=int)
 
         # --- Pass 1: load all data and compute a GLOBAL colour scale ----------
-        # Load both strict-mask and loose-mask datasets in one HDF5 pass.
-        strict_data: list[dict] = []
-        loose_data: list[dict] = []
+        data_list: list[dict] = []
         all_finite: list[np.ndarray] = []
         for es_id in es_ids:
-            s = _load_experiment_set(hf, es_id)
-            l = _load_experiment_set_loose(hf, es_id)
-            finite = s["te"][np.isfinite(s["te"])]
+            d = _load_experiment_set(hf, es_id, min_shots=min_shots)
+            finite = d["te"][np.isfinite(d["te"])]
             if finite.size == 0:
                 print(f"ES {es_id}: no finite T_e data, skipping.")
                 continue
-            strict_data.append(s)
-            loose_data.append(l)
+            data_list.append(d)
             all_finite.append(finite)
 
         if not all_finite:
@@ -335,14 +267,13 @@ def plot_all(hdf5_path: Path, output_dir: Path, save_animation: bool,
         vmax = vmax_override if vmax_override is not None else float(np.percentile(combined, 98))
         src = "manual override" if (vmin_override or vmax_override) else "2nd–98th percentile across all ESs"
         print(f"Global colour scale: vmin={vmin:.2f} eV  vmax={vmax:.2f} eV  ({src})")
+        print(f"Min-shots threshold: {min_shots}")
 
-        # --- Pass 2: plot each ES — strict mask (default) + loose mask --------
-        for s, l in zip(strict_data, loose_data):
-            plot_subplots(s, output_dir, vmin, vmax)             # te_contours_expsetN.png
-            plot_subplots(l, output_dir, vmin, vmax, suffix="_loose")  # te_contours_expsetN_loose.png
+        # --- Pass 2: plot each ES -------------------------------------------
+        for d in data_list:
+            plot_subplots(d, output_dir, vmin, vmax)
             if save_animation:
-                plot_animation(s, output_dir, vmin, vmax)
-                plot_animation(l, output_dir, vmin, vmax, suffix="_loose")
+                plot_animation(d, output_dir, vmin, vmax)
 
 
 def main() -> None:
@@ -354,6 +285,15 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path, default=OUTPUT_DIR)
     parser.add_argument("--no-animation", action="store_true",
                         help="skip saving animated GIFs")
+    parser.add_argument(
+        "--min-shots", type=int, default=DEFAULT_MIN_SHOTS,
+        metavar="N",
+        help=(
+            f"Minimum number of valid shots (n_ok + n_warn) required to show a "
+            f"cell.  Cells below this threshold are masked.  Default: {DEFAULT_MIN_SHOTS}. "
+            f"Set to 1 to show any cell with at least one good shot."
+        ),
+    )
     parser.add_argument("--vmin", type=float, default=None,
                         help="Override colour scale minimum (eV). "
                              "Default: 2nd percentile across all experiment sets.")
@@ -369,6 +309,7 @@ def main() -> None:
 
     plot_all(args.input, args.output_dir,
              save_animation=not args.no_animation,
+             min_shots=args.min_shots,
              vmin_override=args.vmin, vmax_override=args.vmax)
 
 

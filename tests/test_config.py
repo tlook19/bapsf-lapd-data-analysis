@@ -2,7 +2,16 @@ from pathlib import Path
 
 import pytest
 
-from bapsf_lapd import ChannelKind, LapdDataset, default_run_config, load_run_manifest
+from bapsf_lapd import (
+    ChannelKind,
+    LapdDataset,
+    density_area_key_for_deadtime_source,
+    electrical_connections_swapped,
+    default_run_config,
+    effective_deadtime_source,
+    effective_rotation_deg,
+    load_run_manifest,
+)
 
 
 def test_default_run_config_maps_experiment_set_and_sweep_resistor():
@@ -52,6 +61,38 @@ def test_manifest_loads_run_and_trace_ports():
     assert run01.experiment_set.id == 1
     assert run42.experiment_set.v_puff == 110.0
     assert run42.channel("i_sweep").resistor_ohm == 3.0
+
+
+def test_effective_rotation_overrides_es3_p21_swap():
+    dataset = LapdDataset.from_manifest("config/may2026_run_manifest.toml")
+
+    assert dataset.config("32").probe.rotation_deg == 0.0
+    assert dataset.config("33").probe.rotation_deg == 180.0
+    assert effective_rotation_deg("32", dataset.config("32").probe.rotation_deg) == 180.0
+    assert effective_rotation_deg("33", dataset.config("33").probe.rotation_deg) == 0.0
+    assert effective_rotation_deg("35", dataset.config("35").probe.rotation_deg) == 180.0
+
+
+def test_effective_deadtime_source_uses_isat_for_known_wiring_swap():
+    source, invert, overridden = effective_deadtime_source("31", 11, ChannelKind.I_SWEEP, True)
+
+    assert electrical_connections_swapped("31") is True
+    assert source == ChannelKind.ISAT
+    assert invert is False
+    assert overridden is True
+    assert density_area_key_for_deadtime_source(11, source) == "ap_R_cm2"
+
+    source, invert, overridden = effective_deadtime_source("01", 11, ChannelKind.I_SWEEP, True)
+    assert electrical_connections_swapped("01") is False
+    assert source == ChannelKind.I_SWEEP
+    assert invert is True
+    assert overridden is False
+
+    source, invert, overridden = effective_deadtime_source("33", 21, ChannelKind.I_SWEEP, True)
+    assert source == ChannelKind.I_SWEEP
+    assert invert is True
+    assert overridden is False
+    assert density_area_key_for_deadtime_source(21, source) == "ap_L_cm2"
 
 
 def test_manifest_loads_current_attenuation_rules():

@@ -1,12 +1,13 @@
 """Compute electron density, Mach number, and plasma FWHM for all LAPD runs.
 
 For each run the script reads the dead-time (inter-sweep) periods of the
-Isat and Isweep channels, combines them with the shot-averaged T_e from
-langmuir_sweeps.hdf5, and derives:
+Isat and Isweep channels, combines them with the filled T_e map from
+te_filled.hdf5, and derives:
 
   n_e_R  — electron density from the Isat face (A_p_R, right/downstream)
   n_e_L  — electron density from the -Isweep face (A_p_L, left/upstream)
   mach   — Mach number M = ln(I_u / I_d) / K, area-normalised
+  velocity_km_s — parallel flow speed M * C_s in km/s
   plasma_fwhm_cm — FWHM of the n_e_R radial profile at each cycle time
 
 Physics
@@ -54,13 +55,16 @@ HDF5 output layout
       n_e_L_m3_std                 (51, n_cycles) float64
       mach                         (51, n_cycles) float64  NaN for probe A
       mach_std                     (51, n_cycles) float64
+      cs_m_s                       (51, n_cycles) float64  from filled T_e
+      velocity_km_s                (51, n_cycles) float64
+      velocity_km_s_std            (51, n_cycles) float64
       plasma_fwhm_cm               (n_cycles,) float64
 
 Inputs
 ------
   config/may2026_run_manifest.toml
   processed/probe_area_calibration.toml  (from calibrate_probe_areas.py)
-  processed/langmuir_sweeps.hdf5         (from process_langmuir_sweeps.py)
+  processed/te_filled.hdf5               (from fit_te_spatial.py)
   data/may2026/*.hdf5
 
 Output
@@ -84,18 +88,27 @@ from typing import Any
 import h5py
 import numpy as np
 
-from bapsf_lapd import ChannelKind, LapdDataset, LapdRun
+from bapsf_lapd import (
+    ChannelKind,
+    LapdDataset,
+    LapdRun,
+    effective_rotation_deg,
+    electrical_connections_swapped,
+)
 from bapsf_lapd.density import (
+    apply_probe_a_area_factor,
     density_fwhm_cm,
     electron_density_m3,
     inter_sweep_sample_slices,
     ion_sound_speed_m_s,
+    load_probe_a_area_calibration,
 )
 
 
 MANIFEST = Path("config/may2026_run_manifest.toml")
 CALIB_TOML = Path("processed/probe_area_calibration.toml")
-SWEEPS_HDF5 = Path("processed/langmuir_sweeps.hdf5")
+PROBE_A_CALIB_TOML = Path("config/may2026_probe_a_area_calibration.toml")
+TE_FILLED_HDF5 = Path("processed/te_filled.hdf5")
 HDF5_OUTPUT = Path("processed/density_mach.hdf5")
 
 # He-4 ion mass (amu).  Must match calibrate_probe_areas.py.
@@ -149,16 +162,40 @@ def _inter_sweep_times_s(run: LapdRun) -> np.ndarray:
     ])
 
 
+def _interp_filled_te_to_deadtime(
+    te_hdf: h5py.File,
+    set_id: int,
+    z_cm: float,
+    dead_time_s: np.ndarray,
+) -> np.ndarray:
+    """Return filled T_e on the run's (x, dead-time) grid."""
+    grp = te_hdf[f"experiment_sets/{set_id}"]
+    x_cm = grp["x_cm"][()]
+    if not np.allclose(x_cm, X_CM):
+        raise ValueError(f"Filled T_e x grid differs from density grid for experiment set {set_id}")
+
+    z_grid = grp["z_cm"][()]
+    z_idx = int(np.argmin(np.abs(z_grid - z_cm)))
+    te_time_ms = grp["cycle_time_ms"][()]
+    dead_time_ms = dead_time_s * 1000.0
+    te_z = grp["te_filled"][z_idx, :, :]
+    return np.vstack([
+        np.interp(dead_time_ms, te_time_ms, te_z[xi, :])
+        for xi in range(te_z.shape[0])
+    ])
+
+
 def process_run(
     run: LapdRun,
     ap_R_m2: float,
     ap_L_m2: float,
     probe_id: str,
     te_grid: np.ndarray,
+    probe_a_calibration,
 ) -> dict[str, np.ndarray]:
     """Compute density, Mach, and FWHM for one run.
 
-    te_grid: (51, n_cycles) shot-averaged T_e in eV (NaN for bad-quality positions).
+    te_grid: (51, n_cycles) filled T_e in eV, aligned to dead-time midpoints.
 
     Returns arrays keyed by output dataset name.
     """
@@ -166,7 +203,8 @@ def process_run(
     n_pos = run.config.acquisition.n_positions
     n_cycles = sw.n_cycles
     n_shots = run.config.acquisition.n_shots_per_position
-    rotation_deg = run.config.probe.rotation_deg or 0
+    rotation_deg = effective_rotation_deg(run.config.run_id, run.config.probe.rotation_deg)
+    connections_swapped = electrical_connections_swapped(run.config.run_id)
 
     dead_slices = inter_sweep_sample_slices(sw, run.config.acquisition, clip_s=CLIP_S)
     inter_times_s = _inter_sweep_times_s(run)
@@ -180,6 +218,9 @@ def process_run(
     n_e_L_std = np.full((n_pos, n_cycles), np.nan)
     mach = np.full((n_pos, n_cycles), np.nan)
     mach_std = np.full((n_pos, n_cycles), np.nan)
+    cs_m_s = np.full((n_pos, n_cycles), np.nan)
+    velocity_km_s = np.full((n_pos, n_cycles), np.nan)
+    velocity_km_s_std = np.full((n_pos, n_cycles), np.nan)
     fwhm = np.full(n_cycles, np.nan)
 
     for k in range(n_cycles):
@@ -190,11 +231,18 @@ def process_run(
         # Per-shot dead-time mean: (51, 20)
         isat_R_shot = traces_R.mean(axis=2)
         isat_L_shot = -traces_L.mean(axis=2)  # negate Isweep polarity
+        isat_R_shot = apply_probe_a_area_factor(
+            isat_R_shot, probe_id, probe_a_calibration
+        )
+        isat_L_shot = apply_probe_a_area_factor(
+            isat_L_shot, probe_id, probe_a_calibration
+        )
 
         # T_e and sound speed at cycle k: (51,)
         te_k = te_grid[:, k] if k < te_grid.shape[1] else np.full(n_pos, np.nan)
         with np.errstate(invalid="ignore"):
             cs_k = ion_sound_speed_m_s(te_k, M_I_AMU)
+        cs_m_s[:, k] = cs_k
 
         # Per-shot density: (51, 20) — cs_k broadcast via [:, None]
         with np.errstate(all="ignore"):
@@ -209,18 +257,23 @@ def process_run(
                 n_e_R_std[:, k] = np.nanstd(n_e_R_shot, axis=1, ddof=1)
                 n_e_L_std[:, k] = np.nanstd(n_e_L_shot, axis=1, ddof=1)
 
-        # Mach (probes B/C/D only)
-        if probe_id != "A":
+        # Mach (probes B/C/D, plus known wiring-swap runs where ISAT appears to
+        # be the upstream face).
+        if probe_id != "A" or connections_swapped:
             with np.errstate(all="ignore"):
                 # rot=0: Isweep/A_p_L faces upstream → n_e_L is upstream density
                 # rot=180: Isat/A_p_R faces upstream → n_e_R is upstream density
-                if rotation_deg == 0:
+                if connections_swapped:
+                    M_shot = np.log(n_e_R_shot / n_e_L_shot) / MACH_K
+                elif rotation_deg == 0:
                     M_shot = np.log(n_e_L_shot / n_e_R_shot) / MACH_K
                 else:
                     M_shot = np.log(n_e_R_shot / n_e_L_shot) / MACH_K
                 mach[:, k] = np.nanmean(M_shot, axis=1)
                 if n_shots > 1:
                     mach_std[:, k] = np.nanstd(M_shot, axis=1, ddof=1)
+                velocity_km_s[:, k] = mach[:, k] * cs_k / 1000.0
+                velocity_km_s_std[:, k] = mach_std[:, k] * cs_k / 1000.0
 
         # FWHM from n_e_R radial profile (the Isat face, available for all runs)
         fwhm[k] = density_fwhm_cm(n_e_R[:, k], X_CM)
@@ -233,6 +286,9 @@ def process_run(
         "n_e_L_m3_std": n_e_L_std,
         "mach": mach,
         "mach_std": mach_std,
+        "cs_m_s": cs_m_s,
+        "velocity_km_s": velocity_km_s,
+        "velocity_km_s_std": velocity_km_s_std,
         "plasma_fwhm_cm": fwhm,
     }
 
@@ -251,23 +307,41 @@ def main() -> None:
         metavar="ID",
         help="Two-digit run IDs to process (e.g. 02 03), or 'all'.",
     )
+    parser.add_argument("--te-filled", type=Path, default=TE_FILLED_HDF5)
+    parser.add_argument(
+        "--probe-a-calibration",
+        type=Path,
+        default=PROBE_A_CALIB_TOML,
+    )
     args = parser.parse_args()
     target_ids: set[str] | None = None if "all" in args.run_ids else set(args.run_ids)
 
     if not CALIB_TOML.exists():
         sys.exit(f"Missing {CALIB_TOML} — run calibrate_probe_areas.py first.")
-    if not SWEEPS_HDF5.exists():
-        sys.exit(f"Missing {SWEEPS_HDF5} — run process_langmuir_sweeps.py first.")
+    if not args.te_filled.exists():
+        sys.exit(f"Missing {args.te_filled} — run fit_te_spatial.py first.")
 
     dataset = LapdDataset.from_manifest(MANIFEST)
     calibration = _load_calibration(CALIB_TOML)
+    probe_a_calibration = load_probe_a_area_calibration(args.probe_a_calibration)
 
     HDF5_OUTPUT.parent.mkdir(parents=True, exist_ok=True)
 
     with (
         h5py.File(HDF5_OUTPUT, "w") as out_hdf,
-        h5py.File(SWEEPS_HDF5, "r") as sweeps_hdf,
+        h5py.File(args.te_filled, "r") as te_hdf,
     ):
+        out_hdf.attrs["source_te_hdf5"] = str(args.te_filled)
+        out_hdf.attrs["source_probe_a_calibration_toml"] = str(
+            args.probe_a_calibration
+        )
+        out_hdf.attrs["probe_a_factor"] = probe_a_calibration.factor
+        out_hdf.attrs["probe_a_factor_lower_bound"] = (
+            probe_a_calibration.lower_bound
+        )
+        out_hdf.attrs["probe_a_factor_upper_bound"] = (
+            probe_a_calibration.upper_bound
+        )
         out_hdf.create_dataset("x_cm", data=X_CM)
         out_hdf["x_cm"].attrs["description"] = (
             "Probe scan positions in cm, centred at x = 0."
@@ -290,22 +364,31 @@ def main() -> None:
                 if target_ids is not None and run_id not in target_ids:
                     continue
 
-                hdf_key = f"experiment_sets/{set_id}/{run_id}"
-                if hdf_key not in sweeps_hdf:
-                    print(f"  [skip] run {run_id}: not found in {SWEEPS_HDF5}")
+                if f"experiment_sets/{set_id}" not in te_hdf:
+                    print(f"  [skip] run {run_id}: experiment set {set_id} not found in {args.te_filled}")
                     continue
 
                 pid = _probe_id(run_id)
                 calib = calibration[pid]
                 run = dataset.run(run_id)
                 cfg = run.config
+                recorded_rot = float(cfg.probe.rotation_deg or 0)
+                effective_rot = effective_rotation_deg(run_id, recorded_rot)
 
                 print(
                     f"  run {run_id}  probe={pid}  set={set_id}"
-                    f"  rot={cfg.probe.rotation_deg}°  port={cfg.probe.port}"
+                    f"  rot={effective_rot:.0f}°"
+                    + (f" (recorded {recorded_rot:.0f}°)" if effective_rot != recorded_rot else "")
+                    + f"  port={cfg.probe.port}"
                 )
 
-                te_grid = sweeps_hdf[f"{hdf_key}/te_log_ev"][()]  # (51, n_cycles)
+                inter_times_s = _inter_sweep_times_s(run)
+                te_grid = _interp_filled_te_to_deadtime(
+                    te_hdf,
+                    set_id,
+                    float(cfg.probe.z_cm or 0),
+                    inter_times_s,
+                )
 
                 results = process_run(
                     run,
@@ -313,17 +396,24 @@ def main() -> None:
                     ap_L_m2=calib["ap_L_m2"],
                     probe_id=pid,
                     te_grid=te_grid,
+                    probe_a_calibration=probe_a_calibration,
                 )
 
                 g_run = g_set.create_group(run_id)
                 g_run.attrs["run_id"] = run_id
-                g_run.attrs["rotation_deg"] = float(cfg.probe.rotation_deg or 0)
+                g_run.attrs["rotation_deg"] = float(effective_rot)
+                g_run.attrs["rotation_deg_recorded"] = recorded_rot
+                g_run.attrs["rotation_correction_applied"] = bool(effective_rot != recorded_rot)
                 g_run.attrs["port"] = int(cfg.probe.port or 0)
                 g_run.attrs["z_cm"] = float(cfg.probe.z_cm or 0)
                 g_run.attrs["probe_id"] = pid
                 g_run.attrs["ap_L_cm2"] = calib["ap_L_cm2"]
                 g_run.attrs["ap_R_cm2"] = calib["ap_R_cm2"]
+                g_run.attrs["electrical_swap_applied"] = bool(electrical_connections_swapped(run_id))
                 g_run.attrs["ap_estimated"] = calib["estimated"]
+                g_run.attrs["probe_a_area_factor_applied"] = (
+                    probe_a_calibration.factor if pid == "A" else 1.0
+                )
 
                 for key, arr in results.items():
                     g_run.create_dataset(key, data=arr)

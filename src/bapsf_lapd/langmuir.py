@@ -155,7 +155,24 @@ def _retarding_mask(
     electron_current: np.ndarray,
     *,
     center_voltage: float | None = None,
+    v_p: float | None = None,
 ) -> np.ndarray:
+    """Select the electron-retarding region for fitting.
+
+    Upper voltage bound
+    -------------------
+    When ``v_p`` (plasma potential from the derivative peak) is provided and
+    finite, it is used as the hard upper voltage bound.  This is physically
+    correct: the retarding region IS the interval [V_float, V_p], so fitting
+    up to V_p captures the full exponential rise.  This is especially
+    important for cold / high-V_p plasmas where the amplitude-based cutoff
+    (15 % of I_sat) stops the fit far below V_p, undersampling the steepest
+    part of the I-V curve.
+
+    When V_p is unavailable or the V_p-bounded mask yields fewer than 8
+    points, the function falls back to the amplitude-based cutoff (15 % →
+    30 % of I_sat) so that normal well-behaved sweeps are unaffected.
+    """
     positive = electron_current > 0
     if positive.sum() < 8:
         raise ValueError("Not enough positive electron-current points for retarding fit")
@@ -165,33 +182,43 @@ def _retarding_mask(
 
     # Lower bound: exclude numerical noise near zero.
     low = max(np.nanpercentile(positive_values, 8), i_max * 0.015)
-    # Upper bound: cap at 15 % of the estimated saturation current.  This keeps
-    # the fit in the pure exponential retarding regime (≈ 1.9 e-folds below
-    # saturation) and prevents the saturation knee / sheath-expansion region
-    # from distorting the slope.  The old 50th-percentile upper bound reached
-    # well into the saturation knee for high-amplitude sweeps.
-    high = i_max * 0.15
 
     center_kwargs = {}
     if center_voltage is not None:
         center_kwargs = {"center_voltage": np.array(center_voltage), "voltage": voltage}
-        mask = positive & (electron_current >= low) & (electron_current <= high)
-        width = max((voltage.max() - voltage.min()) * 0.25, 6.0)
-        mask &= voltage <= center_voltage + width
-    else:
-        mask = positive & (electron_current >= low) & (electron_current <= high)
 
-    # Keep the main rising transition, not isolated noisy islands.
-    mask = _contiguous_true_region(mask, **center_kwargs)
-    if mask.sum() < 8:
-        # Fall back to a broader window (30 % of saturation).
-        high = i_max * 0.30
-        broad_mask = positive & (electron_current >= low) & (electron_current <= high)
+    use_vp = v_p is not None and np.isfinite(v_p)
+
+    if use_vp:
+        # Primary path: V_p as the upper voltage bound.
+        mask = positive & (electron_current >= low) & (voltage <= v_p)
+        mask = _contiguous_true_region(mask, **center_kwargs)
+
+    if not use_vp or mask.sum() < 8:
+        # Fallback: amplitude-based cutoff at 15 % of saturation.  Also used
+        # as the fallback when V_p is valid but yields too few points (e.g.
+        # the V_p estimate landed below the retarding region).
+        high = i_max * 0.15
         if center_voltage is not None:
-            broad_mask &= voltage <= center_voltage + max((voltage.max() - voltage.min()) * 0.35, 8.0)
-        mask = _contiguous_true_region(broad_mask, **center_kwargs)
-        if mask.sum() < 8 and broad_mask.sum() >= 8:
-            mask = broad_mask
+            width = max((voltage.max() - voltage.min()) * 0.25, 6.0)
+            mask = (positive & (electron_current >= low) & (electron_current <= high)
+                    & (voltage <= center_voltage + width))
+        else:
+            mask = positive & (electron_current >= low) & (electron_current <= high)
+        mask = _contiguous_true_region(mask, **center_kwargs)
+
+        if mask.sum() < 8:
+            # Broader amplitude fallback (30 %).
+            high = i_max * 0.30
+            if center_voltage is not None:
+                broad = (positive & (electron_current >= low) & (electron_current <= high)
+                         & (voltage <= center_voltage + max((voltage.max() - voltage.min()) * 0.35, 8.0)))
+            else:
+                broad = positive & (electron_current >= low) & (electron_current <= high)
+            mask = _contiguous_true_region(broad, **center_kwargs)
+            if mask.sum() < 8 and broad.sum() >= 8:
+                mask = broad
+
     if mask.sum() < 8:
         raise ValueError("Could not select enough points in the electron-retarding region")
     return mask
@@ -344,6 +371,7 @@ def analyze_langmuir_sweep(
         voltage,
         electron_current,
         center_voltage=transition_center_v,
+        v_p=plasma_potential_derivative_v,
     )
 
     log_fit = _log_linear_fit(voltage, electron_current, retarding_mask)
@@ -380,3 +408,50 @@ def analyze_langmuir_sweep(
         plasma_potential_log_intersection_v=log_intersection,
         plasma_potential_exp_intersection_v=exp_intersection,
     )
+
+
+def select_best_te_ev(analysis: LangmuirAnalysis) -> float:
+    """Return the better of log-linear and exponential T_e estimates.
+
+    Both fits are evaluated in log(I_e) space over the retarding region.
+    The fit with the lower log-space RMS residual wins.  Falls back to the
+    log-linear result when fewer than 3 positive electron-current points are
+    available (e.g. highly noisy sweeps where the retarding region is empty).
+
+    Parameters
+    ----------
+    analysis:
+        Result of ``analyze_langmuir_sweep``.
+
+    Returns
+    -------
+    float
+        T_e in eV from whichever fit had the smaller log-space RMS.
+    """
+    lf   = analysis.log_linear_fit
+    ef   = analysis.exponential_fit
+
+    # Use the same retarding-region mask as the log-linear fit.
+    mask = lf.mask
+    v    = analysis.voltage[mask]
+    ec   = analysis.current[mask] - analysis.ion_fit.evaluate(v)
+
+    # Restrict to positive electron current points for log comparison.
+    pos = ec > 0
+    if pos.sum() < 3:
+        return lf.electron_temperature_ev
+
+    log_ec = np.log(ec[pos])
+    v_pos  = v[pos]
+
+    # Log-space RMS for log-linear fit: ln(I_e) = intercept + slope * V.
+    pred_log = lf.intercept + lf.slope * v_pos
+    rms_log  = float(np.sqrt(np.mean((log_ec - pred_log) ** 2)))
+
+    # Log-space RMS for exponential fit: ln(A exp(V/T_e)) = log_amplitude + inverse_temperature * V.
+    pred_exp = np.clip(ef.log_amplitude + ef.inverse_temperature * v_pos, -700, 700)
+    rms_exp  = float(np.sqrt(np.mean((log_ec - pred_exp) ** 2)))
+
+    if rms_log <= rms_exp:
+        return lf.electron_temperature_ev
+    return ef.electron_temperature_ev

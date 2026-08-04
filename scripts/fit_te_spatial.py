@@ -56,6 +56,7 @@ from scipy.interpolate import RBFInterpolator
 # ---------------------------------------------------------------------------
 HDF5_INPUT  = Path("processed/langmuir_sweeps.hdf5")
 HDF5_OUTPUT = Path("processed/te_filled.hdf5")
+ISWEEP_DEADTIME_INPUT = Path("processed/isweep_deadtime_profiles.hdf5")
 OUTPUT_DIR  = Path("figures")
 
 PORT_SPACING_CM = 31.95   # from config.py
@@ -92,12 +93,27 @@ N_EDGE_ANCHOR_Z       = 40
 # the fit.  10 % keeps ES4's penultimate port (32 %) while dropping the last one.
 MIN_Z_COVERAGE  = 0.10
 
+# Later low-bank sets reach the lower T_e resolution of the swept analysis at
+# downstream ports. Keep only the axial rows previously judged reliable; the
+# remaining rows are reconstructed from these anchors and the end boundaries.
+TRUSTED_TE_PORTS_BY_ES = {
+    "3": (11, 29),
+    "4": (11,),
+}
+
 # Monotonic-z upper bound.  T_e is expected to decrease monotonically with
 # axial distance z (away from the cathode).  Any downstream cell whose Te
 # exceeds the minimum finite upstream Te by more than this fractional padding
 # is masked before the RBF fill.  25 % gives room for shot-to-shot
 # fluctuations while still capping grossly inflated downstream estimates.
 MONO_Z_PADDING  = 0.25
+
+# Core hot spots can be real when a high T_e cell coincides with an upstream
+# -I_SWEEP dead-time current spike.  Preserve those core cells from the
+# monotonic-z outlier mask; edge spikes remain masked because they are usually
+# edge instability/fluctuation artifacts.
+CORE_HOTSPOT_CURRENT_SIGMA = 3.0
+CORE_HOTSPOT_CURRENT_RATIO = 1.25
 
 CMAP            = "plasma"
 
@@ -117,6 +133,7 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
     eg   = hf["experiment_sets"][es_id]
 
     z_groups: dict[float, list] = {}
+    port_by_z: dict[float, int] = {}
     cycle_time_s = None
 
     for run_id in sorted(eg.keys()):
@@ -125,9 +142,13 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
         if rot != 0.0:
             continue                              # skip rot=180 runs
         z  = float(rg.attrs["z_cm"])
+        port = int(rg.attrs["port"])
+        if z in port_by_z and port_by_z[z] != port:
+            raise ValueError(f"Inconsistent port metadata at z={z:g} cm")
+        port_by_z[z] = port
         if z not in z_groups:
             z_groups[z] = []
-        te    = rg["te_log_ev"][:]
+        te    = rg["te_best_ev"][:]
         n_ok  = rg["n_ok"][:]
         n_bad = rg["n_bad"][:]
         z_groups[z].append((te, n_ok, n_bad))
@@ -162,6 +183,7 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
         "te":             te_grid,
         "x_cm":           x_cm,
         "z_cm":           np.array(z_vals),
+        "port":           np.array([port_by_z[z] for z in z_vals], dtype=np.int16),
         "cycle_time_ms":  cycle_time_s * 1e3,
         "es_label":       eg.attrs.get("label", f"set {es_id}"),
         "v_bank":         eg.attrs.get("v_bank_v", "?"),
@@ -172,10 +194,17 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
 def _load_filled_source_experiment_set(hf: h5py.File, es_id: str) -> dict:
     """Load te_masked from a previous te_filled.hdf5-style product."""
     grp = hf["experiment_sets"][es_id]
+    z_cm = grp["z_cm"][()]
+    ports = (
+        grp["port"][()]
+        if "port" in grp
+        else np.rint((z_cm - PORT_2_Z_CM) / PORT_SPACING_CM + 2).astype(np.int16)
+    )
     return {
         "te":             grp["te_masked"][()],
         "x_cm":           grp["x_cm"][()],
-        "z_cm":           grp["z_cm"][()],
+        "z_cm":           z_cm,
+        "port":           ports,
         "cycle_time_ms":  grp["cycle_time_ms"][()],
         "es_label":       grp.attrs.get("label", f"set {es_id}"),
         "v_bank":         grp.attrs.get("v_bank_v", "?"),
@@ -395,6 +424,178 @@ def fill_te_grid(
     return filled
 
 
+def _mask_untrusted_te_ports(
+    te_grid: np.ndarray,
+    ports: np.ndarray,
+    experiment_set_id: str,
+    *,
+    trusted_ports_by_es: dict[str, tuple[int, ...]] = TRUSTED_TE_PORTS_BY_ES,
+) -> tuple[np.ndarray, tuple[int, ...]]:
+    """Blank later-set port rows whose swept T_e is not diagnostically reliable."""
+    trusted = trusted_ports_by_es.get(str(experiment_set_id))
+    if trusted is None:
+        return te_grid.copy(), ()
+    ports = np.asarray(ports, dtype=int)
+    untrusted = tuple(int(port) for port in ports if int(port) not in trusted)
+    out = te_grid.copy()
+    out[~np.isin(ports, trusted)] = np.nan
+    return out, untrusted
+
+
+def _enforce_core_mean_monotonic_z(
+    te_grid: np.ndarray,
+    x_cm: np.ndarray,
+    *,
+    core_x_cm: float = X_CORE_CM,
+    te_floor: float = TE_BOUNDARY_EV,
+) -> tuple[np.ndarray, int, float]:
+    """Scale downstream rows so core-mean T_e is non-increasing with z.
+
+    Each row keeps its radial shape. Scaling is performed about ``te_floor``
+    so the imposed wall/end temperature is not pushed below its boundary.
+    """
+    out = np.asarray(te_grid, dtype=np.float64).copy()
+    core = np.abs(np.asarray(x_cm)) <= core_x_cm
+    adjusted = 0
+    maximum_fractional_reduction = 0.0
+    if not np.any(core):
+        raise ValueError("No x positions fall inside the monotonic core region")
+
+    for cycle_idx in range(out.shape[2]):
+        previous_mean = np.inf
+        for z_idx in range(out.shape[0]):
+            row = out[z_idx, :, cycle_idx]
+            mean = float(np.nanmean(row[core]))
+            if not np.isfinite(mean):
+                continue
+            if mean > previous_mean:
+                if mean <= te_floor or previous_mean <= te_floor:
+                    scale = 0.0
+                else:
+                    scale = (previous_mean - te_floor) / (mean - te_floor)
+                scale = float(np.clip(scale, 0.0, 1.0))
+                out[z_idx, :, cycle_idx] = te_floor + (row - te_floor) * scale
+                adjusted += 1
+                maximum_fractional_reduction = max(
+                    maximum_fractional_reduction,
+                    1.0 - scale,
+                )
+                mean = previous_mean
+            previous_mean = min(previous_mean, mean)
+    return out, adjusted, maximum_fractional_reduction
+
+
+# ---------------------------------------------------------------------------
+# Core hot-spot preservation from -I_SWEEP dead-time current
+# ---------------------------------------------------------------------------
+def _robust_current_spike_mask(
+    current_x_cycle: np.ndarray,
+    x_cm: np.ndarray,
+    *,
+    core_x_cm: float = X_CORE_CM,
+    sigma: float = CORE_HOTSPOT_CURRENT_SIGMA,
+    ratio: float = CORE_HOTSPOT_CURRENT_RATIO,
+) -> np.ndarray:
+    """Return mask of core current spikes, robustly thresholded per cycle."""
+    current = np.asarray(current_x_cycle, dtype=np.float64)
+    mask = np.zeros(current.shape, dtype=bool)
+    core = np.abs(x_cm) <= core_x_cm
+    if not core.any():
+        return mask
+
+    core_current = current[core]
+    finite_core = np.isfinite(core_current)
+    with np.errstate(all="ignore"):
+        median = np.nanmedian(core_current, axis=0)
+        mad = np.nanmedian(np.abs(core_current - median[np.newaxis, :]), axis=0)
+    robust_sigma = 1.4826 * mad
+
+    finite_counts = finite_core.sum(axis=0)
+    has_baseline = (finite_counts >= 3) & np.isfinite(median)
+    if not has_baseline.any():
+        return mask
+
+    sigma_threshold = median + sigma * robust_sigma
+    ratio_threshold = np.where(
+        median > 0.0,
+        median * ratio,
+        median + np.abs(median) * (ratio - 1.0),
+    )
+    threshold = np.maximum(sigma_threshold, ratio_threshold)
+    core_spikes = (
+        np.isfinite(core_current)
+        & has_baseline[np.newaxis, :]
+        & (core_current > threshold[np.newaxis, :])
+    )
+    mask[np.flatnonzero(core), :] = core_spikes
+    return mask
+
+
+def _interp_current_to_te_cycles(
+    current_x_cycle: np.ndarray,
+    current_time_ms: np.ndarray,
+    te_time_ms: np.ndarray,
+) -> np.ndarray:
+    if (
+        current_x_cycle.shape[1] == te_time_ms.size
+        and current_time_ms.shape == te_time_ms.shape
+        and np.allclose(current_time_ms, te_time_ms)
+    ):
+        return current_x_cycle
+    return np.vstack([
+        np.interp(te_time_ms, current_time_ms, current_x_cycle[xi, :])
+        for xi in range(current_x_cycle.shape[0])
+    ])
+
+
+def _load_current_hotspot_mask(
+    hf: h5py.File,
+    es_id: str,
+    *,
+    x_cm: np.ndarray,
+    z_cm: np.ndarray,
+    cycle_time_ms: np.ndarray,
+    core_x_cm: float,
+    sigma: float,
+    ratio: float,
+) -> np.ndarray:
+    """Build a (n_z, n_x, n_cycles) mask of corroborated core hot spots."""
+    mask = np.zeros((len(z_cm), len(x_cm), len(cycle_time_ms)), dtype=bool)
+    if "x_cm" not in hf or "experiment_sets" not in hf or es_id not in hf["experiment_sets"]:
+        return mask
+
+    current_x_cm = hf["x_cm"][()]
+    if not np.allclose(x_cm, current_x_cm):
+        raise ValueError(f"-I_SWEEP dead-time x grid does not match T_e grid for ES {es_id}")
+
+    eg = hf[f"experiment_sets/{es_id}"]
+    for run_id in sorted(eg.keys()):
+        rg = eg[run_id]
+        source_channel = str(rg.attrs.get("deadtime_source_channel", ""))
+        source_invert = bool(rg.attrs.get("deadtime_source_invert_polarity", False))
+        if source_channel != "i_sweep" or not source_invert:
+            continue
+
+        z_idx = int(np.argmin(np.abs(z_cm - float(rg.attrs["z_cm"]))))
+        if not np.isclose(z_cm[z_idx], float(rg.attrs["z_cm"]), atol=1e-3):
+            continue
+
+        current_time_ms = rg["inter_sweep_time_s"][()] * 1000.0
+        current = _interp_current_to_te_cycles(
+            rg["isat_a"][()],
+            current_time_ms,
+            cycle_time_ms,
+        )
+        mask[z_idx] |= _robust_current_spike_mask(
+            current,
+            x_cm,
+            core_x_cm=core_x_cm,
+            sigma=sigma,
+            ratio=ratio,
+        )
+    return mask
+
+
 # ---------------------------------------------------------------------------
 # Comparison figure
 # ---------------------------------------------------------------------------
@@ -460,7 +661,7 @@ def _plot_comparison(data: dict, te_filled: np.ndarray, output_dir: Path) -> Non
 
     sm   = plt.cm.ScalarMappable(norm=norm, cmap=CMAP)
     cbar = fig.colorbar(sm, ax=axes, shrink=0.6, pad=0.02)
-    cbar.set_label("$T_e$ (eV)  [log-linear]", fontsize=9)
+    cbar.set_label("$T_e$ (eV)  [best-fit]", fontsize=9)
     cbar.ax.tick_params(labelsize=7)
 
     fig.suptitle(
@@ -483,56 +684,77 @@ def _monotonic_z_bound(
     z_cm: np.ndarray,
     *,
     padding: float = MONO_Z_PADDING,
-) -> tuple[np.ndarray, int]:
+    preserve_mask: np.ndarray | None = None,
+) -> tuple[np.ndarray, int, int]:
     """Mask downstream cells that violate the expected z-monotonicity of T_e.
 
-    For each z-row z_i (i > 0), the upper bound is:
+    For each z-row z_i (i > 0), the upper bound is a **per-cycle global
+    maximum** over all upstream z-rows and all x positions:
 
-        bound(x, cycle) = min( T_e[z_j, x, cycle]  for j < i, finite ) × (1 + padding)
+        bound(cycle) = max( T_e[z_j, x, cycle]  for j < i, all x, finite )
+                       × (1 + padding)
 
-    i.e. the minimum finite T_e across *all* upstream z-rows, multiplied by a
-    fractional padding to accommodate shot-to-shot fluctuations.  Any cell
-    whose T_e exceeds this bound is set to NaN.
-
+    Using the spatial maximum (rather than a per-x value) correctly handles
+    radial heat spreading: if a hot spot at x=0 upstream spreads outward by
+    the time it reaches z_i, a position at x=6 can legitimately exceed its
+    own upstream value as long as it stays within the global upstream maximum.
     The bound is only applied where at least one upstream finite value exists.
     The most-upstream z-row (i=0) is never touched.
 
     Parameters
     ----------
     padding : float
-        Fractional allowance above the upstream minimum.  0.25 → 25 % above
-        the lowest reliable upstream measurement.
+        Fractional allowance above the upstream peak.  0.25 → 25 % above
+        the highest reliable upstream measurement anywhere in the profile.
 
     Returns
     -------
     te_bounded : (n_z, n_x, n_cycles) — copy of te_grid with outliers masked
     n_masked   : total number of cells set to NaN by this step
+    n_preserved: total number of outlier cells preserved by preserve_mask
     """
     te_out   = te_grid.copy()
     n_masked = 0
+    n_preserved = 0
+    if preserve_mask is None:
+        preserve_mask = np.zeros(te_grid.shape, dtype=bool)
+    elif preserve_mask.shape != te_grid.shape:
+        raise ValueError(
+            f"preserve_mask shape {preserve_mask.shape} does not match T_e grid {te_grid.shape}"
+        )
 
     for zi in range(1, len(z_cm)):
-        # Min T_e across all upstream z-rows per (x, cycle).
-        with np.errstate(all="ignore"):   # nanmin of all-NaN slice → NaN, handled below
-            upstream_min  = np.nanmin(te_grid[:zi], axis=0)  # (n_x, n_cycles)
-        has_upstream  = np.isfinite(upstream_min)
-        upper_bound   = upstream_min * (1.0 + padding)
+        # Global maximum T_e across all upstream z-rows and all x, per cycle.
+        # Shape: (n_cycles,)  — one bound value per time point.
+        with np.errstate(all="ignore"):   # nanmax of all-NaN slice → NaN, handled below
+            upstream_max = np.nanmax(
+                te_grid[:zi].reshape(-1, te_grid.shape[2]), axis=0
+            )
+        has_upstream = np.isfinite(upstream_max)          # (n_cycles,)
+        upper_bound  = upstream_max * (1.0 + padding)     # (n_cycles,)
 
+        # Broadcast bound from (n_cycles,) → (n_x, n_cycles) for comparison.
         exceeds = (
             np.isfinite(te_grid[zi])
-            & has_upstream
-            & (te_grid[zi] > upper_bound)
+            & has_upstream[np.newaxis, :]
+            & (te_grid[zi] > upper_bound[np.newaxis, :])
         )
+        preserved = exceeds & preserve_mask[zi]
+        mask_out = exceeds & ~preserve_mask[zi]
         if exceeds.any():
-            te_out[zi][exceeds] = np.nan
-            n_masked += int(exceeds.sum())
-            n_ref     = int(has_upstream.sum())
+            te_out[zi][mask_out] = np.nan
+            n_masked += int(mask_out.sum())
+            n_preserved += int(preserved.sum())
+            n_ref = int(
+                (np.isfinite(te_grid[zi]) & has_upstream[np.newaxis, :]).sum()
+            )
             print(
-                f"    z = {z_cm[zi]:.1f} cm: {exceeds.sum()} / {n_ref} cells "
-                f"capped  (bound = upstream_min × {1+padding:.2f})"
+                f"    z = {z_cm[zi]:.1f} cm: {mask_out.sum()} / {n_ref} cells "
+                f"capped, {preserved.sum()} preserved by -I_SWEEP hot spot "
+                f"(bound = upstream_max × {1+padding:.2f})"
             )
 
-    return te_out, n_masked
+    return te_out, n_masked, n_preserved
 
 
 # ---------------------------------------------------------------------------
@@ -573,9 +795,21 @@ def main() -> None:
     parser.add_argument("--smoothing-edge-anchor", type=float, default=SMOOTHING_EDGE_ANCHOR,
                         help="RBF smoothing for SOL edge anchor points.")
     parser.add_argument("--mono-z-padding", type=float, default=MONO_Z_PADDING,
-                        help="Fractional allowance above the minimum upstream T_e for the "
+                        help="Fractional allowance above the upstream T_e envelope for the "
                              "monotonic-z upper bound.  Set to a large value (e.g. 1e6) to "
                              f"disable.  Default: {MONO_Z_PADDING}.")
+    parser.add_argument("--isweep-deadtime", type=Path, default=ISWEEP_DEADTIME_INPUT,
+                        help="Optional -I_SWEEP dead-time profile HDF5 used to preserve "
+                             "core T_e hot spots that coincide with current spikes.")
+    parser.add_argument("--no-current-hotspot-preservation", action="store_true",
+                        help="Do not preserve monotonic-z outliers corroborated by core "
+                             "-I_SWEEP dead-time current spikes.")
+    parser.add_argument("--core-hotspot-current-sigma", type=float,
+                        default=CORE_HOTSPOT_CURRENT_SIGMA,
+                        help="Robust per-cycle sigma threshold for core current spikes.")
+    parser.add_argument("--core-hotspot-current-ratio", type=float,
+                        default=CORE_HOTSPOT_CURRENT_RATIO,
+                        help="Minimum current/median ratio for core current spikes.")
     parser.add_argument("--min-z-coverage", type=float, default=MIN_Z_COVERAGE,
                         help="Minimum fraction of finite cells (across all x and cycles) "
                              "for a z-row to be included in the RBF fit. Rows below this "
@@ -608,51 +842,126 @@ def main() -> None:
         min_z_coverage  = args.min_z_coverage,
     )
 
-    with h5py.File(args.input, "r") as hf_in, \
-         h5py.File(args.output, "w") as hf_out:
+    current_hf = (
+        None
+        if args.no_current_hotspot_preservation or not args.isweep_deadtime.exists()
+        else h5py.File(args.isweep_deadtime, "r")
+    )
 
-        es_ids = sorted(hf_in["experiment_sets"].keys(), key=int)
-        hf_out.create_group("experiment_sets")
+    try:
+        with h5py.File(args.input, "r") as hf_in, \
+             h5py.File(args.output, "w") as hf_out:
 
-        for es_id in es_ids:
-            print(f"\nES {es_id}:")
-            data = _load_input_experiment_set(hf_in, es_id, args.input_mode)
+            es_ids = sorted(hf_in["experiment_sets"].keys(), key=int)
+            hf_out.create_group("experiment_sets")
 
-            te_masked = data["te"]
-            x_cm      = data["x_cm"]
-            z_cm      = data["z_cm"]
+            for es_id in es_ids:
+                print(f"\nES {es_id}:")
+                data = _load_input_experiment_set(hf_in, es_id, args.input_mode)
 
-            n_finite = int(np.isfinite(te_masked).sum())
-            n_total  = int(te_masked.size)
-            print(f"  {n_finite}/{n_total} cells finite ({100*n_finite/n_total:.1f}%) before fill")
+                te_masked = data["te"]
+                x_cm      = data["x_cm"]
+                z_cm      = data["z_cm"]
+                ports     = data["port"]
 
-            # Apply monotonic-z upper bound: downstream cells whose Te exceeds
-            # the minimum upstream Te × (1 + padding) are masked before the RBF.
-            print(f"  Monotonic-z bound (padding={args.mono_z_padding:.0%}) …")
-            te_masked, n_mono = _monotonic_z_bound(
-                te_masked, z_cm, padding=args.mono_z_padding
-            )
-            if n_mono:
-                print(f"    {n_mono} cells masked by monotonicity bound")
-            else:
-                print(f"    No cells exceeded the upstream bound")
+                n_finite = int(np.isfinite(te_masked).sum())
+                n_total  = int(te_masked.size)
+                print(f"  {n_finite}/{n_total} cells finite ({100*n_finite/n_total:.1f}%) before fill")
 
-            print(f"  Fitting {te_masked.shape[2]} cycles …")
-            te_filled = fill_te_grid(te_masked, x_cm, z_cm, **fill_kwargs)
+                te_masked, untrusted_ports = _mask_untrusted_te_ports(
+                    te_masked,
+                    ports,
+                    es_id,
+                )
+                if untrusted_ports:
+                    print(
+                        "  Low-T_e/unreliable downstream rows excluded before fill: "
+                        + ", ".join(f"p{port}" for port in untrusted_ports)
+                    )
 
-            # Write to HDF5
-            grp = hf_out["experiment_sets"].create_group(es_id)
-            grp.attrs["label"]    = data["es_label"]
-            grp.attrs["v_bank_v"] = float(data["v_bank"])
-            grp.create_dataset("x_cm",           data=x_cm,                compression="gzip")
-            grp.create_dataset("z_cm",           data=z_cm,                compression="gzip")
-            grp.create_dataset("cycle_time_ms",  data=data["cycle_time_ms"], compression="gzip")
-            grp.create_dataset("te_masked",      data=te_masked,            compression="gzip", compression_opts=4)
-            grp.create_dataset("te_filled",      data=te_filled,            compression="gzip", compression_opts=4)
-            hf_out.flush()
+                preserve_mask = None
+                if current_hf is not None:
+                    preserve_mask = _load_current_hotspot_mask(
+                        current_hf,
+                        es_id,
+                        x_cm=x_cm,
+                        z_cm=z_cm,
+                        cycle_time_ms=data["cycle_time_ms"],
+                        core_x_cm=args.x_core,
+                        sigma=args.core_hotspot_current_sigma,
+                        ratio=args.core_hotspot_current_ratio,
+                    )
+                    print(
+                        f"  Core -I_SWEEP hot-spot preservation: "
+                        f"{int(preserve_mask.sum())} candidate cells"
+                    )
 
-            if not args.no_plots:
-                _plot_comparison(data, te_filled, args.output_dir)
+                # Apply monotonic-z upper bound: downstream cells whose Te exceeds
+                # the upstream Te envelope are masked before the RBF, unless a
+                # core -I_SWEEP dead-time spike corroborates a real hot spot.
+                print(f"  Monotonic-z bound (padding={args.mono_z_padding:.0%}) …")
+                te_masked, n_mono, n_preserved = _monotonic_z_bound(
+                    te_masked, z_cm, padding=args.mono_z_padding, preserve_mask=preserve_mask
+                )
+                if n_mono:
+                    print(f"    {n_mono} cells masked by monotonicity bound")
+                else:
+                    print(f"    No cells exceeded the upstream bound")
+                if n_preserved:
+                    print(f"    {n_preserved} core hot-spot cells preserved")
+
+                print(f"  Fitting {te_masked.shape[2]} cycles …")
+                te_filled = fill_te_grid(te_masked, x_cm, z_cm, **fill_kwargs)
+                te_filled, n_monotonic_rows, max_monotonic_reduction = (
+                    _enforce_core_mean_monotonic_z(
+                        te_filled,
+                        x_cm,
+                        core_x_cm=args.x_core,
+                        te_floor=args.te_boundary,
+                    )
+                )
+                print(
+                    "  Core-mean monotonic-z enforcement: "
+                    f"{n_monotonic_rows} row-cycles adjusted, "
+                    f"maximum reduction {max_monotonic_reduction:.1%}"
+                )
+
+                # Write to HDF5
+                grp = hf_out["experiment_sets"].create_group(es_id)
+                grp.attrs["label"]    = data["es_label"]
+                grp.attrs["v_bank_v"] = float(data["v_bank"])
+                grp.attrs["current_hotspot_preservation_enabled"] = bool(current_hf is not None)
+                grp.attrs["current_hotspot_preserved_cells"] = int(n_preserved)
+                grp.attrs["current_hotspot_current_sigma"] = float(args.core_hotspot_current_sigma)
+                grp.attrs["current_hotspot_current_ratio"] = float(args.core_hotspot_current_ratio)
+                grp.attrs["trusted_te_ports"] = ",".join(
+                    str(port) for port in TRUSTED_TE_PORTS_BY_ES.get(es_id, tuple(ports))
+                )
+                grp.attrs["excluded_unreliable_te_ports"] = ",".join(
+                    str(port) for port in untrusted_ports
+                )
+                grp.attrs["core_mean_te_monotonic_z_enforced"] = True
+                grp.attrs["core_mean_te_monotonic_adjusted_row_cycles"] = int(
+                    n_monotonic_rows
+                )
+                grp.attrs["core_mean_te_monotonic_max_fractional_reduction"] = float(
+                    max_monotonic_reduction
+                )
+                grp.create_dataset("x_cm",           data=x_cm,                compression="gzip")
+                grp.create_dataset("z_cm",           data=z_cm,                compression="gzip")
+                grp.create_dataset("port",           data=ports,               compression="gzip")
+                grp.create_dataset("cycle_time_ms",  data=data["cycle_time_ms"], compression="gzip")
+                grp.create_dataset("te_masked",      data=te_masked,            compression="gzip", compression_opts=4)
+                grp.create_dataset("te_filled",      data=te_filled,            compression="gzip", compression_opts=4)
+                hf_out.flush()
+
+                if not args.no_plots:
+                    plot_data = dict(data)
+                    plot_data["te"] = te_masked
+                    _plot_comparison(plot_data, te_filled, args.output_dir)
+    finally:
+        if current_hf is not None:
+            current_hf.close()
 
     print(f"\nWrote {args.output}")
 

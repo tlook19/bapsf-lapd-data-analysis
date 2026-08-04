@@ -1,0 +1,18 @@
+{
+  "description": "Shot-cycle exclusions for downstream analysis. These are detected only from frontside -I_SWEEP dead-time high-current outliers, then intended to exclude both I_SWEEP and ISAT for the same run/flat_shot/cycle.",
+  "manifest": "config/may2026_run_manifest.toml",
+  "detector_channel": "i_sweep",
+  "detector_polarity": "inverted; -I_SWEEP must be positive during dead-time",
+  "sigma_threshold": 3.0,
+  "ratio_threshold": 1.5,
+  "min_shots_retained_per_position_cycle": 10,
+  "total_exclusions": 65996,
+  "csv": "processed/isweep_frontside_arc_shot_exclusions.csv",
+  "summary_csv": "processed/isweep_frontside_arc_shot_exclusions_summary.csv",
+  "columns": {
+    "flat_shot": "position_index * n_shots_per_position + shot_index",
+    "cycle_index": "Langmuir sweep/dead-time cycle index; exclude the matching cycle for this flat_shot.",
+    "exclude_i_sweep": "1 means exclude this run/flat_shot/cycle from I_SWEEP-based analysis.",
+    "exclude_isat": "1 means exclude this run/flat_shot/cycle from ISAT-based analysis because the frontside arc can pollute both faces."
+  }
+}

@@ -46,3 +46,8 @@ The package currently focuses on:
   the `MSI/Discharge` traces.
 
 Large local HDF5 files under `data/` are ignored by git.
+
+## Analysis Notes
+
+- After the Langmuir sweep processing is complete for all runs, make a table of
+  the starting density and temperature at x = 0 for each Langmuir port.

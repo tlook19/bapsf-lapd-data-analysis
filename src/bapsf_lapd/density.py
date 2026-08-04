@@ -34,7 +34,10 @@ magnetised limit used here somewhat overestimates the correction.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
+from pathlib import Path
+import tomllib
 
 import numpy as np
 
@@ -60,6 +63,59 @@ MACH_K: float = 1.66
 #: ``ln(A_body / A_face) / MACH_K = ln(3/2) / 1.66 ≈ 0.244``
 #: **Not applied** to recorded M_measured; see module docstring.
 MACH_SHADOW_OFFSET: float = math.log(1.5) / MACH_K   # ≈ 0.244
+
+
+@dataclass(frozen=True)
+class ProbeAAreaCalibration:
+    """Canonical empirical Probe A current-to-area normalization."""
+
+    factor: float
+    lower_bound: float
+    upper_bound: float
+    applies_to_both_faces: bool
+
+    @property
+    def uncertainty(self) -> float:
+        """Half-width of the density-bracket interval."""
+        return abs(self.upper_bound - self.lower_bound) / 2.0
+
+    @property
+    def relative_uncertainty(self) -> float:
+        return self.uncertainty / self.factor
+
+
+def load_probe_a_area_calibration(path: str | Path) -> ProbeAAreaCalibration:
+    """Load and validate the canonical p11/p50 empirical area factor."""
+    with open(path, "rb") as stream:
+        data = tomllib.load(stream)["probe_A"]
+    calibration = ProbeAAreaCalibration(
+        factor=float(data["factor"]),
+        lower_bound=float(data["lower_bound"]),
+        upper_bound=float(data["upper_bound"]),
+        applies_to_both_faces=bool(data.get("applies_to_both_faces", False)),
+    )
+    if (
+        calibration.factor <= 0.0
+        or calibration.lower_bound <= 0.0
+        or calibration.upper_bound <= 0.0
+        or calibration.lower_bound > calibration.upper_bound
+    ):
+        raise ValueError(f"Invalid Probe A area calibration in {path}")
+    if not calibration.applies_to_both_faces:
+        raise ValueError(
+            "The May 2026 Probe A calibration must explicitly apply to both faces"
+        )
+    return calibration
+
+
+def apply_probe_a_area_factor(
+    current_a: np.ndarray,
+    probe_id: str,
+    calibration: ProbeAAreaCalibration,
+) -> np.ndarray:
+    """Return current normalized to the canonical effective Probe A area."""
+    scale = calibration.factor if probe_id == "A" else 1.0
+    return np.asarray(current_a) * scale
 
 
 def ion_sound_speed_m_s(te_ev: np.ndarray, m_i_amu: float) -> np.ndarray:
@@ -155,7 +211,7 @@ def calibrate_probe_area_m2(
     if valid.sum() < 2:
         return np.nan
 
-    probe_line_integrated = np.trapz(integrand[valid], x[valid])
+    probe_line_integrated = np.trapezoid(integrand[valid], x[valid])
     if probe_line_integrated <= 0 or not np.isfinite(interf_line_integrated_m2) or interf_line_integrated_m2 <= 0:
         return np.nan
     return float(probe_line_integrated / interf_line_integrated_m2)

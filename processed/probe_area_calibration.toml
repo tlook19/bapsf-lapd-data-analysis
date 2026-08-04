@@ -1,0 +1,35 @@
+# Langmuir probe face area calibration — May 2026 LAPD experiment.
+# Ion species: He-4  m_i = 4.003 amu
+# Calibration time window: 10.0–19.0 ms (stable plasma plateau)
+# Primary calibration: experiment set 1 ('nice plasma', 180 V bank)
+#
+# A_p_L: left (upstream) face area — Isweep channel
+# A_p_R: right (downstream) face area — Isat channel
+# Probe A: base/reference area copied from probe B. Apply the canonical
+# empirical factor in config/may2026_probe_a_area_calibration.toml once to raw
+# Probe A current in every downstream density/Mach workflow.
+
+[probe_A]
+ap_L_cm2 = 0.050614
+ap_R_cm2 = 0.053233
+ap_L_std_cm2 = 0.001540
+ap_R_std_cm2 = 0.001144
+estimated = true  # base/reference area copied from probe B
+
+[probe_B]
+ap_L_cm2 = 0.050614
+ap_R_cm2 = 0.053233
+ap_L_std_cm2 = 0.001540
+ap_R_std_cm2 = 0.001144
+
+[probe_C]
+ap_L_cm2 = 0.045589
+ap_R_cm2 = 0.050461
+ap_L_std_cm2 = 0.001461
+ap_R_std_cm2 = 0.001362
+
+[probe_D]
+ap_L_cm2 = 0.059149
+ap_R_cm2 = 0.056133
+ap_L_std_cm2 = 0.001354
+ap_R_std_cm2 = 0.001102

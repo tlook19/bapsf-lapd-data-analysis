@@ -17,15 +17,14 @@ Calibration formula
 -------------------
   A_p = trapz(I_sat(x) / [e * C_s(x) * exp(-0.5)], x) / ∫ n_e dl
 
-where C_s = sqrt(k_B T_e / m_i) from the langmuir_sweeps.hdf5 T_e and the
-interferometer provides ∫ n_e dl at each dead-time midpoint.
+where C_s = sqrt(k_B T_e / m_i) from the experiment-set-1 filled T_e grid and
+the interferometer provides ∫ n_e dl at each dead-time midpoint.
 
 Cross-set variation
 -------------------
-Areas are computed independently for each experiment set (1–4) and reported
-in a table.  Experiment set 1 ("nice plasma", 180 V bank) is used as the
-primary calibration.  Probe A (ports 11/50) has no nearby interferometer;
-its area is estimated from probe B with an ``estimated = true`` flag.
+Areas are computed from experiment set 1 ("nice plasma", 180 V bank).  Probe A
+(ports 11/50) has no nearby interferometer; its area is estimated from probe B
+with an ``estimated = true`` flag.
 
 Interferometer port mapping (axial proximity)
 ---------------------------------------------
@@ -35,9 +34,10 @@ Interferometer port mapping (axial proximity)
 
 Inputs
 ------
-  config/may2026_run_manifest.toml
-  processed/langmuir_sweeps.hdf5  (T_e per position/cycle)
+  processed/te_filled.hdf5  (experiment-set-1 filled T_e profile)
   processed/interferometer_experiment_set_stats.npz
+  processed/isweep_deadtime_profiles.hdf5
+  processed/isat_rot180_deadtime_profiles.hdf5
 
 Output
 ------
@@ -56,28 +56,21 @@ from typing import Any
 import h5py
 import numpy as np
 
-from bapsf_lapd import ChannelKind, LapdDataset, LapdRun
-from bapsf_lapd.density import (
-    calibrate_probe_area_m2,
-    inter_sweep_sample_slices,
-    ion_sound_speed_m_s,
-)
+from bapsf_lapd.density import calibrate_probe_area_m2, ion_sound_speed_m_s
 
 
-MANIFEST = Path("config/may2026_run_manifest.toml")
-SWEEPS_HDF5 = Path("processed/langmuir_sweeps.hdf5")
+TE_FILLED_HDF5 = Path("processed/te_filled.hdf5")
 INTERF_NPZ = Path("processed/interferometer_experiment_set_stats.npz")
+ISWEEP_ROT0_HDF5 = Path("processed/isweep_deadtime_profiles.hdf5")
+ISAT_ROT180_HDF5 = Path("processed/isat_rot180_deadtime_profiles.hdf5")
 OUTPUT_TOML = Path("processed/probe_area_calibration.toml")
 
 # He-4 ion mass in amu.  Change to 1.008 for hydrogen, 39.948 for argon.
 M_I_AMU = 4.003
 
 # Stable plasma plateau for calibration (ms from SIS trigger).
-CALIB_T_MIN_MS = 5.0
-CALIB_T_MAX_MS = 15.0
-
-# Edge clip at both ends of each dead-time window to avoid ramp transients.
-CLIP_S = 10e-6
+CALIB_T_MIN_MS = 10.0
+CALIB_T_MAX_MS = 19.0
 
 # Probe scan positions (51 points, 1 cm spacing, centred at x = 0).
 X_CM = np.linspace(-25.0, 25.0, 51)
@@ -114,86 +107,114 @@ def _load_interferometer(
     return time_ms, line_integrated_m2
 
 
-def _dead_time_midpoints_ms(run: LapdRun) -> np.ndarray:
-    """Midpoint time (ms) of each dead-time period relative to the SIS trigger."""
-    sw = run.config.sweep
-    return np.array([
-        (sw.t0_s + k * sw.tau_cycle_s + sw.tau_ramp_s
-         + sw.t0_s + (k + 1) * sw.tau_cycle_s) / 2 * 1000
-        for k in range(sw.n_cycles)
-    ])
+def _load_te_filled_reference(path: Path) -> dict[str, np.ndarray]:
+    """Load the experiment-set-1 filled T_e reference grid."""
+    with h5py.File(path, "r") as hdf:
+        grp = hdf["experiment_sets"][str(REF_SET)]
+        return {
+            "x_cm": grp["x_cm"][()],
+            "z_cm": grp["z_cm"][()],
+            "cycle_time_ms": grp["cycle_time_ms"][()],
+            "te_filled": grp["te_filled"][()],
+        }
 
 
-def _shot_averaged_isat(traces: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Per-position mean and std from (n_pos, n_shots, n_samples) traces.
-
-    Averages over the time axis first, then over shots, giving a robust
-    DC estimate of the ion saturation current at each probe position.
-    """
-    per_shot = traces.mean(axis=2)  # (n_pos, n_shots)
-    mean = per_shot.mean(axis=1)    # (n_pos,)
-    n_shots = traces.shape[1]
-    std = per_shot.std(axis=1, ddof=1) if n_shots > 1 else np.zeros(traces.shape[0])
-    return mean, std
+def _te_grid_for_port(te_ref: dict[str, np.ndarray], port_z_cm: float) -> np.ndarray:
+    """Return a filled T_e(x, cycle) grid at the nearest measured z row."""
+    z_cm = te_ref["z_cm"]
+    z_idx = int(np.argmin(np.abs(z_cm - port_z_cm)))
+    te_grid = te_ref["te_filled"][z_idx, :, :]
+    if not np.allclose(te_ref["x_cm"], X_CM):
+        raise ValueError("te_filled x grid does not match the calibration x grid")
+    return te_grid
 
 
 # ---------------------------------------------------------------------------
-# Per-run calibration
+# Profile calibration
 # ---------------------------------------------------------------------------
 
-def calibrate_run(
-    run: LapdRun,
+def calibrate_profile(
+    isat_grid: np.ndarray,
+    profile_time_s: np.ndarray,
     te_grid: np.ndarray,
+    te_time_ms: np.ndarray,
     interf_time_ms: np.ndarray,
     interf_line_integrated_m2: np.ndarray,
 ) -> dict[str, list[float]]:
-    """Calibrate A_p_R and A_p_L for one run over the stable plasma window.
+    """Calibrate one probe face over the selected stable plasma window.
 
-    te_grid: (51, n_cycles) shot-averaged electron temperature in eV (NaN allowed).
+    isat_grid: (51, n_cycles) positive ion-saturation current in A.
+    te_grid: (51, n_cycles) filled electron temperature in eV.
 
-    Returns {"ap_R_m2": [...], "ap_L_m2": [...]} — one value per calibration cycle.
+    Returns one area value per valid calibration cycle.
     """
-    sw = run.config.sweep
-    dead_slices = inter_sweep_sample_slices(sw, run.config.acquisition, clip_s=CLIP_S)
-    dead_mids_ms = _dead_time_midpoints_ms(run)
-    in_window = (dead_mids_ms >= CALIB_T_MIN_MS) & (dead_mids_ms <= CALIB_T_MAX_MS)
+    profile_time_ms = np.asarray(profile_time_s, dtype=np.float64) * 1000.0
+    in_window = (profile_time_ms >= CALIB_T_MIN_MS) & (profile_time_ms <= CALIB_T_MAX_MS)
 
-    isat_offset = run.default_zero_offset_v(ChannelKind.ISAT)
-    isweep_offset = run.default_zero_offset_v(ChannelKind.I_SWEEP)
-
-    ap_R_list: list[float] = []
-    ap_L_list: list[float] = []
-
-    for k in range(sw.n_cycles):
+    ap_list: list[float] = []
+    for k, time_ms in enumerate(profile_time_ms):
         if not in_window[k]:
             continue
 
-        # Load dead-time traces: (51, 20, n_dead_samples)
-        traces_R = run.langmuir_traces(ChannelKind.ISAT, dead_slices[k], zero_offset_v=isat_offset)
-        traces_L = run.langmuir_traces(ChannelKind.I_SWEEP, dead_slices[k], zero_offset_v=isweep_offset)
-
-        isat_R, _ = _shot_averaged_isat(traces_R)
-        isat_L, _ = _shot_averaged_isat(-traces_L)  # negate Isweep polarity
-
-        # T_e at ramp k → sound speed at each position.
-        te_k = te_grid[:, k] if k < te_grid.shape[1] else np.full(51, np.nan)
+        # Filled T_e at the dead-time midpoint → sound speed at each position.
+        te_k = np.array([
+            np.interp(time_ms, te_time_ms, te_grid[i, :])
+            for i in range(te_grid.shape[0])
+        ])
         with np.errstate(invalid="ignore"):
             cs_k = ion_sound_speed_m_s(te_k, M_I_AMU)
 
         # Interferometer value at the dead-time midpoint.
-        interf_val = float(np.interp(dead_mids_ms[k], interf_time_ms, interf_line_integrated_m2))
+        interf_val = float(np.interp(time_ms, interf_time_ms, interf_line_integrated_m2))
         if not np.isfinite(interf_val) or interf_val <= 0:
             continue
 
-        ap_R_k = calibrate_probe_area_m2(isat_R, cs_k, X_M, interf_val)
-        ap_L_k = calibrate_probe_area_m2(isat_L, cs_k, X_M, interf_val)
+        ap_k = calibrate_probe_area_m2(isat_grid[:, k], cs_k, X_M, interf_val)
 
-        if np.isfinite(ap_R_k):
-            ap_R_list.append(ap_R_k)
-        if np.isfinite(ap_L_k):
-            ap_L_list.append(ap_L_k)
+        if np.isfinite(ap_k):
+            ap_list.append(ap_k)
 
-    return {"ap_R_m2": ap_R_list, "ap_L_m2": ap_L_list}
+    return ap_list
+
+
+def _accumulate_profile_file(
+    hdf_path: Path,
+    face_key: str,
+    accum: dict[str, dict[str, list[float]]],
+    te_ref: dict[str, np.ndarray],
+    interf_npz: dict[str, np.ndarray],
+) -> None:
+    with h5py.File(hdf_path, "r") as hdf:
+        if not np.allclose(hdf["x_cm"][()], X_CM):
+            raise ValueError(f"{hdf_path} x grid does not match the calibration x grid")
+
+        for run_id in sorted(hdf[f"experiment_sets/{REF_SET}"].keys()):
+            pid = _probe_id(run_id)
+            if pid not in accum:
+                continue
+
+            grp = hdf[f"experiment_sets/{REF_SET}/{run_id}"]
+            port = int(grp.attrs["port"])
+            if port not in INTERF_PORT_FOR:
+                continue
+
+            interf_port = INTERF_PORT_FOR[port]
+            interf_time_ms, interf_m2 = _load_interferometer(interf_npz, REF_SET, interf_port)
+            te_grid = _te_grid_for_port(te_ref, float(grp.attrs["z_cm"]))
+
+            print(
+                f"  calibrating run {run_id}  probe={pid}  set={REF_SET}"
+                f"  port={port}  face={face_key}"
+            )
+            ap = calibrate_profile(
+                grp["isat_a"][()],
+                grp["inter_sweep_time_s"][()],
+                te_grid,
+                te_ref["cycle_time_ms"],
+                interf_time_ms,
+                interf_m2,
+            )
+            accum[pid][face_key].extend(ap)
 
 
 # ---------------------------------------------------------------------------
@@ -214,7 +235,9 @@ def _write_toml(summary: dict[str, dict[str, Any]], path: Path) -> None:
         "#\n",
         "# A_p_L: left (upstream) face area — Isweep channel\n",
         "# A_p_R: right (downstream) face area — Isat channel\n",
-        "# Probe A: no nearby interferometer; area estimated from probe B\n",
+        "# Probe A: base/reference area copied from probe B; apply the canonical\n",
+        "# empirical factor in config/may2026_probe_a_area_calibration.toml once\n",
+        "# to raw Probe A current in every downstream density/Mach workflow.\n",
         "\n",
     ]
     for probe_id in ("A", "B", "C", "D"):
@@ -225,7 +248,7 @@ def _write_toml(summary: dict[str, dict[str, Any]], path: Path) -> None:
         lines.append(f"ap_L_std_cm2 = {_fmt(data['ap_L_std_cm2'])}\n")
         lines.append(f"ap_R_std_cm2 = {_fmt(data['ap_R_std_cm2'])}\n")
         if data.get("estimated"):
-            lines.append("estimated = true  # no nearby interferometer; area copied from probe B\n")
+            lines.append("estimated = true  # base/reference area copied from probe B\n")
         lines.append("\n")
 
         if "by_set" in data:
@@ -248,81 +271,42 @@ def _write_toml(summary: dict[str, dict[str, Any]], path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    dataset = LapdDataset.from_manifest(MANIFEST)
     interf_npz = dict(np.load(INTERF_NPZ))
+    te_ref = _load_te_filled_reference(TE_FILLED_HDF5)
 
-    # Accumulate calibration samples keyed by [probe_id][set_id]["ap_R/L_m2"]
+    # Accumulate calibration samples keyed by [probe_id]["ap_R/L_m2"]
     probe_ids = ("B", "C", "D")
-    accum: dict[str, dict[int, dict[str, list[float]]]] = {
-        pid: {sid: {"ap_R_m2": [], "ap_L_m2": []} for sid in range(1, 5)}
-        for pid in probe_ids
-    }
+    accum: dict[str, dict[str, list[float]]] = {pid: {"ap_R_m2": [], "ap_L_m2": []} for pid in probe_ids}
 
-    with h5py.File(SWEEPS_HDF5, "r") as sweeps_hdf:
-        for set_id in dataset.experiment_set_ids():
-            for run_id in dataset.experiment_set_run_ids(set_id):
-                pid = _probe_id(run_id)
-                if pid not in probe_ids:
-                    continue  # probe A has no interferometer
+    _accumulate_profile_file(ISAT_ROT180_HDF5, "ap_R_m2", accum, te_ref, interf_npz)
+    _accumulate_profile_file(ISWEEP_ROT0_HDF5, "ap_L_m2", accum, te_ref, interf_npz)
 
-                run = dataset.run(run_id)
-                port = run.config.probe.port
-                if port not in INTERF_PORT_FOR:
-                    print(f"  [skip] run {run_id}: port {port} not in interferometer map")
-                    continue
-
-                # Check that this run has been processed by process_langmuir_sweeps.py.
-                hdf_key = f"experiment_sets/{set_id}/{run_id}"
-                if hdf_key not in sweeps_hdf:
-                    print(f"  [skip] run {run_id}: not found in {SWEEPS_HDF5}")
-                    continue
-
-                interf_port = INTERF_PORT_FOR[port]
-                interf_time_ms, interf_m2 = _load_interferometer(interf_npz, set_id, interf_port)
-                te_grid = sweeps_hdf[f"{hdf_key}/te_log_ev"][()]  # (51, n_cycles)
-
-                print(f"  calibrating run {run_id}  probe={pid}  set={set_id}  port={port}")
-                cal = calibrate_run(run, te_grid, interf_time_ms, interf_m2)
-
-                accum[pid][set_id]["ap_R_m2"].extend(cal["ap_R_m2"])
-                accum[pid][set_id]["ap_L_m2"].extend(cal["ap_L_m2"])
-
-    # Summarise: mean ± std per probe per set; print cross-set table.
+    # Summarise: mean ± std per probe; print table.
     print(
         "\n=== Probe Area Calibration ==="
-        f"\n{'Probe':>6} {'Set':>4}  {'A_p_R (cm²)':>18}  {'A_p_L (cm²)':>18}  {'n_R':>5} {'n_L':>5}"
+        f"\n{'Probe':>6}  {'A_p_R (cm²)':>18}  {'A_p_L (cm²)':>18}  {'n_R':>5} {'n_L':>5}"
     )
-    print("-" * 62)
+    print("-" * 56)
 
     probe_summary: dict[str, dict[str, Any]] = {}
     for pid in probe_ids:
-        by_set: dict[int, dict[str, Any]] = {}
-        for set_id in range(1, 5):
-            vals_R = np.array([v for v in accum[pid][set_id]["ap_R_m2"] if np.isfinite(v)]) * 1e4
-            vals_L = np.array([v for v in accum[pid][set_id]["ap_L_m2"] if np.isfinite(v)]) * 1e4
-            mean_R = float(np.mean(vals_R)) if len(vals_R) > 0 else np.nan
-            mean_L = float(np.mean(vals_L)) if len(vals_L) > 0 else np.nan
-            std_R = float(np.std(vals_R, ddof=1)) if len(vals_R) > 1 else np.nan
-            std_L = float(np.std(vals_L, ddof=1)) if len(vals_L) > 1 else np.nan
-            by_set[set_id] = {
-                "ap_R_cm2": mean_R, "ap_L_cm2": mean_L,
-                "ap_R_std_cm2": std_R, "ap_L_std_cm2": std_L,
-                "n_R": len(vals_R), "n_L": len(vals_L),
-            }
-            print(
-                f"{pid:>6} {set_id:>4}  "
-                f"{mean_R:>8.4f} ± {std_R:<8.4f}  "
-                f"{mean_L:>8.4f} ± {std_L:<8.4f}  "
-                f"{len(vals_R):>5} {len(vals_L):>5}"
-            )
-
-        ref = by_set[REF_SET]
+        vals_R = np.array([v for v in accum[pid]["ap_R_m2"] if np.isfinite(v)]) * 1e4
+        vals_L = np.array([v for v in accum[pid]["ap_L_m2"] if np.isfinite(v)]) * 1e4
+        mean_R = float(np.mean(vals_R)) if len(vals_R) > 0 else np.nan
+        mean_L = float(np.mean(vals_L)) if len(vals_L) > 0 else np.nan
+        std_R = float(np.std(vals_R, ddof=1)) if len(vals_R) > 1 else np.nan
+        std_L = float(np.std(vals_L, ddof=1)) if len(vals_L) > 1 else np.nan
+        print(
+            f"{pid:>6}  "
+            f"{mean_R:>8.4f} ± {std_R:<8.4f}  "
+            f"{mean_L:>8.4f} ± {std_L:<8.4f}  "
+            f"{len(vals_R):>5} {len(vals_L):>5}"
+        )
         probe_summary[pid] = {
-            "ap_R_cm2": ref["ap_R_cm2"],
-            "ap_L_cm2": ref["ap_L_cm2"],
-            "ap_R_std_cm2": ref["ap_R_std_cm2"],
-            "ap_L_std_cm2": ref["ap_L_std_cm2"],
-            "by_set": by_set,
+            "ap_R_cm2": mean_R,
+            "ap_L_cm2": mean_L,
+            "ap_R_std_cm2": std_R,
+            "ap_L_std_cm2": std_L,
         }
 
     # Probe A: estimated from probe B (nearest port).

@@ -25,6 +25,9 @@ HDF5 layout
       te_exp_ev                 (51, n_cycles)  shot-averaged Te, exp method
       te_exp_ev_std             (51, n_cycles)
       te_exp_ev_sem             (51, n_cycles)
+      te_best_ev                (51, n_cycles)  shot-averaged Te, best-of-log-or-exp per shot
+      te_best_ev_std            (51, n_cycles)
+      te_best_ev_sem            (51, n_cycles)
       vp_derivative_v           (51, n_cycles)  plasma potential, derivative
       vp_derivative_v_std       (51, n_cycles)
       vp_derivative_v_sem       (51, n_cycles)
@@ -78,7 +81,9 @@ from bapsf_lapd import (
     LapdRun,
     analyze_langmuir_sweep,
     butterworth_lowpass,
+    effective_rotation_deg,
     evaluate_langmuir_quality,
+    select_best_te_ev,
 )
 
 
@@ -89,7 +94,7 @@ ARC_EXCLUSIONS_CSV = Path("processed/isweep_frontside_arc_shot_exclusions.csv")
 # Probe scan positions: 51 points, 1 cm spacing, centered at x=0.
 X_CM = np.linspace(-25.0, 25.0, 51)
 
-QUANTITIES = ("te_log_ev", "te_exp_ev", "vp_derivative_v", "vp_log_v", "vp_exp_v")
+QUANTITIES = ("te_log_ev", "te_exp_ev", "te_best_ev", "vp_derivative_v", "vp_log_v", "vp_exp_v")
 
 # Integer codes for severity stored in per-shot accumulation arrays.
 _SEV_OK = 0
@@ -350,6 +355,9 @@ def _process_run(
                         per_shot["te_exp_ev"][pos_idx, shot_idx, cyc_idx] = (
                             analysis.exponential_fit.electron_temperature_ev
                         )
+                        per_shot["te_best_ev"][pos_idx, shot_idx, cyc_idx] = (
+                            select_best_te_ev(analysis)
+                        )
                         per_shot["vp_derivative_v"][pos_idx, shot_idx, cyc_idx] = (
                             analysis.plasma_potential_derivative_v
                         )
@@ -542,11 +550,13 @@ def main() -> None:
                 del es_grp[es_id][run_id]
 
             run = dataset.run(run_id)
-            rot = cfg.probe.rotation_deg
+            recorded_rot = float(cfg.probe.rotation_deg or 0)
+            rot = effective_rotation_deg(run_id, recorded_rot)
             core_c, edge_c = _cutoff_hz_for_run(run, args.cutoff_khz * 1e3)
+            rot_note = f" (recorded {recorded_rot:.0f}°)" if rot != recorded_rot else ""
             sys.stdout.write(
                 f"run {run_id}  exp_set={es_id}  port={cfg.probe.port}"
-                f"  z={cfg.probe.z_cm:.1f} cm  rot={rot:.0f}°"
+                f"  z={cfg.probe.z_cm:.1f} cm  rot={rot:.0f}°{rot_note}"
                 f"  {run.config.sweep.n_cycles} cycles"
                 f"  cutoff={core_c/1e3:.0f}/{edge_c/1e3:.0f} kHz (core/edge)\n"
             )
@@ -572,6 +582,8 @@ def main() -> None:
             run_grp = es_grp[es_id].create_group(run_id)
             run_grp.attrs["run_id"] = run_id
             run_grp.attrs["rotation_deg"] = float(rot)
+            run_grp.attrs["rotation_deg_recorded"] = recorded_rot
+            run_grp.attrs["rotation_correction_applied"] = bool(rot != recorded_rot)
             run_grp.attrs["port"] = int(cfg.probe.port)
             run_grp.attrs["z_cm"] = float(cfg.probe.z_cm)
             run_grp.attrs["experiment_set_id"] = int(exp_set.id)
