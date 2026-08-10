@@ -56,7 +56,7 @@ SEAM_WINDOW_MS = 0.25  # first slice of the decay trace used for the seam gate
 # drive family is appended.  Keys are the inputs this script will augment;
 # values are versions it will NOT re-accept, which is what makes an
 # already-augmented overlay fail the gate instead of being augmented twice.
-AUGMENTED_SCHEMA = {2: 4, 3: 4, 5: 6}
+AUGMENTED_SCHEMA = {2: 4, 3: 4, 5: 6, 7: 8}
 
 
 def _seam_gate(new: dict, decay_t, decay_mean, decay_sem) -> list[str]:
