@@ -5,7 +5,8 @@ The NPZ product is self-contained and uses simulation-facing units:
 * core density and total SEM in cm^-3;
 * core electron temperature and radial SEM in eV;
 * offset-corrected upstream ion-saturation current at x=0 in A;
-* offset-corrected discharge current in A and cathode-anode voltage in V;
+* offset-corrected discharge current in A and cathode-anode voltage in V,
+  each with the shot-to-shot standard deviation and the SEM of the mean;
 * per-port fractional spread of the fit-window T_e re-fits, dimensionless;
 * all time axes in ms relative to the experimental SIS trigger.
 
@@ -19,8 +20,12 @@ Each run's discharge current has its own additive channel zero offset
 subtracted before smoothing; the per-run values are exported alongside the
 traces.  Discharge traces are smoothed with the same 9-sample moving average
 used by ``process_discharge_experiment_summary.py`` and averaged over both
-stored traces from all runs in the selected experiment set.  Raw cathode-anode
-voltage is negative, so the exported overlay voltage is multiplied by -1.
+stored traces from all runs in the selected experiment set.  The discharge
+standard deviation is the spread of those same single shots about that mean,
+taken on the shared trigger-referenced time grid without per-shot alignment,
+so it carries the machine's breakdown-timing jitter.  Raw cathode-anode
+voltage is negative, so the exported overlay voltage is multiplied by -1;
+dispersion is sign-invariant and is exported unnegated.
 """
 
 from __future__ import annotations
@@ -258,6 +263,23 @@ def _discharge_stats(
     Each run's discharge current has its own additive channel zero offset
     (``LapdRun.discharge_zero_offset_stats``) subtracted before smoothing, so
     the exported trace reads zero where no current flows.
+
+    Two per-sample dispersion measures are returned for both current and
+    voltage, computed over the same pooled single-shot ensemble as the mean:
+
+    * ``*_sd_*``  -- the sample standard deviation (``ddof=1``), i.e. the
+      shot-to-shot ENVELOPE.  This is the width of the population of real
+      shots, and does not shrink as more shots are stored.
+    * ``*_sem_*`` -- that standard deviation divided by ``sqrt(n_traces)``,
+      i.e. the uncertainty of the plotted MEAN.
+
+    The ensemble is pooled across runs on the raw SIS-trigger sample grid,
+    which every run in the set is required to share; no per-shot time
+    alignment is applied.  Shot-to-shot breakdown-timing jitter therefore
+    appears INSIDE these dispersions rather than being removed from them,
+    and dominates them wherever the trace is steep.  Each single trace is
+    smoothed by the ``DISCHARGE_SMOOTHING_SAMPLES`` moving average before
+    the statistics are taken, so both measures describe smoothed shots.
     """
     currents = []
     voltages_raw = []
@@ -303,8 +325,10 @@ def _discharge_stats(
     return {
         "time_ms": reference_time_s * 1000.0,
         "current_mean_a": np.mean(current_all, axis=0),
+        "current_sd_a": current_std,
         "current_sem_a": current_std / np.sqrt(n_traces),
         "voltage_positive_mean_v": -np.mean(voltage_all_raw, axis=0),
+        "voltage_sd_v": voltage_std,
         "voltage_sem_v": voltage_std / np.sqrt(n_traces),
         "n_traces": n_traces,
         "zero_offset_a": np.asarray(zero_offsets_a, dtype=np.float64),
@@ -373,7 +397,7 @@ def export_overlay(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        schema_version=np.array(5, dtype=np.int16),
+        schema_version=np.array(7, dtype=np.int16),
         experiment_set_id=np.array(experiment_set_id, dtype=np.int16),
         experiment_label=np.array(experiment_label),
         port=PORTS,
@@ -421,9 +445,18 @@ def export_overlay(
         ),
         discharge_time_ms=discharge["time_ms"],
         discharge_current_mean_a=discharge["current_mean_a"],
+        discharge_current_sd_a=discharge["current_sd_a"],
         discharge_current_sem_a=discharge["current_sem_a"],
         discharge_voltage_positive_mean_v=discharge["voltage_positive_mean_v"],
+        discharge_voltage_sd_v=discharge["voltage_sd_v"],
         discharge_voltage_sem_v=discharge["voltage_sem_v"],
+        discharge_spread_alignment=np.array(
+            "pooled single shots on the shared raw SIS-trigger sample grid; "
+            "no per-shot time alignment, so shot-to-shot breakdown-timing "
+            "jitter is inside the spread and dominates it where the trace is "
+            "steep; each shot smoothed by the moving average first; sd is the "
+            "ddof=1 shot envelope, sem is sd/sqrt(discharge_n_traces)"
+        ),
         discharge_n_traces=np.array(discharge["n_traces"], dtype=np.int16),
         discharge_zero_offset_a=discharge["zero_offset_a"],
         discharge_zero_offset_run_id=discharge["zero_offset_run_id"],
