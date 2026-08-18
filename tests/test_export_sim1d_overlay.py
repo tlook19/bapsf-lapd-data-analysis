@@ -10,6 +10,7 @@ from scripts.export_es1_sim1d_overlay import (
     X_MIN_CM,
     _despike_profile,
     _flux_tube_profile_stats,
+    _flow_symmetrized_profiles,
     _flux_tube_weights,
     _rot0_isat_profiles,
     _subtract_background,
@@ -248,3 +249,74 @@ def test_line_scans_refuse_a_mismatched_z_grid(tmp_path):
 
     with pytest.raises(ValueError, match="does not match the overlay z grid"):
         _rot0_isat_profiles(path, 1, np.array([999.0]))
+
+
+def _face(channel, current, sem=1.0, run_id="01", port=11):
+    """One face of a two-face pair, in the loader's return shape."""
+    return {
+        "x_cm": X_CM,
+        "time_ms": np.zeros(1),
+        "isat_a": np.full((1, 51, 1), float(current)),
+        "sem_a": np.full((1, 51, 1), float(sem)),
+        "port": np.array([port], dtype=np.int16),
+        "run_id": np.asarray([run_id]),
+        "source_channel": np.asarray([channel]),
+    }
+
+
+AREAS = {"01": {"ap_L_cm2": 2.0, "ap_R_cm2": 4.0}}
+
+
+def test_geomean_normalizes_each_face_by_its_own_channel_area():
+    combined = _flow_symmetrized_profiles(
+        _face("i_sweep", 6.0), _face("isat", 8.0), AREAS
+    )
+    # sqrt((6/2) * (8/4)) = sqrt(6)
+    assert combined["profiles"][0, 0, 0] == pytest.approx(np.sqrt(6.0))
+    assert combined["area_cm2"].tolist() == [[2.0, 4.0]]
+    assert "ap_L_cm2" in str(combined["pairing"][0])
+
+
+def test_geomean_is_symmetric_under_exchanging_which_product_holds_which_face():
+    forward = _flow_symmetrized_profiles(
+        _face("i_sweep", 6.0), _face("isat", 8.0), AREAS
+    )
+    swapped = _flow_symmetrized_profiles(
+        _face("isat", 8.0), _face("i_sweep", 6.0), AREAS
+    )
+    assert forward["profiles"][0, 0, 0] == pytest.approx(swapped["profiles"][0, 0, 0])
+
+
+def test_geomean_cancels_reciprocal_flow_factors():
+    # Chung: the faces carry exp(+KM/2) and exp(-KM/2) about a common level.
+    boost = np.exp(0.37)
+    plain = _flow_symmetrized_profiles(
+        _face("i_sweep", 2.0), _face("isat", 4.0), AREAS
+    )
+    flowing = _flow_symmetrized_profiles(
+        _face("i_sweep", 2.0 * boost), _face("isat", 4.0 / boost), AREAS
+    )
+    assert flowing["profiles"][0, 0, 0] == pytest.approx(plain["profiles"][0, 0, 0])
+
+
+def test_geomean_relative_error_is_half_the_quadrature_of_the_faces():
+    combined = _flow_symmetrized_profiles(
+        _face("i_sweep", 2.0, sem=0.2), _face("isat", 4.0, sem=0.8), AREAS
+    )
+    value = combined["profiles"][0, 0, 0]
+    expected = value * 0.5 * np.hypot(0.2 / 2.0, 0.8 / 4.0)
+    assert combined["sem"][0, 0, 0] == pytest.approx(expected)
+
+
+def test_geomean_is_nan_where_a_face_is_not_positive():
+    combined = _flow_symmetrized_profiles(
+        _face("i_sweep", 2.0), _face("isat", -1.0), AREAS
+    )
+    assert not np.isfinite(combined["profiles"][0, 0, 0])
+
+
+def test_geomean_refuses_two_readings_of_the_same_face():
+    with pytest.raises(ValueError, match="no second face"):
+        _flow_symmetrized_profiles(
+            _face("i_sweep", 2.0), _face("i_sweep", 3.0), AREAS
+        )

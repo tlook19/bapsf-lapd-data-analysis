@@ -132,6 +132,16 @@ ISAT_DECAY_BIN_S = 10.0e-6
 #: it too for the two to be the same quantity.
 FLUX_TUBE_RADIUS_CM = 18.415
 
+#: Collection area of the probe face each electrical channel sits on, as the
+#: attribute name carrying it.  Per ``bapsf_lapd.density``: at rot-0 the left
+#: face (toward the cathode, upstream) is the Isweep channel with area A_p_L,
+#: and the right face (toward the anode, downstream) is the Isat channel with
+#: area A_p_R.  The pairing is keyed off each run's OWN recorded channel rather
+#: than off which product file it came from, which is what keeps ES3 run 31 --
+#: whose two channels are exchanged between the products -- normalized by the
+#: right areas.
+CHANNEL_AREA_ATTR = {"i_sweep": "ap_L_cm2", "isat": "ap_R_cm2"}
+
 #: Number of points at each end of the scan that set the background baseline.
 #: Convention transcribed from the effective-width ledger
 #: (``figures/effwidth_analysis.py``, ``width_metrics``): the scalar baseline is
@@ -429,6 +439,92 @@ def _rot0_isat_profiles(
     }
 
 
+def _flow_symmetrized_profiles(
+    upstream: dict,
+    downstream: dict,
+    areas_cm2: dict[str, dict[str, float]],
+) -> dict[str, np.ndarray]:
+    """Return the flow-artifact-cancelled current density from both probe faces.
+
+    For each port, sample and x, the geometric mean ``sqrt(J_up * J_dn)`` of the
+    two faces' AREA-NORMALIZED currents, in A cm^-2.  In the Chung two-sided
+    probe model the faces carry flow factors ``exp(+K M / 2)`` and
+    ``exp(-K M / 2)``; those are reciprocal, so they cancel exactly in the
+    geometric mean to first order in ``M`` and what is left is the flow-free
+    shape.  Either single face carries the flow artifact with the opposite
+    sign, which is why their flux-tube corrections trend oppositely in z.
+
+    The geometric mean is symmetric in its two arguments, so which product
+    supplied which face does not matter; only the area normalization is
+    face-specific, and that is keyed off each run's own channel.  A cell is NaN
+    wherever either face is non-finite or non-positive, since a geometric mean
+    of a non-positive current is not defined; ``_flux_tube_profile_stats`` then
+    drops those cells from the quadrature.
+    """
+    if not np.array_equal(upstream["port"], downstream["port"]):
+        raise ValueError(
+            f"face products disagree on ports: {upstream['port']} vs "
+            f"{downstream['port']}"
+        )
+    if not np.array_equal(upstream["run_id"], downstream["run_id"]):
+        raise ValueError(
+            f"face products disagree on runs: {upstream['run_id']} vs "
+            f"{downstream['run_id']}"
+        )
+    if not np.allclose(upstream["x_cm"], downstream["x_cm"]):
+        raise ValueError("face products disagree on the x grid")
+    if not np.allclose(upstream["time_ms"], downstream["time_ms"]):
+        raise ValueError("face products disagree on the inter-sweep time grid")
+
+    geomean = np.empty_like(upstream["isat_a"])
+    sem = np.empty_like(geomean)
+    pairing = []
+    used_areas = []
+    for index, run_id in enumerate(upstream["run_id"]):
+        run_id = str(run_id)
+        channels = (
+            str(upstream["source_channel"][index]),
+            str(downstream["source_channel"][index]),
+        )
+        if channels[0] == channels[1]:
+            raise ValueError(
+                f"run {run_id}: both products report the {channels[0]} channel, "
+                "so there is no second face to symmetrize against"
+            )
+        currents = (upstream["isat_a"][index], downstream["isat_a"][index])
+        sems = (upstream["sem_a"][index], downstream["sem_a"][index])
+        densities = []
+        relatives = []
+        run_areas = []
+        for channel, current, current_sem in zip(channels, currents, sems):
+            if channel not in CHANNEL_AREA_ATTR:
+                raise ValueError(f"run {run_id}: unknown probe channel {channel}")
+            area = float(areas_cm2[run_id][CHANNEL_AREA_ATTR[channel]])
+            if area <= 0.0:
+                raise ValueError(f"run {run_id}: non-positive {channel} face area")
+            run_areas.append(area)
+            densities.append(current / area)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                relatives.append(current_sem / current)
+        product = densities[0] * densities[1]
+        usable = np.isfinite(product) & (product > 0.0)
+        geomean[index] = np.where(usable, np.sqrt(np.abs(product)), np.nan)
+        # d(sqrt(ab))/sqrt(ab) = 0.5 * hypot(da/a, db/b)
+        sem[index] = geomean[index] * 0.5 * np.hypot(relatives[0], relatives[1])
+        pairing.append(
+            f"{channels[0]}/{CHANNEL_AREA_ATTR[channels[0]]}={run_areas[0]:.6f} cm2"
+            f" x {channels[1]}/{CHANNEL_AREA_ATTR[channels[1]]}="
+            f"{run_areas[1]:.6f} cm2"
+        )
+        used_areas.append(run_areas)
+    return {
+        "profiles": geomean,
+        "sem": sem,
+        "pairing": np.asarray(pairing),
+        "area_cm2": np.asarray(used_areas, dtype=np.float64),
+    }
+
+
 def _isat_decay_stats(
     dataset: LapdDataset,
     profile_path: Path,
@@ -718,6 +814,14 @@ def export_overlay(
         density_profiles_m3 = density_hdf[
             f"experiment_sets/{experiment_set_key}/n_e_m3"
         ][()]
+        runs_group = density_hdf[f"experiment_sets/{experiment_set_key}/runs"]
+        face_areas_cm2 = {
+            run_id: {
+                attr: float(run_group.attrs[attr])
+                for attr in set(CHANNEL_AREA_ATTR.values())
+            }
+            for run_id, run_group in runs_group.items()
+        }
         te = _load_te_stats(
             te_hdf,
             experiment_set_key,
@@ -780,10 +884,20 @@ def export_overlay(
 
     upstream_scans, upstream_ftavg = _face_ftavg(isat_profile_path, "upstream")
     rot0_isat, isat_ftavg = _face_ftavg(rot0_isat_profile_path, "downstream")
+    geomean_scans = _flow_symmetrized_profiles(
+        upstream_scans,
+        rot0_isat,
+        face_areas_cm2,
+    )
+    geomean_ftavg = _flux_tube_series(
+        geomean_scans["profiles"],
+        upstream_scans["x_cm"],
+        geomean_scans["sem"],
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        schema_version=np.array(11, dtype=np.int16),
+        schema_version=np.array(13, dtype=np.int16),
         experiment_set_id=np.array(experiment_set_id, dtype=np.int16),
         experiment_label=np.array(experiment_label),
         port=PORTS,
@@ -922,12 +1036,42 @@ def export_overlay(
             "is the downstream face, retained as the effective-width ledger's "
             "rot-0 primary and as the face the 2026-08-18 paper read used.  "
             "The two faces' flux-tube corrections run in OPPOSITE directions "
-            "with z and must never be ratioed against each other."
+            "with z and must never be ratioed against each other.  "
+            "ADJUDICATED 2026-08-18, three estimators with three roles: "
+            "isat_ftavg_* is the downstream face, SHADOWED, biased low; "
+            "isat_ftavg_upstream_* is the ruled truth channel and the "
+            "flow-ENHANCED conjugate of it, biased the other way; "
+            "isat_ftavg_geomean_* is the flow-CANCELLED central estimator "
+            "built from both, and is the one whose C(z) came out z-flat."
         ),
         density_ftavg_cm3=density_ftavg["ftavg"] * M3_TO_CM3,
         density_ftavg_core_cm3=density_ftavg["core"] * M3_TO_CM3,
         density_ftavg_centroid_cm=density_ftavg["centroid"],
         density_ftavg_n_despiked=density_ftavg["n_despiked"],
+        isat_ftavg_geomean_time_ms=upstream_scans["time_ms"],
+        isat_ftavg_geomean_a_per_cm2=geomean_ftavg["ftavg"],
+        isat_ftavg_geomean_sem_a_per_cm2=geomean_ftavg["ftavg_sem"],
+        isat_ftavg_geomean_core_a_per_cm2=geomean_ftavg["core"],
+        isat_ftavg_geomean_centroid_cm=geomean_ftavg["centroid"],
+        isat_ftavg_geomean_n_despiked=geomean_ftavg["n_despiked"],
+        isat_ftavg_geomean_port=upstream_scans["port"],
+        isat_ftavg_geomean_run_id=upstream_scans["run_id"],
+        isat_ftavg_geomean_area_cm2=geomean_scans["area_cm2"],
+        isat_ftavg_geomean_pairing=geomean_scans["pairing"],
+        isat_ftavg_geomean_definition=np.array(
+            "FLOW-SYMMETRIZED central estimator, in A cm^-2: per port, per "
+            "inter-sweep sample and per x, the geometric mean "
+            "sqrt(J_up * J_dn) of the two probe faces' area-normalized "
+            "currents, then the same despike / background / centroid-fold / "
+            "R = ftavg_radius_cm quadrature as the other flux-tube fields.  "
+            "In the Chung two-sided model the faces carry reciprocal flow "
+            "factors exp(+K M / 2) and exp(-K M / 2), which cancel in the "
+            "geometric mean to first order in M, so this is the "
+            "flow-artifact-cancelled shape; each single face keeps that "
+            "artifact with the opposite sign.  Per-run face-and-area pairing "
+            "is in isat_ftavg_geomean_pairing.  A cell is NaN wherever either "
+            "face is non-positive or non-finite."
+        ),
         isat_ftavg_upstream_time_ms=upstream_scans["time_ms"],
         isat_ftavg_upstream_a=upstream_ftavg["ftavg"],
         isat_ftavg_upstream_sem_a=upstream_ftavg["ftavg_sem"],
