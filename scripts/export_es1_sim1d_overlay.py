@@ -181,16 +181,23 @@ def _despike_profile(profile: np.ndarray) -> tuple[np.ndarray, int]:
 
 
 def _subtract_background(profile: np.ndarray) -> np.ndarray:
-    """Return the profile with the effective-width ledger's baseline removed."""
+    """Return the profile with the effective-width ledger's baseline removed.
+
+    The baseline is the smaller of the two outer-edge medians, clipped at zero.
+    A side whose outer points are all non-finite contributes no median and is
+    skipped rather than poisoning the minimum; the profile is only rejected
+    outright when neither side yields one.
+    """
     values = np.asarray(profile, dtype=np.float64)
     if np.count_nonzero(np.isfinite(values)) < 5:
         return np.full_like(values, np.nan)
     edge = BACKGROUND_EDGE_POINTS
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
-        baseline = min(
-            float(np.nanmedian(values[:edge])),
-            float(np.nanmedian(values[-edge:])),
+        baseline = float(
+            np.nanmin(
+                [np.nanmedian(values[:edge]), np.nanmedian(values[-edge:])]
+            )
         )
     if not np.isfinite(baseline):
         return np.full_like(values, np.nan)
