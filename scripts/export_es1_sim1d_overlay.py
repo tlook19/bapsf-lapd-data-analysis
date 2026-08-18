@@ -3,6 +3,8 @@
 The NPZ product is self-contained and uses simulation-facing units:
 
 * core density and total SEM in cm^-3;
+* flux-tube-averaged density in cm^-3 and flux-tube-averaged ion-saturation
+  current in A, the second radial-averaging convention (see below);
 * core electron temperature and radial SEM in eV;
 * offset-corrected upstream ion-saturation current at x=0 in A;
 * offset-corrected discharge current in A and cathode-anode voltage in V,
@@ -26,12 +28,36 @@ taken on the shared trigger-referenced time grid without per-shot alignment,
 so it carries the machine's breakdown-timing jitter.  Raw cathode-anode
 voltage is negative, so the exported overlay voltage is multiplied by -1;
 dispersion is sign-invariant and is exported unnegated.
+
+Two radial-averaging conventions
+--------------------------------
+The overlay carries the measured radial average in BOTH conventions, because
+the comparison convention is otherwise implicit and is the same order as the
+residuals it is used to judge:
+
+``density_mean_cm3`` (and its SEM fields) is the LEGACY convention: an
+unweighted arithmetic mean of the 51-point line scan over the core band
+``X_MIN_CM <= x <= X_MAX_CM``.  It is a line cut through the column, so it
+carries no radial area weighting at all.  Nothing about it changes here.
+
+``density_ftavg_cm3`` and ``isat_ftavg_a`` are the FLUX-TUBE convention:
+``int_0^R 2 pi r f(r) dr / (pi R^2)`` with ``R = FLUX_TUBE_RADIUS_CM``, the
+measured cathode frame opening.  This is the quantity a 1D transport model
+that carries one radial cell of radius R reports, so it is the convention in
+which a model cell and a measurement are the same quantity.  Getting there
+from a diameter line scan requires assuming the column is axisymmetric about
+its own centroid, which is an ASSUMPTION and not a measurement -- see
+``ftavg_axisymmetry`` in the exported product.
+
+The two conventions are exported side by side and are NOT interchangeable; a
+consumer must state which one a number came from.
 """
 
 from __future__ import annotations
 
 import argparse
 from pathlib import Path
+import warnings
 
 import h5py
 import numpy as np
@@ -57,6 +83,7 @@ MANIFEST = Path("config/may2026_run_manifest.toml")
 DENSITY_HDF5 = Path("processed/density_profiles_isweep.hdf5")
 TE_HDF5 = Path("processed/te_filled.hdf5")
 ISAT_PROFILE_HDF5 = Path("processed/isweep_deadtime_profiles.hdf5")
+ROT0_ISAT_PROFILE_HDF5 = Path("processed/isat_profiles.hdf5")
 ZERO_OFFSETS = Path("processed/trace_zero_offsets.toml")
 WINDOW_REFITS_HDF5 = Path("processed/sweep_window_refits.hdf5")
 PORTS = np.array([11, 21, 29, 41, 50], dtype=np.int16)
@@ -64,10 +91,306 @@ X_MIN_CM = -10.0
 X_MAX_CM = 10.0
 DISCHARGE_SMOOTHING_SAMPLES = 9
 DENSITY_SCALE_CM3 = DENSITY_SCALE_M3 * 1.0e-6
+M3_TO_CM3 = 1.0e-6  # the flux-tube fields work on raw n_e_m3, not the scaled grid
 ISAT_DECAY_STOP_S = 47.5e-3
 ISAT_DECAY_FILTER_PAD_S = 0.1e-3
 ISAT_DECAY_CUTOFF_HZ = 100.0e3
 ISAT_DECAY_BIN_S = 10.0e-6
+
+#: Radius of the flux tube the measured profiles are averaged over, in cm.
+#: Direct caliper reading of the LAPD cathode assembly (2026-08-17): the frame
+#: opening is a 14.5 in aperture, 36.830 cm diameter, in a 15.0 in x 0.25 in
+#: disc whose outer radius is 19.050 cm.  Half the aperture diameter is
+#: 18.415 cm.  This is hardware, not a fit, and it is the radius the transport
+#: model's single radial cell uses, which is why the measured target has to use
+#: it too for the two to be the same quantity.
+FLUX_TUBE_RADIUS_CM = 18.415
+
+#: Number of points at each end of the scan that set the background baseline.
+#: Convention transcribed from the effective-width ledger
+#: (``figures/effwidth_analysis.py``, ``width_metrics``): the scalar baseline is
+#: ``min(median of the outer BACKGROUND_EDGE_POINTS on each side)``, clipped at
+#: zero, subtracted, and the profile is then clipped at zero.
+BACKGROUND_EDGE_POINTS = 3
+
+#: Spatial-coherence despike, transcribed from the edge-T_e ledger's gate
+#: (``figures/edgete_early_analyze.py``): a cell that sits further than
+#: ``DESPIKE_TOLERANCE`` (fractional) from the median of its finite neighbours
+#: within +/- ``DESPIKE_HALF_WIDTH`` cells is an isolated single-cell spike and
+#: is replaced by that median.  At least two finite neighbours are required
+#: before the gate will judge a cell, and they must BRACKET it -- at least one
+#: on each side.  Bracketing is what makes a cell "isolated"; without it the
+#: gate judges the two scan endpoints against a one-sided window, and those are
+#: exactly the points that set the background baseline below, so a one-sided
+#: misjudgement moves the baseline and with it the whole average.
+DESPIKE_HALF_WIDTH = 2
+DESPIKE_TOLERANCE = 0.5
+
+#: Amplitude floor below which the despike gate does not judge a cell, as a
+#: fraction of the profile peak.  The gate's premise is that the profile is
+#: locally flat on the scale of DESPIKE_HALF_WIDTH cells; in the outer skirt the
+#: profile legitimately falls by more than DESPIKE_TOLERANCE over two cells, so
+#: the gate is not valid there and an unrestricted gate flags ordinary skirt
+#: points.  The threshold reuses the effective-width ledger's own 0.2 x peak
+#: level, the amplitude at which that ledger stops treating the profile as
+#: closed.
+DESPIKE_MIN_PEAK_FRACTION = 0.2
+
+
+def _despike_profile(profile: np.ndarray) -> tuple[np.ndarray, int]:
+    """Return the profile with isolated single-cell spikes repaired, and a count.
+
+    A cell is judged only if it is finite, at or above
+    ``DESPIKE_MIN_PEAK_FRACTION`` of the profile peak, and bracketed by finite
+    neighbours within +/- ``DESPIKE_HALF_WIDTH`` cells -- at least one on each
+    side and at least two in total.  A judged cell whose value differs from the
+    median of those neighbours by more than ``DESPIKE_TOLERANCE`` is replaced by
+    that median.  Replacement rather than deletion keeps the sample grid intact,
+    so the quadrature below does not have to bridge a hole.
+    """
+    values = np.asarray(profile, dtype=np.float64)
+    repaired = values.copy()
+    finite = np.isfinite(values)
+    if not np.any(finite):
+        return repaired, 0
+    peak = float(np.max(values[finite]))
+    if not np.isfinite(peak) or peak <= 0.0:
+        return repaired, 0
+    n_replaced = 0
+    for index in range(values.size):
+        if not finite[index] or values[index] < DESPIKE_MIN_PEAK_FRACTION * peak:
+            continue
+        low = max(0, index - DESPIKE_HALF_WIDTH)
+        high = index + 1 + DESPIKE_HALF_WIDTH
+        left = values[low:index]
+        right = values[index + 1 : high]
+        left = left[np.isfinite(left)]
+        right = right[np.isfinite(right)]
+        if left.size == 0 or right.size == 0:
+            continue
+        neighbours = np.concatenate([left, right])
+        if neighbours.size < 2:
+            continue
+        median = float(np.median(neighbours))
+        if median == 0.0:
+            continue
+        if abs(values[index] / median - 1.0) > DESPIKE_TOLERANCE:
+            repaired[index] = median
+            n_replaced += 1
+    return repaired, n_replaced
+
+
+def _subtract_background(profile: np.ndarray) -> np.ndarray:
+    """Return the profile with the effective-width ledger's baseline removed."""
+    values = np.asarray(profile, dtype=np.float64)
+    if np.count_nonzero(np.isfinite(values)) < 5:
+        return np.full_like(values, np.nan)
+    edge = BACKGROUND_EDGE_POINTS
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        baseline = min(
+            float(np.nanmedian(values[:edge])),
+            float(np.nanmedian(values[-edge:])),
+        )
+    if not np.isfinite(baseline):
+        return np.full_like(values, np.nan)
+    return values - max(baseline, 0.0)
+
+
+def _flux_tube_weights(radius_cm: np.ndarray, radius_limit_cm: float) -> np.ndarray:
+    """Return quadrature weights ``w`` with the flux-tube average = ``w @ f``.
+
+    ``radius_cm`` holds the folded radius of each retained sample.  The weights
+    implement ``int_0^R 2 r f(r) dr / R^2`` as a trapezoidal rule over the
+    sorted sample radii, closed at ``r = 0`` -- where the integrand ``2 r f``
+    vanishes, so the value there never enters -- and at ``r = R``, where ``f``
+    is linearly interpolated between the two samples that bracket ``R``.  The
+    weights sum to one for a uniform profile, exactly, because ``2 r`` is
+    linear and the trapezoidal rule is exact for it.
+
+    Raises ``ValueError`` if the samples do not reach ``R``; the average is not
+    defined without extrapolating the profile past its own scan extent.
+    """
+    order = np.argsort(radius_cm)
+    sorted_radius = radius_cm[order]
+    if sorted_radius[-1] < radius_limit_cm:
+        raise ValueError(
+            f"folded profile reaches only r = {sorted_radius[-1]:g} cm, "
+            f"short of the flux-tube radius {radius_limit_cm:g} cm"
+        )
+    inside = np.flatnonzero(sorted_radius < radius_limit_cm)
+    first_outside = int(inside[-1]) + 1 if inside.size else 0
+    nodes = np.concatenate(([0.0], sorted_radius[inside], [radius_limit_cm]))
+    coefficient = np.empty(nodes.size, dtype=np.float64)
+    coefficient[0] = (nodes[1] - nodes[0]) / 2.0
+    coefficient[1:-1] = (nodes[2:] - nodes[:-2]) / 2.0
+    coefficient[-1] = (nodes[-1] - nodes[-2]) / 2.0
+    node_weight = 2.0 * nodes * coefficient / radius_limit_cm**2
+
+    weights = np.zeros(radius_cm.size, dtype=np.float64)
+    weights[order[inside]] = node_weight[1:-1]
+    lower = sorted_radius[first_outside - 1] if first_outside else 0.0
+    upper = sorted_radius[first_outside]
+    fraction = 0.0 if upper == lower else (radius_limit_cm - lower) / (upper - lower)
+    if first_outside:
+        weights[order[first_outside - 1]] += node_weight[-1] * (1.0 - fraction)
+    weights[order[first_outside]] += node_weight[-1] * fraction
+    return weights
+
+
+def _flux_tube_profile_stats(
+    profile: np.ndarray,
+    x_cm: np.ndarray,
+    *,
+    point_sem: np.ndarray | None = None,
+    radius_cm: float = FLUX_TUBE_RADIUS_CM,
+) -> dict[str, float | int]:
+    """Return the flux-tube average of one radial profile and its companions.
+
+    The pipeline is, in order: repair single-cell spikes; subtract the
+    effective-width ledger's scalar background; take the core-band mean of that
+    same background-subtracted profile (the numerator of the convention ratio,
+    reported so the ratio is reconstructible from the product alone); clip the
+    profile at zero and drop non-finite cells; fold about the profile centroid,
+    treating ``r = |x - x_c|`` as radius; and integrate to ``radius_cm``.
+
+    ``point_sem`` is an optional per-point uncertainty on the SAME samples; it
+    is propagated through the quadrature weights in quadrature, treating the
+    points as independent.  The background's own sampling uncertainty is not
+    propagated -- it is a small, fully correlated term.
+    """
+    despiked, n_despiked = _despike_profile(profile)
+    subtracted = _subtract_background(despiked)
+    core_band = (x_cm >= X_MIN_CM) & (x_cm <= X_MAX_CM)
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        core_mean = float(np.nanmean(subtracted[core_band]))
+
+    empty = dict(
+        ftavg=np.nan,
+        ftavg_sem=np.nan,
+        core=core_mean,
+        centroid=np.nan,
+        n_despiked=n_despiked,
+    )
+    finite = np.isfinite(subtracted)
+    if np.count_nonzero(finite) < 5:
+        return empty
+    values = np.clip(subtracted[finite], 0.0, None)
+    positions = x_cm[finite]
+    total = float(np.sum(values))
+    if total <= 0.0:
+        return empty
+    centroid = float(np.sum(values * positions) / total)
+    try:
+        weights = _flux_tube_weights(np.abs(positions - centroid), radius_cm)
+    except ValueError:
+        empty["centroid"] = centroid
+        return empty
+
+    ftavg = float(weights @ values)
+    ftavg_sem = np.nan
+    if point_sem is not None:
+        sem_values = np.asarray(point_sem, dtype=np.float64)[finite]
+        if np.all(np.isfinite(sem_values)):
+            ftavg_sem = float(np.sqrt(np.sum((weights * sem_values) ** 2)))
+    return dict(
+        ftavg=ftavg,
+        ftavg_sem=ftavg_sem,
+        core=core_mean,
+        centroid=centroid,
+        n_despiked=n_despiked,
+    )
+
+
+def _flux_tube_series(
+    profiles: np.ndarray,
+    x_cm: np.ndarray,
+    point_sem: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Apply ``_flux_tube_profile_stats`` to every (z, time) profile.
+
+    ``profiles`` is shaped ``(z, x, time)``; every returned array is shaped
+    ``(z, time)``.  Each time sample is reduced independently, so the exported
+    series is self-contained sample by sample.
+    """
+    n_z, _, n_t = profiles.shape
+    out = {
+        name: np.full((n_z, n_t), np.nan, dtype=np.float64)
+        for name in ("ftavg", "ftavg_sem", "core", "centroid")
+    }
+    out["n_despiked"] = np.zeros((n_z, n_t), dtype=np.int16)
+    for zi in range(n_z):
+        for ti in range(n_t):
+            sem = None if point_sem is None else point_sem[zi, :, ti]
+            stats = _flux_tube_profile_stats(profiles[zi, :, ti], x_cm, point_sem=sem)
+            for name in ("ftavg", "ftavg_sem", "core", "centroid"):
+                out[name][zi, ti] = stats[name]
+            out["n_despiked"][zi, ti] = stats["n_despiked"]
+    return out
+
+
+def _rot0_isat_profiles(
+    path: Path,
+    experiment_set_id: int,
+    z_cm: np.ndarray,
+) -> dict[str, np.ndarray | str]:
+    """Return the rot-0 Isat line-scan profiles ordered onto the overlay z axis.
+
+    This is the ``isat`` electrical channel -- the DOWNSTREAM-facing probe face
+    and the effective-width ledger's rot-0 primary product -- which is NOT the
+    ``i_sweep`` (upstream) channel that feeds ``isat_decay_*`` and
+    ``isat_drive_*``.  The two faces are different measurements and their
+    profiles have different shapes, so the per-run source channel is exported
+    with the fields rather than assumed.  A set is NOT required to be
+    single-channel: ES3 run 31 falls back to ``i_sweep`` in this product, and
+    the mix is disclosed through ``isat_ftavg_source_channel`` the same way
+    ``augment_sim1d_overlay_isat_drive.py`` discloses it for the drive family.
+    """
+    with h5py.File(path, "r") as hdf:
+        rotation = float(hdf.attrs["rotation_filter_deg"])
+        if rotation != 0.0:
+            raise ValueError(f"{path} is a rot-{rotation:g} product, not rot-0")
+        x_cm = hdf["x_cm"][()]
+        set_group = hdf[f"experiment_sets/{experiment_set_id}"]
+        run_ids = sorted(set_group.keys())
+        z_by_run = np.array(
+            [float(set_group[run_id].attrs["z_cm"]) for run_id in run_ids]
+        )
+        order = np.argsort(z_by_run)
+        run_ids = [run_ids[i] for i in order]
+        if not np.allclose(z_by_run[order], z_cm):
+            raise ValueError(
+                f"{path} ES{experiment_set_id} z grid {z_by_run[order]} does not "
+                f"match the overlay z grid {z_cm}"
+            )
+        time_ms = set_group[run_ids[0]]["inter_sweep_time_s"][()] * 1000.0
+        isat = []
+        sem = []
+        channels = []
+        for run_id in run_ids:
+            run_group = set_group[run_id]
+            if not np.allclose(run_group["inter_sweep_time_s"][()] * 1000.0, time_ms):
+                raise ValueError(f"{path} run {run_id} dead-time grid differs")
+            isat.append(run_group["isat_a"][()])
+            shots = np.maximum(
+                np.asarray(run_group["n_shots_used"][()], dtype=np.float64), 1.0
+            )
+            sem.append(run_group["isat_a_std"][()] / np.sqrt(shots))
+            channels.append(str(run_group.attrs["deadtime_source_channel"]))
+        ports = np.array(
+            [int(set_group[run_id].attrs["port"]) for run_id in run_ids],
+            dtype=np.int16,
+        )
+    return {
+        "x_cm": x_cm,
+        "time_ms": time_ms,
+        "isat_a": np.stack(isat, axis=0),
+        "sem_a": np.stack(sem, axis=0),
+        "port": ports,
+        "run_id": np.asarray(run_ids),
+        "source_channel": np.asarray(channels),
+    }
 
 
 def _isat_decay_stats(
@@ -345,6 +668,7 @@ def export_overlay(
     output_path: Path,
     experiment_set_id: int = 1,
     window_refits_path: Path = WINDOW_REFITS_HDF5,
+    rot0_isat_profile_path: Path = ROT0_ISAT_PROFILE_HDF5,
 ) -> Path:
     experiment_set_key = str(experiment_set_id)
     with h5py.File(density_path, "r") as density_hdf, h5py.File(te_path, "r") as te_hdf:
@@ -354,6 +678,10 @@ def export_overlay(
             X_MIN_CM,
             X_MAX_CM,
         )
+        density_x_cm = density_hdf["x_cm"][()]
+        density_profiles_m3 = density_hdf[
+            f"experiment_sets/{experiment_set_key}/n_e_m3"
+        ][()]
         te = _load_te_stats(
             te_hdf,
             experiment_set_key,
@@ -394,10 +722,31 @@ def export_overlay(
         experiment_set_id,
         PORTS,
     )
+
+    density_ftavg = _flux_tube_series(density_profiles_m3, density_x_cm)
+    rot0_isat = _rot0_isat_profiles(
+        rot0_isat_profile_path,
+        experiment_set_id,
+        density.z_cm,
+    )
+    if not np.array_equal(rot0_isat["port"], PORTS):
+        raise ValueError(
+            f"ES{experiment_set_id} rot-0 Isat ports {rot0_isat['port']} "
+            f"do not match expected {PORTS}"
+        )
+    if not np.allclose(rot0_isat["x_cm"], density_x_cm):
+        raise ValueError("rot-0 Isat and density x grids differ")
+    if not np.allclose(rot0_isat["time_ms"], density.time_ms):
+        raise ValueError("rot-0 Isat and density inter-sweep time grids differ")
+    isat_ftavg = _flux_tube_series(
+        rot0_isat["isat_a"],
+        rot0_isat["x_cm"],
+        rot0_isat["sem_a"],
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        schema_version=np.array(7, dtype=np.int16),
+        schema_version=np.array(9, dtype=np.int16),
         experiment_set_id=np.array(experiment_set_id, dtype=np.int16),
         experiment_label=np.array(experiment_label),
         port=PORTS,
@@ -474,6 +823,82 @@ def export_overlay(
         density_uncertainty=np.array(
             "radial SEM plus Probe-A area calibration in quadrature"
         ),
+        density_mean_convention=np.array(
+            f"density_mean_cm3 and its SEM fields are the LEGACY core-band "
+            f"convention: an unweighted arithmetic mean of the line scan over "
+            f"{X_MIN_CM:g} <= x <= {X_MAX_CM:g} cm, a diameter line cut with no "
+            "radial area weighting.  It is NOT the flux-tube average; see "
+            "density_ftavg_cm3 and ftavg_convention."
+        ),
+        ftavg_radius_cm=np.array(FLUX_TUBE_RADIUS_CM),
+        ftavg_convention=np.array(
+            "flux-tube average: int_0^R 2 pi r f(r) dr / (pi R^2) with "
+            f"R = ftavg_radius_cm = {FLUX_TUBE_RADIUS_CM:g} cm, evaluated per "
+            "port and per inter-sweep time sample by trapezoidal quadrature "
+            "over the folded line-scan samples, closed at r = 0 and at r = R "
+            "by linear interpolation between the samples bracketing R.  R is "
+            "the caliper-measured cathode frame opening (14.5 in aperture "
+            "diameter, 2026-08-17), the same radius the 1D transport model's "
+            "single radial cell uses."
+        ),
+        ftavg_axisymmetry=np.array(
+            "ASSUMED, not measured: the 51-point scan is a single diameter in "
+            "x at fixed y, folded about its own intensity centroid, and the "
+            "folded coordinate r = |x - x_c| is then read as radius.  This "
+            "assumes the column is axisymmetric about that centroid.  The "
+            "per-sample centroids are exported as density_ftavg_centroid_cm "
+            "and isat_ftavg_centroid_cm; a single-diameter scan cannot test "
+            "the assumption, and the on-record left/right profile asymmetry is "
+            "not captured by it."
+        ),
+        ftavg_background=np.array(
+            "scalar baseline = min(median of the outer "
+            f"{BACKGROUND_EDGE_POINTS} points on each side), clipped at zero "
+            "and subtracted, profile then clipped at zero; convention taken "
+            "from the effective-width ledger.  The legacy density_mean_cm3 is "
+            "NOT background-subtracted, so the ratio of the two exported "
+            "fields is not the pure weighting correction; ratio "
+            "density_ftavg_core_cm3 / density_ftavg_cm3 for that."
+        ),
+        ftavg_despike=np.array(
+            f"isolated single-cell spikes at or above "
+            f"{DESPIKE_MIN_PEAK_FRACTION:g} x peak that differ by more than "
+            f"{DESPIKE_TOLERANCE:g} from the median of their finite "
+            f"neighbours within +/- {DESPIKE_HALF_WIDTH} cells are replaced by "
+            "that median; gate taken from the edge-Te ledger, amplitude floor "
+            "from the effective-width ledger.  Counts per sample are exported "
+            "as density_ftavg_n_despiked and isat_ftavg_n_despiked."
+        ),
+        density_ftavg_cm3=density_ftavg["ftavg"] * M3_TO_CM3,
+        density_ftavg_core_cm3=density_ftavg["core"] * M3_TO_CM3,
+        density_ftavg_centroid_cm=density_ftavg["centroid"],
+        density_ftavg_n_despiked=density_ftavg["n_despiked"],
+        isat_ftavg_time_ms=rot0_isat["time_ms"],
+        isat_ftavg_a=isat_ftavg["ftavg"],
+        isat_ftavg_sem_a=isat_ftavg["ftavg_sem"],
+        isat_ftavg_core_a=isat_ftavg["core"],
+        isat_ftavg_centroid_cm=isat_ftavg["centroid"],
+        isat_ftavg_n_despiked=isat_ftavg["n_despiked"],
+        isat_ftavg_port=rot0_isat["port"],
+        isat_ftavg_run_id=rot0_isat["run_id"],
+        isat_ftavg_source_file=np.array(str(rot0_isat_profile_path)),
+        isat_ftavg_source_channel=rot0_isat["source_channel"],
+        isat_ftavg_face=np.array(
+            "per-port electrical channel is in isat_ftavg_source_channel; "
+            "'isat' is the DOWNSTREAM-facing probe face (the rot-0 primary "
+            "line-scan product).  That is NOT the upstream 'i_sweep' channel "
+            "that feeds isat_decay_*, isat_drive_* and the density chain; the "
+            "two faces have different profile shapes and must not be ratioed "
+            "against each other."
+        ),
+        isat_ftavg_sem_definition=np.array(
+            "per-point shot SEM (isat_a_std / sqrt(n_shots_used)) propagated "
+            "through the quadrature weights in quadrature, points treated as "
+            "independent; the background's own sampling uncertainty is not "
+            "included.  This is a shot SEM and is NOT commensurate with "
+            "density_total_sem_cm3, which is a radial-scatter SEM plus the "
+            "Probe-A area calibration."
+        ),
     )
     print(output_path)
     return output_path
@@ -484,6 +909,12 @@ def main() -> None:
     parser.add_argument("--density", type=Path, default=DENSITY_HDF5)
     parser.add_argument("--te-filled", type=Path, default=TE_HDF5)
     parser.add_argument("--isat-profiles", type=Path, default=ISAT_PROFILE_HDF5)
+    parser.add_argument(
+        "--rot0-isat-profiles",
+        type=Path,
+        default=ROT0_ISAT_PROFILE_HDF5,
+        help="rot-0 Isat-channel line-scan product for the flux-tube fields",
+    )
     parser.add_argument("--zero-offsets", type=Path, default=ZERO_OFFSETS)
     parser.add_argument("--window-refits", type=Path, default=WINDOW_REFITS_HDF5)
     parser.add_argument("--manifest", type=Path, default=MANIFEST)
@@ -502,6 +933,7 @@ def main() -> None:
         output,
         args.experiment_set,
         args.window_refits,
+        args.rot0_isat_profiles,
     )
 
 
