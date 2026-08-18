@@ -8,10 +8,11 @@ schema v2 (es1 vintage), v3 (adds the isat_decay source-channel
 metadata; es2/es3 vintage — v3 was already taken by that export, so the
 drive family is SCHEMA v4, superseding the 7h brief's "v3"), or v5 (the
 v5 vintage, which adds the per-port ``te_window_spread_frac``), v7 (adds
-the discharge shot-to-shot standard deviations), or v9 (the current
-export, which adds the flux-tube-averaged density and Isat targets).  A
-v5 input is written back as SCHEMA v6, a v7 as v8 and a v9 as v10, so
-each family's presence stays readable from the version alone; an
+the discharge shot-to-shot standard deviations), v9 (adds the
+flux-tube-averaged density and downstream-face Isat targets), or v11
+(the current export, which adds the ruled upstream-face Isat target).  A
+v5 input is written back as SCHEMA v6, a v7 as v8, a v9 as v10 and a v11
+as v12, so each family's presence stays readable from the version alone; an
 augmented version is never itself an accepted input, which is what makes
 a second augmentation fail the gate.
 The consumer is
@@ -59,7 +60,7 @@ SEAM_WINDOW_MS = 0.25  # first slice of the decay trace used for the seam gate
 # drive family is appended.  Keys are the inputs this script will augment;
 # values are versions it will NOT re-accept, which is what makes an
 # already-augmented overlay fail the gate instead of being augmented twice.
-AUGMENTED_SCHEMA = {2: 4, 3: 4, 5: 6, 7: 8, 9: 10}
+AUGMENTED_SCHEMA = {2: 4, 3: 4, 5: 6, 7: 8, 9: 10, 11: 12}
 
 
 def _seam_gate(new: dict, decay_t, decay_mean, decay_sem) -> list[str]:

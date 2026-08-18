@@ -11,6 +11,7 @@ from scripts.export_es1_sim1d_overlay import (
     _despike_profile,
     _flux_tube_profile_stats,
     _flux_tube_weights,
+    _rot0_isat_profiles,
     _subtract_background,
     _te_window_spread_frac,
 )
@@ -181,3 +182,69 @@ def test_legacy_core_band_mean_stays_an_unweighted_line_cut_mean():
     band = (X_CM >= X_MIN_CM) & (X_CM <= X_MAX_CM)
     assert mean[0, 0] == pytest.approx(float(np.mean(values[0, band, 0])))
     assert count[0, 0] == int(band.sum())
+
+
+def _write_line_scans(path, runs, *, rotation_deg=0.0, n_t=4):
+    """Minimal stand-in for a dead-time line-scan product."""
+    with h5py.File(path, "w") as hdf:
+        hdf.attrs["rotation_filter_deg"] = rotation_deg
+        hdf.create_dataset("x_cm", data=X_CM)
+        group = hdf.create_group("experiment_sets/1")
+        for run_id, (port, z_cm, channel) in runs.items():
+            run = group.create_group(run_id)
+            run.attrs["port"] = port
+            run.attrs["z_cm"] = z_cm
+            run.attrs["deadtime_source_channel"] = channel
+            run.create_dataset("inter_sweep_time_s", data=np.arange(n_t) * 1e-3)
+            run.create_dataset("isat_a", data=np.full((51, n_t), float(port)))
+            run.create_dataset("isat_a_std", data=np.full((51, n_t), 2.0))
+            run.create_dataset("n_shots_used", data=np.full((51, n_t), 4))
+
+
+def test_line_scans_are_ordered_onto_the_overlay_z_axis(tmp_path):
+    path = tmp_path / "scans.hdf5"
+    _write_line_scans(
+        path,
+        {
+            "08": (50, 1716.1, "i_sweep"),
+            "01": (11, 470.05, "i_sweep"),
+            "04": (29, 1045.15, "i_sweep"),
+        },
+    )
+    z_cm = np.array([470.05, 1045.15, 1716.1])
+
+    scans = _rot0_isat_profiles(path, 1, z_cm)
+
+    assert list(scans["run_id"]) == ["01", "04", "08"]
+    assert list(scans["port"]) == [11, 29, 50]
+    assert scans["isat_a"][:, 0, 0].tolist() == [11.0, 29.0, 50.0]
+    # SEM is the per-cell shot SEM, std / sqrt(n_shots_used).
+    assert scans["sem_a"][0, 0, 0] == pytest.approx(1.0)
+
+
+def test_line_scans_keep_a_mixed_channel_set_and_disclose_it(tmp_path):
+    path = tmp_path / "scans.hdf5"
+    _write_line_scans(
+        path,
+        {"01": (11, 470.05, "i_sweep"), "04": (29, 1045.15, "isat")},
+    )
+
+    scans = _rot0_isat_profiles(path, 1, np.array([470.05, 1045.15]))
+
+    assert list(scans["source_channel"]) == ["i_sweep", "isat"]
+
+
+def test_line_scans_refuse_a_rotated_product(tmp_path):
+    path = tmp_path / "scans.hdf5"
+    _write_line_scans(path, {"03": (21, 789.55, "isat")}, rotation_deg=180.0)
+
+    with pytest.raises(ValueError, match="rot-180 product"):
+        _rot0_isat_profiles(path, 1, np.array([789.55]))
+
+
+def test_line_scans_refuse_a_mismatched_z_grid(tmp_path):
+    path = tmp_path / "scans.hdf5"
+    _write_line_scans(path, {"01": (11, 470.05, "i_sweep")})
+
+    with pytest.raises(ValueError, match="does not match the overlay z grid"):
+        _rot0_isat_profiles(path, 1, np.array([999.0]))

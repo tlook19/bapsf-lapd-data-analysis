@@ -40,7 +40,8 @@ unweighted arithmetic mean of the 51-point line scan over the core band
 ``X_MIN_CM <= x <= X_MAX_CM``.  It is a line cut through the column, so it
 carries no radial area weighting at all.  Nothing about it changes here.
 
-``density_ftavg_cm3`` and ``isat_ftavg_a`` are the FLUX-TUBE convention:
+``density_ftavg_cm3``, ``isat_ftavg_upstream_a`` and ``isat_ftavg_a`` are the
+FLUX-TUBE convention:
 ``int_0^R 2 pi r f(r) dr / (pi R^2)`` with ``R = FLUX_TUBE_RADIUS_CM``, the
 measured cathode frame opening.  This is the quantity a 1D transport model
 that carries one radial cell of radius R reports, so it is the convention in
@@ -51,6 +52,25 @@ its own centroid, which is an ASSUMPTION and not a measurement -- see
 
 The two conventions are exported side by side and are NOT interchangeable; a
 consumer must state which one a number came from.
+
+Which probe face the Isat flux-tube average comes from
+------------------------------------------------------
+The Mach probe has two planar faces on opposite sides of the body.  At rot-0
+the ``i_sweep`` channel collects on the UPSTREAM face and the ``isat`` channel
+on the DOWNSTREAM one; at rot-180 the assignment reverses.  A downstream face
+sits in the probe body's own flow shadow, so it under-reads, and on 2026-08-18
+the upstream face was RULED the Isat truth channel.
+
+``isat_ftavg_upstream_a`` is therefore the correction-bearing field: it comes
+from the ``i_sweep`` product, which is also the chain behind ``n_e_m3`` and
+behind ``isat_decay_*`` / ``isat_drive_*``, so it pairs with the density and
+core-band fields without a face change anywhere.
+
+``isat_ftavg_a`` is the downstream ``isat`` face, kept because it is the
+effective-width ledger's rot-0 primary and the face the 2026-08-18 paper read
+used.  It carries the shadowing caveat in ``isat_ftavg_face`` and the two
+faces must not be ratioed against each other -- their flux-tube corrections
+run in opposite directions with z.
 """
 
 from __future__ import annotations
@@ -82,7 +102,13 @@ from plot_isat_profiles import _deadtime_shot_means, _high_shot_outlier_mask
 MANIFEST = Path("config/may2026_run_manifest.toml")
 DENSITY_HDF5 = Path("processed/density_profiles_isweep.hdf5")
 TE_HDF5 = Path("processed/te_filled.hdf5")
+#: Dead-time line-scan profiles from the ``i_sweep`` channel: the UPSTREAM
+#: probe face at rot-0, ruled the Isat truth channel 2026-08-18.  Feeds both
+#: the x=0 decay trace and the ``isat_ftavg_upstream_*`` flux-tube family.
 ISAT_PROFILE_HDF5 = Path("processed/isweep_deadtime_profiles.hdf5")
+#: The same scans from the ``isat`` channel: the DOWNSTREAM face at rot-0,
+#: which reads low because it sits in the probe body's flow shadow.  Feeds the
+#: ``isat_ftavg_*`` family only.
 ROT0_ISAT_PROFILE_HDF5 = Path("processed/isat_profiles.hdf5")
 ZERO_OFFSETS = Path("processed/trace_zero_offsets.toml")
 WINDOW_REFITS_HDF5 = Path("processed/sweep_window_refits.hdf5")
@@ -342,16 +368,19 @@ def _rot0_isat_profiles(
     experiment_set_id: int,
     z_cm: np.ndarray,
 ) -> dict[str, np.ndarray | str]:
-    """Return the rot-0 Isat line-scan profiles ordered onto the overlay z axis.
+    """Return one rot-0 line-scan product ordered onto the overlay z axis.
 
-    This is the ``isat`` electrical channel -- the DOWNSTREAM-facing probe face
-    and the effective-width ledger's rot-0 primary product -- which is NOT the
-    ``i_sweep`` (upstream) channel that feeds ``isat_decay_*`` and
-    ``isat_drive_*``.  The two faces are different measurements and their
-    profiles have different shapes, so the per-run source channel is exported
-    with the fields rather than assumed.  A set is NOT required to be
-    single-channel: ES3 run 31 falls back to ``i_sweep`` in this product, and
-    the mix is disclosed through ``isat_ftavg_source_channel`` the same way
+    Used for both probe faces, since the two dead-time profile products have the
+    same layout and differ only in which electrical channel filled them:
+
+    * ``ISAT_PROFILE_HDF5`` -- the ``i_sweep`` channel, the UPSTREAM face at
+      rot-0 and the ruled Isat truth channel;
+    * ``ROT0_ISAT_PROFILE_HDF5`` -- the ``isat`` channel, the DOWNSTREAM face.
+
+    The per-run source channel is exported with the fields rather than assumed,
+    and a set is NOT required to be single-channel: ES3 run 31 falls back to
+    ``i_sweep`` in the downstream product, and the mix is disclosed through
+    ``isat_ftavg_source_channel`` the same way
     ``augment_sim1d_overlay_isat_drive.py`` discloses it for the drive family.
     """
     with h5py.File(path, "r") as hdf:
@@ -731,29 +760,30 @@ def export_overlay(
     )
 
     density_ftavg = _flux_tube_series(density_profiles_m3, density_x_cm)
-    rot0_isat = _rot0_isat_profiles(
-        rot0_isat_profile_path,
-        experiment_set_id,
-        density.z_cm,
-    )
-    if not np.array_equal(rot0_isat["port"], PORTS):
-        raise ValueError(
-            f"ES{experiment_set_id} rot-0 Isat ports {rot0_isat['port']} "
-            f"do not match expected {PORTS}"
+
+    def _face_ftavg(path: Path, label: str) -> tuple[dict, dict]:
+        scans = _rot0_isat_profiles(path, experiment_set_id, density.z_cm)
+        if not np.array_equal(scans["port"], PORTS):
+            raise ValueError(
+                f"ES{experiment_set_id} {label} Isat ports {scans['port']} "
+                f"do not match expected {PORTS}"
+            )
+        if not np.allclose(scans["x_cm"], density_x_cm):
+            raise ValueError(f"{label} Isat and density x grids differ")
+        if not np.allclose(scans["time_ms"], density.time_ms):
+            raise ValueError(
+                f"{label} Isat and density inter-sweep time grids differ"
+            )
+        return scans, _flux_tube_series(
+            scans["isat_a"], scans["x_cm"], scans["sem_a"]
         )
-    if not np.allclose(rot0_isat["x_cm"], density_x_cm):
-        raise ValueError("rot-0 Isat and density x grids differ")
-    if not np.allclose(rot0_isat["time_ms"], density.time_ms):
-        raise ValueError("rot-0 Isat and density inter-sweep time grids differ")
-    isat_ftavg = _flux_tube_series(
-        rot0_isat["isat_a"],
-        rot0_isat["x_cm"],
-        rot0_isat["sem_a"],
-    )
+
+    upstream_scans, upstream_ftavg = _face_ftavg(isat_profile_path, "upstream")
+    rot0_isat, isat_ftavg = _face_ftavg(rot0_isat_profile_path, "downstream")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        schema_version=np.array(9, dtype=np.int16),
+        schema_version=np.array(11, dtype=np.int16),
         experiment_set_id=np.array(experiment_set_id, dtype=np.int16),
         experiment_label=np.array(experiment_label),
         port=PORTS,
@@ -878,12 +908,46 @@ def export_overlay(
             f"neighbours within +/- {DESPIKE_HALF_WIDTH} cells are replaced by "
             "that median; gate taken from the edge-Te ledger, amplitude floor "
             "from the effective-width ledger.  Counts per sample are exported "
-            "as density_ftavg_n_despiked and isat_ftavg_n_despiked."
+            "as density_ftavg_n_despiked, isat_ftavg_upstream_n_despiked and "
+            "isat_ftavg_n_despiked."
+        ),
+        ftavg_face_ruling=np.array(
+            "RULED 2026-08-18: at rot-0 the i_sweep channel collects on the "
+            "UPSTREAM probe face and is the Isat truth channel; the isat "
+            "channel is the DOWNSTREAM face and under-reads because it sits "
+            "in the probe body's flow shadow (the assignment reverses at "
+            "rot-180).  isat_ftavg_upstream_* is therefore the "
+            "correction-bearing family and is the face the density chain and "
+            "the isat_decay_*/isat_drive_* families already use; isat_ftavg_* "
+            "is the downstream face, retained as the effective-width ledger's "
+            "rot-0 primary and as the face the 2026-08-18 paper read used.  "
+            "The two faces' flux-tube corrections run in OPPOSITE directions "
+            "with z and must never be ratioed against each other."
         ),
         density_ftavg_cm3=density_ftavg["ftavg"] * M3_TO_CM3,
         density_ftavg_core_cm3=density_ftavg["core"] * M3_TO_CM3,
         density_ftavg_centroid_cm=density_ftavg["centroid"],
         density_ftavg_n_despiked=density_ftavg["n_despiked"],
+        isat_ftavg_upstream_time_ms=upstream_scans["time_ms"],
+        isat_ftavg_upstream_a=upstream_ftavg["ftavg"],
+        isat_ftavg_upstream_sem_a=upstream_ftavg["ftavg_sem"],
+        isat_ftavg_upstream_core_a=upstream_ftavg["core"],
+        isat_ftavg_upstream_centroid_cm=upstream_ftavg["centroid"],
+        isat_ftavg_upstream_n_despiked=upstream_ftavg["n_despiked"],
+        isat_ftavg_upstream_port=upstream_scans["port"],
+        isat_ftavg_upstream_run_id=upstream_scans["run_id"],
+        isat_ftavg_upstream_source_file=np.array(str(isat_profile_path)),
+        isat_ftavg_upstream_source_channel=upstream_scans["source_channel"],
+        isat_ftavg_upstream_face=np.array(
+            "UPSTREAM probe face at rot-0 ('i_sweep' channel; per-port channel "
+            "is in isat_ftavg_upstream_source_channel).  RULED the Isat truth "
+            "channel 2026-08-18 because the opposite face collects in the "
+            "probe body's flow shadow and under-reads.  This is the same face "
+            "as the density chain behind density_ftavg_cm3 and as "
+            "isat_decay_*/isat_drive_*, so this family is the "
+            "correction-bearing one and pairs with them without a face change. "
+            "See ftavg_face_ruling."
+        ),
         isat_ftavg_time_ms=rot0_isat["time_ms"],
         isat_ftavg_a=isat_ftavg["ftavg"],
         isat_ftavg_sem_a=isat_ftavg["ftavg_sem"],
@@ -895,12 +959,15 @@ def export_overlay(
         isat_ftavg_source_file=np.array(str(rot0_isat_profile_path)),
         isat_ftavg_source_channel=rot0_isat["source_channel"],
         isat_ftavg_face=np.array(
-            "per-port electrical channel is in isat_ftavg_source_channel; "
-            "'isat' is the DOWNSTREAM-facing probe face (the rot-0 primary "
-            "line-scan product).  That is NOT the upstream 'i_sweep' channel "
-            "that feeds isat_decay_*, isat_drive_* and the density chain; the "
-            "two faces have different profile shapes and must not be ratioed "
-            "against each other."
+            "DOWNSTREAM probe face at rot-0 ('isat' channel; per-port channel "
+            "is in isat_ftavg_source_channel).  CAVEAT: this face collects in "
+            "the probe body's flow shadow and under-reads, which is why the "
+            "2026-08-18 ruling put the truth channel on the upstream face -- "
+            "use isat_ftavg_upstream_* for a correction.  Retained because it "
+            "is the effective-width ledger's rot-0 primary and the face the "
+            "2026-08-18 paper read measured.  It is NOT the face behind "
+            "isat_decay_*, isat_drive_* or the density chain, and its "
+            "flux-tube correction runs the opposite way with z."
         ),
         isat_ftavg_sem_definition=np.array(
             "per-point shot SEM (isat_a_std / sqrt(n_shots_used)) propagated "
