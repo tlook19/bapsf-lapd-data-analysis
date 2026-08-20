@@ -8,6 +8,19 @@ in x and at the cathode/anode ends in z, then fills all NaN cells using a
 The resulting te_filled array is intended for probe-area calibration and
 density analysis where a continuous T_e map is required.
 
+The fill fills gaps: a cell that carries a finite measurement keeps its
+measured value and only NaN cells take the interpolant.  The sentinels are
+enforced near-exactly while data points carry a finite smoothing, so a fitted
+surface is otherwise free to sit below a measured row in order to reach the
+imposed end-plate temperature, and it does so by an amount that grows towards
+the ends -- a z-dependent bias on rows that have data.  See ``fill_te_cycle``.
+
+The core-mean monotonic-z clamp that runs after the fill is likewise judged on
+the measurement: it rewrites a measured row only where the MEASURED core means
+are themselves non-monotonic, and applies unconditionally only to rows that
+have no measured core cells and are therefore reconstructed.  See
+``_enforce_core_mean_monotonic_z``.
+
 Boundary conditions
 -------------------
   |x| = X_WALL_CM   →  T_e = TE_BOUNDARY_EV  (drift-tube wall)
@@ -26,7 +39,9 @@ processed/te_filled.hdf5
     z_cm            (n_z,)
     cycle_time_ms   (n_cycles,)
     te_masked       (n_z, n_x, n_cycles)   strict-masked data (NaN where hidden)
-    te_filled       (n_z, n_x, n_cycles)   RBF-interpolated, boundary-filled
+    te_filled       (n_z, n_x, n_cycles)   measured cells, RBF fill elsewhere
+    core_mean_te_monotonic_clamped (n_z, n_cycles)  where the clamp acted
+    core_mean_te_monotonic_scale   (n_z, n_cycles)  factor it applied (1 = none)
 
 figures/te_filled_expset{es_id}.png
   Masked vs filled T_e at four representative cycles.
@@ -43,6 +58,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import warnings
 from pathlib import Path
 
 import h5py
@@ -325,6 +341,7 @@ def fill_te_cycle(
     edge_anchor:     float = EDGE_ANCHOR_CM,
     te_edge_anchor:  float = TE_EDGE_ANCHOR_EV,
     smoothing_edge_anchor: float = SMOOTHING_EDGE_ANCHOR,
+    preserve_measured: bool = True,
 ) -> np.ndarray:
     """Return filled (n_z, n_x) T_e array with no NaN cells.
 
@@ -332,6 +349,20 @@ def fill_te_cycle(
       |x| ≤ x_core  → smoothing_core (fit closely; trusted core data)
       |x| ≥ x_edge  → smoothing_edge (fit loosely; noisy edge data)
     Sentinel boundary points use smoothing=0 (exact enforcement).
+
+    With *preserve_measured* (the default) every cell that carries a finite
+    measurement keeps its measured value and only NaN cells take the
+    interpolant, so the product is the data wherever the data exists and the
+    fill only where it does not.  This is what the boundary sentinels make
+    necessary: they are enforced near-exactly (``SMOOTHING_SENTINEL``) while
+    data points carry ``smoothing_core``, so the fitted surface is free to sit
+    below a measured row that lies near an end plate in order to reach the
+    imposed T_e there.  The effect falls off with distance from the boundary
+    and is therefore a z-dependent bias, not a uniform offset: it does not
+    cancel in a ratio or a difference between rows, and it can invert the
+    ordering of two rows whose measured separation is smaller than the bias.
+    Setting *preserve_measured* to False restores the surface-everywhere
+    behaviour for comparison.
     """
     zz, xx = np.meshgrid(z_cm, x_cm, indexing="ij")  # (n_z, n_x) each
     valid = np.isfinite(te_2d)
@@ -341,7 +372,10 @@ def fill_te_cycle(
     data_values = te_2d[valid]
 
     if data_values.size < 4:
-        return np.full_like(te_2d, te_boundary)
+        flat = np.full_like(te_2d, te_boundary)
+        if preserve_measured:
+            flat = np.where(valid, te_2d, flat)
+        return np.clip(flat, te_boundary, None)
 
     # Per-point smoothing for data points
     data_smoothing = _point_smoothing(
@@ -381,6 +415,8 @@ def fill_te_cycle(
     # Evaluate on full grid
     grid_norm = _normalise(xx.ravel(), zz.ravel(), x_wall, z_lo, z_hi)
     te_out = rbf(grid_norm).reshape(te_2d.shape)
+    if preserve_measured:
+        te_out = np.where(valid, te_2d, te_out)
     return np.clip(te_out, te_boundary, None)
 
 
@@ -448,11 +484,33 @@ def _enforce_core_mean_monotonic_z(
     *,
     core_x_cm: float = X_CORE_CM,
     te_floor: float = TE_BOUNDARY_EV,
-) -> tuple[np.ndarray, int, float]:
+    measured_grid: np.ndarray | None = None,
+) -> tuple[np.ndarray, int, float, np.ndarray, np.ndarray]:
     """Scale downstream rows so core-mean T_e is non-increasing with z.
 
     Each row keeps its radial shape. Scaling is performed about ``te_floor``
     so the imposed wall/end temperature is not pushed below its boundary.
+
+    ``measured_grid`` is the masked measurement the filled grid was built from,
+    on the same axes.  When it is supplied, a row-cycle is only rescaled where
+    the prior is not contradicted by the measurement it would be rewriting:
+
+    * a row with no finite measured core cell at that cycle is reconstructed
+      from neighbouring rows and the end boundaries, so the monotonic prior is
+      the only axial constraint it has and the clamp applies as before;
+    * a row that does carry measured core cells is rescaled only when the
+      MEASURED core means are themselves non-monotonic there, i.e. when the row
+      is warmer than the coolest measured row upstream of it.
+
+    Without that restriction the clamp also fires on inversions the fill
+    invented (a row whose fitted surface was pulled down by the end-plate
+    sentinels reads cooler than the row below it), and the row it then rewrites
+    is a measured one.  The prior is an axial statement about the plasma, so it
+    must be judged on the measurement, not on the interpolant.
+
+    Returns the adjusted grid, the number of rescaled row-cycles, the largest
+    fractional reduction applied, the per-row-cycle boolean record of where the
+    clamp acted, and the per-row-cycle scale factor (1.0 where it did not).
     """
     out = np.asarray(te_grid, dtype=np.float64).copy()
     core = np.abs(np.asarray(x_cm)) <= core_x_cm
@@ -461,14 +519,35 @@ def _enforce_core_mean_monotonic_z(
     if not np.any(core):
         raise ValueError("No x positions fall inside the monotonic core region")
 
-    for cycle_idx in range(out.shape[2]):
+    n_z, _, n_cycles = out.shape
+    clamped = np.zeros((n_z, n_cycles), dtype=bool)
+    scales = np.ones((n_z, n_cycles), dtype=np.float64)
+
+    if measured_grid is None:
+        measured_core_mean = np.full((n_z, n_cycles), np.nan)
+    else:
+        measured = np.asarray(measured_grid, dtype=np.float64)
+        if measured.shape != out.shape:
+            raise ValueError(
+                f"measured grid shape {measured.shape} does not match the "
+                f"filled T_e grid {out.shape}"
+            )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            measured_core_mean = np.nanmean(measured[:, core, :], axis=1)
+
+    for cycle_idx in range(n_cycles):
         previous_mean = np.inf
-        for z_idx in range(out.shape[0]):
+        previous_measured = np.inf
+        for z_idx in range(n_z):
             row = out[z_idx, :, cycle_idx]
             mean = float(np.nanmean(row[core]))
+            measured_mean = float(measured_core_mean[z_idx, cycle_idx])
             if not np.isfinite(mean):
                 continue
-            if mean > previous_mean:
+            if mean > previous_mean and _monotonic_clamp_permitted(
+                measured_mean, previous_measured
+            ):
                 if mean <= te_floor or previous_mean <= te_floor:
                     scale = 0.0
                 else:
@@ -476,13 +555,37 @@ def _enforce_core_mean_monotonic_z(
                 scale = float(np.clip(scale, 0.0, 1.0))
                 out[z_idx, :, cycle_idx] = te_floor + (row - te_floor) * scale
                 adjusted += 1
+                clamped[z_idx, cycle_idx] = True
+                scales[z_idx, cycle_idx] = scale
                 maximum_fractional_reduction = max(
                     maximum_fractional_reduction,
                     1.0 - scale,
                 )
                 mean = previous_mean
             previous_mean = min(previous_mean, mean)
-    return out, adjusted, maximum_fractional_reduction
+            if np.isfinite(measured_mean):
+                previous_measured = min(previous_measured, measured_mean)
+    return out, adjusted, maximum_fractional_reduction, clamped, scales
+
+
+def _monotonic_clamp_permitted(
+    measured_mean: float,
+    previous_measured_mean: float,
+) -> bool:
+    """Return whether the monotonic-z clamp may rewrite this row-cycle.
+
+    ``measured_mean`` is the row's own measured core mean and
+    ``previous_measured_mean`` the smallest measured core mean upstream of it,
+    both ``NaN``/``inf`` when no such measurement exists.  Permission is granted
+    when the row is reconstructed rather than measured, when nothing measured
+    sits upstream to judge it against, or when the measurements themselves run
+    the wrong way in z.
+    """
+    if not np.isfinite(measured_mean):
+        return True
+    if not np.isfinite(previous_measured_mean):
+        return True
+    return measured_mean > previous_measured_mean
 
 
 # ---------------------------------------------------------------------------
@@ -815,6 +918,18 @@ def main() -> None:
                              "for a z-row to be included in the RBF fit. Rows below this "
                              "threshold are blanked and filled by boundary extrapolation. "
                              f"Default: {MIN_Z_COVERAGE}.")
+    parser.add_argument("--no-preserve-measured-cells", action="store_true",
+                        help="Let the RBF surface overwrite cells that carry a finite "
+                             "measurement, instead of filling only the NaN cells.  This "
+                             "is the pre-2026-08-20 behaviour and lets the near-exactly "
+                             "enforced boundary sentinels bias measured rows near the "
+                             "end plates; kept for comparison only.")
+    parser.add_argument("--no-measured-monotonic-gate", action="store_true",
+                        help="Let the core-mean monotonic-z clamp rewrite a measured row "
+                             "even where the measured core means are themselves "
+                             "monotonic.  This is the pre-2026-08-20 behaviour, in which "
+                             "the clamp also fires on inversions the fill invented; kept "
+                             "for comparison only.")
     parser.add_argument("--no-plots",       action="store_true",
                         help="skip comparison figures")
     args = parser.parse_args()
@@ -840,6 +955,7 @@ def main() -> None:
         te_edge_anchor  = args.te_edge_anchor,
         smoothing_edge_anchor = args.smoothing_edge_anchor,
         min_z_coverage  = args.min_z_coverage,
+        preserve_measured = not args.no_preserve_measured_cells,
     )
 
     current_hf = (
@@ -912,19 +1028,34 @@ def main() -> None:
 
                 print(f"  Fitting {te_masked.shape[2]} cycles …")
                 te_filled = fill_te_grid(te_masked, x_cm, z_cm, **fill_kwargs)
-                te_filled, n_monotonic_rows, max_monotonic_reduction = (
-                    _enforce_core_mean_monotonic_z(
-                        te_filled,
-                        x_cm,
-                        core_x_cm=args.x_core,
-                        te_floor=args.te_boundary,
-                    )
+                (
+                    te_filled,
+                    n_monotonic_rows,
+                    max_monotonic_reduction,
+                    monotonic_clamped,
+                    monotonic_scale,
+                ) = _enforce_core_mean_monotonic_z(
+                    te_filled,
+                    x_cm,
+                    core_x_cm=args.x_core,
+                    te_floor=args.te_boundary,
+                    measured_grid=None if args.no_measured_monotonic_gate else te_masked,
                 )
                 print(
                     "  Core-mean monotonic-z enforcement: "
                     f"{n_monotonic_rows} row-cycles adjusted, "
                     f"maximum reduction {max_monotonic_reduction:.1%}"
                 )
+                for z_idx in np.flatnonzero(monotonic_clamped.any(axis=1)):
+                    cycles = np.flatnonzero(monotonic_clamped[z_idx])
+                    print(
+                        f"    z = {z_cm[z_idx]:.1f} cm (p{int(ports[z_idx])}): "
+                        f"{cycles.size} row-cycles clamped at t = "
+                        + ", ".join(
+                            f"{data['cycle_time_ms'][ci]:.2f}" for ci in cycles
+                        )
+                        + " ms"
+                    )
 
                 # Write to HDF5
                 grp = hf_out["experiment_sets"].create_group(es_id)
@@ -947,12 +1078,28 @@ def main() -> None:
                 grp.attrs["core_mean_te_monotonic_max_fractional_reduction"] = float(
                     max_monotonic_reduction
                 )
+                grp.attrs["core_mean_te_monotonic_measured_gate"] = bool(
+                    not args.no_measured_monotonic_gate
+                )
+                grp.attrs["measured_cells_preserved_in_fill"] = bool(
+                    not args.no_preserve_measured_cells
+                )
                 grp.create_dataset("x_cm",           data=x_cm,                compression="gzip")
                 grp.create_dataset("z_cm",           data=z_cm,                compression="gzip")
                 grp.create_dataset("port",           data=ports,               compression="gzip")
                 grp.create_dataset("cycle_time_ms",  data=data["cycle_time_ms"], compression="gzip")
                 grp.create_dataset("te_masked",      data=te_masked,            compression="gzip", compression_opts=4)
                 grp.create_dataset("te_filled",      data=te_filled,            compression="gzip", compression_opts=4)
+                grp.create_dataset(
+                    "core_mean_te_monotonic_clamped",
+                    data=monotonic_clamped,
+                    compression="gzip",
+                )
+                grp.create_dataset(
+                    "core_mean_te_monotonic_scale",
+                    data=monotonic_scale,
+                    compression="gzip",
+                )
                 hf_out.flush()
 
                 if not args.no_plots:
