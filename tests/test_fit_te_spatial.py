@@ -190,22 +190,58 @@ def test_core_mean_clamp_rejects_a_mismatched_measured_grid():
         )
 
 
-def test_fill_keeps_measured_cells_and_fills_only_the_gaps():
-    """The sentinels may shape the gaps; they may not move a measured cell."""
-    x_cm = np.linspace(-25.0, 25.0, 11)
+def test_fill_keeps_measured_core_cells_and_leaves_the_edge_prior_alone():
+    """The sentinels may shape the gaps; they may not move a measured core cell.
+
+    Outside the core the scrape-off-layer prior is intended, so the fitted
+    surface must still be what comes out there.
+    """
+    x_cm = np.linspace(-25.0, 25.0, 51)
     z_cm = np.array([470.1, 789.5, 1045.2])
     rng = np.random.default_rng(0)
     te_2d = 8.0 - 0.002 * (z_cm[:, None] - z_cm[0]) - 0.004 * x_cm[None, :] ** 2
     te_2d = te_2d + rng.normal(scale=0.05, size=te_2d.shape)
-    te_2d[1, 4] = np.nan
-    te_2d[2, 7] = np.nan
+    te_2d[1, 24] = np.nan
+    te_2d[2, 37] = np.nan
     measured = np.isfinite(te_2d)
+    core = np.broadcast_to(np.abs(x_cm) <= 10.0, te_2d.shape)
+    beyond_edge = np.broadcast_to(np.abs(x_cm) >= 15.0, te_2d.shape)
 
     filled = fill_te_cycle(te_2d, x_cm, z_cm)
     unpreserved = fill_te_cycle(te_2d, x_cm, z_cm, preserve_measured=False)
 
     assert np.all(np.isfinite(filled))
-    assert filled[measured] == pytest.approx(te_2d[measured])
+    assert filled[measured & core] == pytest.approx(te_2d[measured & core])
     assert filled[~measured] == pytest.approx(unpreserved[~measured])
+    assert filled[beyond_edge] == pytest.approx(unpreserved[beyond_edge])
     # The row nearest the cathode end plate is the one the sentinels drag down.
-    assert unpreserved[0][measured[0]].mean() < te_2d[0][measured[0]].mean()
+    core_row = measured[0] & core[0]
+    assert unpreserved[0][core_row].mean() < te_2d[0][core_row].mean()
+
+
+def test_fill_blends_across_the_transition_zone_without_a_step():
+    """Trust in the measurement falls off on the ramp the smoothing already uses."""
+    x_cm = np.linspace(-25.0, 25.0, 51)
+    z_cm = np.array([470.1, 789.5, 1045.2])
+    te_2d = np.broadcast_to(
+        8.0 - 0.004 * x_cm ** 2, (z_cm.size, x_cm.size)
+    ).copy()
+    te_2d[:, np.abs(x_cm) > 12.0] += 3.0  # a hot shoulder only the prior should damp
+
+    filled = fill_te_cycle(te_2d, x_cm, z_cm)
+    unpreserved = fill_te_cycle(te_2d, x_cm, z_cm, preserve_measured=False)
+
+    weight = (filled - unpreserved) / np.where(
+        te_2d - unpreserved == 0.0, np.nan, te_2d - unpreserved
+    )
+    inner = np.abs(x_cm) <= 10.0
+    outer = np.abs(x_cm) >= 15.0
+    middle = (np.abs(x_cm) > 10.0) & (np.abs(x_cm) < 15.0)
+    assert np.nanmin(weight[:, inner]) == pytest.approx(1.0)
+    assert np.nanmax(weight[:, outer]) == pytest.approx(0.0, abs=1e-12)
+    assert np.all(np.nan_to_num(weight[:, middle]) < 1.0)
+    assert np.all(np.nan_to_num(weight[:, middle]) >= 0.0)
+    # The blend weight is monotone in |x|, so the profile picks up no step.
+    order = np.argsort(np.abs(x_cm))
+    ramp = np.nan_to_num(weight[0][order], nan=1.0)
+    assert np.all(np.diff(ramp) <= 1e-12)

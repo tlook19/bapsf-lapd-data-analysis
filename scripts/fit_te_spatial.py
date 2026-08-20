@@ -8,12 +8,15 @@ in x and at the cathode/anode ends in z, then fills all NaN cells using a
 The resulting te_filled array is intended for probe-area calibration and
 density analysis where a continuous T_e map is required.
 
-The fill fills gaps: a cell that carries a finite measurement keeps its
-measured value and only NaN cells take the interpolant.  The sentinels are
-enforced near-exactly while data points carry a finite smoothing, so a fitted
-surface is otherwise free to sit below a measured row in order to reach the
-imposed end-plate temperature, and it does so by an amount that grows towards
-the ends -- a z-dependent bias on rows that have data.  See ``fill_te_cycle``.
+Inside the trusted core the fill fills gaps: a cell that carries a finite
+measurement keeps its measured value, and the surface is used only where there
+is no measurement.  The sentinels are enforced near-exactly while data points
+carry a finite smoothing, so a fitted surface is otherwise free to sit below a
+measured row in order to reach the imposed end-plate temperature, and it does
+so by an amount that grows towards the ends -- a z-dependent bias on rows that
+have data.  Outside the core the scrape-off-layer prior is intended and is left
+in place; the two are blended across the same core-to-edge ramp the per-point
+smoothing uses.  See ``fill_te_cycle``.
 
 The core-mean monotonic-z clamp that runs after the fill is likewise judged on
 the measurement: it rewrites a measured row only where the MEASURED core means
@@ -307,6 +310,21 @@ def _normalise(x: np.ndarray, z: np.ndarray,
     return np.column_stack([x_n, z_n])
 
 
+def _core_transition(
+    x_pts: np.ndarray,
+    x_core: float,
+    x_edge: float,
+) -> np.ndarray:
+    """Return 0 inside the trusted core, 1 at and beyond the edge zone.
+
+    The single definition of how far a radius sits from the trusted core into
+    the noisy scrape-off layer.  Both how tightly the RBF is asked to fit a
+    point and how far its measured value is carried into the filled product are
+    read off this one ramp, so the two cannot drift apart.
+    """
+    return np.clip((np.abs(x_pts) - x_core) / (x_edge - x_core), 0.0, 1.0)
+
+
 def _point_smoothing(
     x_pts: np.ndarray,
     *,
@@ -321,7 +339,7 @@ def _point_smoothing(
     x_core < |x| < x_edge   → linearly interpolated
     |x| ≥ x_edge            → smoothing_edge  (loose: noisier edge data)
     """
-    t = np.clip((np.abs(x_pts) - x_core) / (x_edge - x_core), 0.0, 1.0)
+    t = _core_transition(x_pts, x_core, x_edge)
     return smoothing_core + t * (smoothing_edge - smoothing_core)
 
 
@@ -350,17 +368,29 @@ def fill_te_cycle(
       |x| ≥ x_edge  → smoothing_edge (fit loosely; noisy edge data)
     Sentinel boundary points use smoothing=0 (exact enforcement).
 
-    With *preserve_measured* (the default) every cell that carries a finite
-    measurement keeps its measured value and only NaN cells take the
-    interpolant, so the product is the data wherever the data exists and the
-    fill only where it does not.  This is what the boundary sentinels make
-    necessary: they are enforced near-exactly (``SMOOTHING_SENTINEL``) while
-    data points carry ``smoothing_core``, so the fitted surface is free to sit
-    below a measured row that lies near an end plate in order to reach the
-    imposed T_e there.  The effect falls off with distance from the boundary
-    and is therefore a z-dependent bias, not a uniform offset: it does not
-    cancel in a ratio or a difference between rows, and it can invert the
-    ordering of two rows whose measured separation is smaller than the bias.
+    With *preserve_measured* (the default) a measured cell inside the trusted
+    core (|x| <= x_core) keeps its measured value and the surface is used only
+    where there is no measurement; across the transition zone the two are
+    blended on the same ramp the smoothing uses, so at |x| >= x_edge the
+    scrape-off-layer prior (the edge anchors and ``smoothing_edge``) is left
+    entirely intact and there is no step anywhere in the profile.
+
+    This is what the boundary sentinels make necessary: they are enforced
+    near-exactly (``SMOOTHING_SENTINEL``) while data points carry
+    ``smoothing_core``, so the fitted surface is free to sit below a measured
+    row that lies near an end plate in order to reach the imposed T_e there.
+    The effect falls off with distance from the boundary and is therefore a
+    z-dependent bias, not a uniform offset: it does not cancel in a ratio or a
+    difference between rows, and it can invert the ordering of two rows whose
+    measured separation is smaller than the bias.
+
+    The blend is deliberately not carried out to the wall.  Outside the core
+    the fill is not merely interpolating: the edge anchors and the loose edge
+    smoothing are a prior that exists precisely because scan-edge measurements
+    are fluctuation-prone, and it holds the surface 1-2 eV below the measured
+    cells at EVERY axial row, including rows the sentinels barely touch.  That
+    is a separate, intended choice and is left alone here.
+
     Setting *preserve_measured* to False restores the surface-everywhere
     behaviour for comparison.
     """
@@ -374,7 +404,8 @@ def fill_te_cycle(
     if data_values.size < 4:
         flat = np.full_like(te_2d, te_boundary)
         if preserve_measured:
-            flat = np.where(valid, te_2d, flat)
+            trust = 1.0 - _core_transition(xx, x_core, x_edge)
+            flat = np.where(valid, trust * te_2d + (1.0 - trust) * flat, flat)
         return np.clip(flat, te_boundary, None)
 
     # Per-point smoothing for data points
@@ -416,7 +447,8 @@ def fill_te_cycle(
     grid_norm = _normalise(xx.ravel(), zz.ravel(), x_wall, z_lo, z_hi)
     te_out = rbf(grid_norm).reshape(te_2d.shape)
     if preserve_measured:
-        te_out = np.where(valid, te_2d, te_out)
+        trust = 1.0 - _core_transition(xx, x_core, x_edge)
+        te_out = np.where(valid, trust * te_2d + (1.0 - trust) * te_out, te_out)
     return np.clip(te_out, te_boundary, None)
 
 
@@ -919,11 +951,11 @@ def main() -> None:
                              "threshold are blanked and filled by boundary extrapolation. "
                              f"Default: {MIN_Z_COVERAGE}.")
     parser.add_argument("--no-preserve-measured-cells", action="store_true",
-                        help="Let the RBF surface overwrite cells that carry a finite "
-                             "measurement, instead of filling only the NaN cells.  This "
-                             "is the pre-2026-08-20 behaviour and lets the near-exactly "
-                             "enforced boundary sentinels bias measured rows near the "
-                             "end plates; kept for comparison only.")
+                        help="Let the RBF surface overwrite core cells that carry a "
+                             "finite measurement, instead of filling only the NaN cells "
+                             "there.  This is the pre-2026-08-20 behaviour and lets the "
+                             "near-exactly enforced boundary sentinels bias measured "
+                             "rows near the end plates; kept for comparison only.")
     parser.add_argument("--no-measured-monotonic-gate", action="store_true",
                         help="Let the core-mean monotonic-z clamp rewrite a measured row "
                              "even where the measured core means are themselves "
