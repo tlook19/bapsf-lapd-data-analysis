@@ -338,6 +338,12 @@ def _write_te_records(path, *, omit=(), core_band=(X_MIN_CM, X_MAX_CM)):
         "te_core_window_sem_ev": np.zeros((5, 3)),
         "te_window_dln_core_control": np.array([0.19, 0.24, 0.17, 2.146, 3.049]),
         "te_window_dln_core_control_source": np.array([1, 1, 1, 2, 2], dtype=np.int8),
+        "te_row_measured_cells": np.array(
+            [[7, 7, 7], [7, 7, 7], [7, 7, 7], [0, 0, 0], [0, 0, 0]], dtype=np.int16
+        ),
+        "te_row_measured_core_cells": np.array(
+            [[5, 5, 5], [5, 5, 5], [5, 5, 5], [0, 0, 0], [0, 0, 0]], dtype=np.int16
+        ),
     }
     with h5py.File(path, "w") as hdf:
         group = hdf.create_group("experiment_sets/1")
@@ -351,6 +357,8 @@ def _write_te_records(path, *, omit=(), core_band=(X_MIN_CM, X_MAX_CM)):
         group.attrs["te_semi_quantitative_rule"] = "semi-quantitative rule"
         group.attrs["te_core_window_sem_definition"] = "window sem"
         group.attrs["te_window_core_control_source_codes"] = "0 none, 1 band, 2 original"
+        group.attrs["te_row_provenance_definition"] = "row provenance"
+        group.attrs["te_qc_floor_rule"] = "qc floor"
     return path
 
 
@@ -365,6 +373,20 @@ def test_te_records_are_read_off_the_filled_product(tmp_path):
     assert records["trust_model"] == "trust model"
     assert records["core_control_dln"].tolist() == [0.19, 0.24, 0.17, 2.146, 3.049]
     assert records["core_control_source"].tolist() == [1, 1, 1, 2, 2]
+    assert records["row_measured_cells"][:, 0].tolist() == [7, 7, 7, 0, 0]
+    assert records["row_measured_core_cells"][:, 0].tolist() == [5, 5, 5, 0, 0]
+
+
+def test_a_row_with_no_measured_cell_is_flagged_prior_derived(tmp_path):
+    """The seven blanked exception ports must not read as measured ports."""
+    path = _write_te_records(tmp_path / "te_filled.hdf5")
+
+    with h5py.File(path, "r") as hdf:
+        records = _te_trust_records(hdf["experiment_sets/1"], path, 1)
+    measured = records["row_measured_cells"] > 0
+
+    assert measured[:, 0].tolist() == [True, True, True, False, False]
+    assert not measured[3].any() and not measured[4].any()
 
 
 @pytest.mark.parametrize("missing", REQUIRED_TE_RECORDS)

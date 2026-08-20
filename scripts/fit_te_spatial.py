@@ -69,6 +69,8 @@ processed/te_filled.hdf5
     te_semi_quantitative_core_count (n_z, n_cycles)  marked cells in the core
     te_semi_quantitative_band_count (n_z, n_cycles)  marked cells in the band
     te_core_window_sem_ev           (n_z, n_cycles)  window term for the SEM
+    te_row_measured_cells           (n_z, n_cycles)  measured cells behind a row
+    te_row_measured_core_cells      (n_z, n_cycles)  of those, inside the core
 
 figures/te_filled_expset{es_id}.png
   Masked vs filled T_e at four representative cycles.
@@ -253,6 +255,51 @@ TRUST_MODEL_STATEMENT = (
     "fitted surface is the same one an unadopted port would have seen."
 )
 
+#: Beyond this radius a measured cell must clear ``QC_FLOOR_MIN_N_OK`` before
+#: its value is allowed into the filled product.  It is the aperture radius:
+#: inside it the trust extension rests on a measured, band-wide window
+#: sensitivity; outside it the measurement is only ever partially carried, and
+#: how much evidence stands behind a cell has to be asked separately.
+QC_FLOOR_RADIUS_CM = X_TRUST_APERTURE_CM
+#: Minimum surviving-cycle count for a measured cell beyond
+#: ``QC_FLOOR_RADIUS_CM``.  Four is the boundary of the pathology it targets:
+#: the far-band junk cells are backed by one to three surviving cycles against
+#: fifteen to nineteen that only warned, where one survivor outvotes zero
+#: failures and the majority rule cannot see it.
+QC_FLOOR_MIN_N_OK = 4
+
+#: What the radius-conditional floor is, stated once so the product carries it.
+QC_FLOOR_RULE = (
+    f"Beyond |x| = {QC_FLOOR_RADIUS_CM:g} cm a measured cell is carried into "
+    f"the filled product only if at least {QC_FLOOR_MIN_N_OK} of its cycles "
+    "survived QC.  The floor gates the measurement's WEIGHT IN THE FILL, not "
+    "its use as an interpolation constraint: the cell still informs the RBF "
+    "surface, so the fitted surface is unchanged and no port can be moved by "
+    "a neighbour's gated cell.  One rule, stated by radius rather than by "
+    "port.  It can only bite where the measurement still has weight beyond "
+    "the aperture, which is exactly the ports that adopted the aperture trust "
+    "radius; every other port has weight identically zero there and is "
+    "untouched by construction rather than by exemption.  A cell backed by "
+    "several rot-0 runs is judged on the best-supported of them."
+)
+
+#: What the per-row provenance record means, stated once for the same reason.
+ROW_PROVENANCE_STATEMENT = (
+    "te_row_measured_cells[port, sample] counts the QC-surviving measured "
+    "cells behind that row at that sample, over the whole scan, and "
+    "te_row_measured_core_cells counts those inside the core band the "
+    "exported T_e statistics are taken over.  A row with ZERO measured cells "
+    "is PRIOR-DERIVED: it was reconstructed entirely from neighbouring rows, "
+    "the scrape-off-layer anchors and the end-plate sentinels, and its T_e is "
+    "not a measurement of that port.  Rows reach that state two ways, and the "
+    "count sees both: an experiment set whose later ports approach the swept "
+    "diagnostic's low-temperature limit has them blanked before the fill "
+    "(excluded_unreliable_te_ports), and a row too sparsely sampled to "
+    "constrain the interpolant is dropped by the coverage threshold.  Read "
+    "this before treating a port's T_e or anything derived from it as an "
+    "independent measurement."
+)
+
 #: What the semi-quantitative class is, stated once for the same reason.
 SEMI_QUANTITATIVE_STATEMENT = (
     "A cell is semi-quantitative when its filled T_e is below "
@@ -315,6 +362,30 @@ def _qc_surviving_cells(n_ok: np.ndarray, n_bad: np.ndarray) -> np.ndarray:
     return np.asarray(n_ok) >= np.asarray(n_bad)
 
 
+def measured_weight_allowed(
+    n_ok: np.ndarray,
+    x_cm: np.ndarray,
+    *,
+    floor_radius_cm: float = QC_FLOOR_RADIUS_CM,
+    min_n_ok: int = QC_FLOOR_MIN_N_OK,
+) -> np.ndarray:
+    """Return where a measured cell may carry weight in the fill.
+
+    ``n_ok`` is the surviving-cycle count behind each cell, shaped
+    ``(n_z, n_x, n_cycles)``; ``x_cm`` indexes its second axis.  Inside
+    *floor_radius_cm* every cell is allowed and the answer is True; outside it
+    a cell needs at least *min_n_ok* surviving cycles.  See ``QC_FLOOR_RULE``.
+
+    This is a statement about the FILL's weighting, not about the data: a cell
+    that fails still enters the RBF as an interpolation constraint, so the
+    fitted surface is untouched and the gate cannot propagate between ports.
+    """
+    inside = np.abs(np.asarray(x_cm)) <= floor_radius_cm
+    return inside[np.newaxis, :, np.newaxis] | (
+        np.asarray(n_ok) >= min_n_ok
+    )
+
+
 def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
     """Load QC-masked T_e(n_z, n_x, n_cycles) for one experiment set.
 
@@ -356,12 +427,14 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
     n_x      = len(x_cm)
     n_cycles = len(cycle_time_s)
     te_grid  = np.full((n_z, n_x, n_cycles), np.nan)
+    n_ok_grid = np.zeros((n_z, n_x, n_cycles), dtype=np.int32)
     n_qc_excluded = 0
 
     for zi, z in enumerate(z_vals):
         te_sum = np.zeros((n_x, n_cycles))
         weight = np.zeros((n_x, n_cycles))
         mask_bad = np.zeros((n_x, n_cycles), dtype=bool)
+        best_n_ok = np.zeros((n_x, n_cycles), dtype=np.int32)
 
         for te, n_ok, n_bad in z_groups[z]:
             cell_bad = ~_qc_surviving_cells(n_ok, n_bad)
@@ -370,6 +443,11 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
             valid     = ~cell_bad
             te_sum   += np.where(valid, te, 0.0)
             weight   += valid.astype(float)
+            # The surviving-cycle count standing behind the cell: the best
+            # supported of the contributing runs, so a second rot-0 run can
+            # only ever strengthen a cell's case, never weaken it.
+            best_n_ok = np.maximum(best_n_ok, np.where(valid, n_ok, 0))
+        n_ok_grid[zi] = best_n_ok
 
         with np.errstate(invalid="ignore"):
             te_avg = np.where(weight > 0, te_sum / weight, np.nan)
@@ -387,6 +465,7 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
         "v_bank":         eg.attrs.get("v_bank_v", "?"),
         "es_id":          es_id,
         "n_qc_excluded":  n_qc_excluded,
+        "n_ok":           n_ok_grid,
     }
 
 
@@ -409,6 +488,7 @@ def _load_filled_source_experiment_set(hf: h5py.File, es_id: str) -> dict:
         "v_bank":         grp.attrs.get("v_bank_v", "?"),
         "es_id":          es_id,
         "n_qc_excluded":  -1,   # the QC gate ran when the source was built
+        "n_ok":           None,  # severity counts do not survive into te_filled
     }
 
 
@@ -588,6 +668,7 @@ def fill_te_cycle(
     preserve_measured: bool = True,
     trust_radius_cm: np.ndarray | float | None = None,
     trust_blend_cm: np.ndarray | float | None = None,
+    measured_weight_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return filled (n_z, n_x) T_e array with no NaN cells.
 
@@ -610,6 +691,12 @@ def fill_te_cycle(
     RBF: the per-point smoothing keeps its own fixed zone, so changing a port's
     trusted radius does not move the fitted surface and cannot move a
     neighbouring port.  See ``_core_transition``.
+
+    *measured_weight_mask*, when given, is a ``(n_z, n_x)`` boolean saying
+    which measured cells may carry weight at all; False forces the blend onto
+    the surface there.  It is how the radius-conditional QC floor is applied
+    (``QC_FLOOR_RULE``), and like the trust radii it never enters the RBF, so a
+    gated cell still constrains the surface that replaces it.
 
     This is what the boundary sentinels make necessary: they are enforced
     near-exactly (``SMOOTHING_SENTINEL``) while data points carry
@@ -646,6 +733,19 @@ def fill_te_cycle(
             f"trust radii shaped {radius.shape}/{blend.shape} do not broadcast "
             f"onto the {te_2d.shape[0]} z-rows of the T_e grid"
         )
+    if measured_weight_mask is not None:
+        measured_weight_mask = np.asarray(measured_weight_mask, dtype=bool)
+        if measured_weight_mask.shape != te_2d.shape:
+            raise ValueError(
+                f"measured weight mask shape {measured_weight_mask.shape} does "
+                f"not match the T_e grid {te_2d.shape}"
+            )
+
+    def _trust(grid_x: np.ndarray) -> np.ndarray:
+        weight = 1.0 - _core_transition(grid_x, radius, blend)
+        if measured_weight_mask is not None:
+            weight = np.where(measured_weight_mask, weight, 0.0)
+        return weight
 
     # Data coordinates and values
     data_coords = np.column_stack([xx[valid], zz[valid]])   # [x, z]
@@ -654,7 +754,7 @@ def fill_te_cycle(
     if data_values.size < 4:
         flat = np.full_like(te_2d, te_boundary)
         if preserve_measured:
-            trust = 1.0 - _core_transition(xx, radius, blend)
+            trust = _trust(xx)
             flat = np.where(valid, trust * te_2d + (1.0 - trust) * flat, flat)
         return np.clip(flat, te_boundary, None)
 
@@ -697,9 +797,25 @@ def fill_te_cycle(
     grid_norm = _normalise(xx.ravel(), zz.ravel(), x_wall, z_lo, z_hi)
     te_out = rbf(grid_norm).reshape(te_2d.shape)
     if preserve_measured:
-        trust = 1.0 - _core_transition(xx, radius, blend)
+        trust = _trust(xx)
         te_out = np.where(valid, trust * te_2d + (1.0 - trust) * te_out, te_out)
     return np.clip(te_out, te_boundary, None)
+
+
+def sparse_z_rows(
+    te_grid: np.ndarray,
+    min_z_coverage: float = MIN_Z_COVERAGE,
+) -> np.ndarray:
+    """Return which z-rows are too sparsely sampled to constrain the fit.
+
+    A row whose fraction of finite cells, pooled over all x and all cycles,
+    falls below *min_z_coverage* cannot hold the interpolant and is dropped
+    from it.  The single definition of that test, so the fill and the record
+    of which rows ended up prior-derived cannot disagree about it.
+    """
+    n_z = te_grid.shape[0]
+    coverage = np.array([np.isfinite(te_grid[zi]).mean() for zi in range(n_z)])
+    return coverage < min_z_coverage
 
 
 def fill_te_grid(
@@ -708,6 +824,7 @@ def fill_te_grid(
     z_cm: np.ndarray,
     *,
     min_z_coverage: float = MIN_Z_COVERAGE,
+    measured_weight_mask: np.ndarray | None = None,
     **kwargs,                   # forwarded to fill_te_cycle
 ) -> np.ndarray:
     """Fill every cycle in the grid; prints progress.
@@ -721,7 +838,7 @@ def fill_te_grid(
     """
     n_z = te_grid.shape[0]
     z_coverage = np.array([np.isfinite(te_grid[zi]).mean() for zi in range(n_z)])
-    sparse = z_coverage < min_z_coverage
+    sparse = sparse_z_rows(te_grid, min_z_coverage)
     if sparse.any():
         te_grid = te_grid.copy()
         te_grid[sparse] = np.nan
@@ -734,7 +851,16 @@ def fill_te_grid(
     n_cycles = te_grid.shape[2]
     filled = np.empty_like(te_grid)
     for ci in range(n_cycles):
-        filled[:, :, ci] = fill_te_cycle(te_grid[:, :, ci], x_cm, z_cm, **kwargs)
+        cycle_mask = (
+            None if measured_weight_mask is None else measured_weight_mask[:, :, ci]
+        )
+        filled[:, :, ci] = fill_te_cycle(
+            te_grid[:, :, ci],
+            x_cm,
+            z_cm,
+            measured_weight_mask=cycle_mask,
+            **kwargs,
+        )
         pct = 100 * (ci + 1) / n_cycles
         sys.stdout.write(f"\r    cycle {ci + 1}/{n_cycles} ({pct:.0f}%)")
         sys.stdout.flush()
@@ -1663,6 +1789,39 @@ def main() -> None:
                 if n_preserved:
                     print(f"    {n_preserved} core hot-spot cells preserved")
 
+                if data["n_ok"] is None:
+                    measured_gate = None
+                    print(
+                        "  Radius-conditional QC floor NOT applied: the input "
+                        "carries no severity counts"
+                    )
+                else:
+                    measured_gate = measured_weight_allowed(data["n_ok"], x_cm)
+                    beyond = np.abs(x_cm) > QC_FLOOR_RADIUS_CM
+                    gated = np.isfinite(te_masked) & ~measured_gate
+                    weighted = gated & (
+                        (1.0 - _core_transition(
+                            np.broadcast_to(x_cm, te_masked.shape[:2]),
+                            trust_radius_cm[:, None],
+                            trust_blend_cm[:, None],
+                        ) > 0.0)[:, :, None]
+                    )
+                    print(
+                        f"  Radius-conditional QC floor (|x| > "
+                        f"{QC_FLOOR_RADIUS_CM:g} cm needs n_ok >= "
+                        f"{QC_FLOOR_MIN_N_OK}): {int(gated.sum())} measured "
+                        f"cells gated, of which {int(weighted.sum())} carried "
+                        "weight in this trust model"
+                    )
+                    for z_idx in np.flatnonzero(weighted.any(axis=(1, 2))):
+                        positions = np.flatnonzero(weighted[z_idx].any(axis=1))
+                        print(
+                            f"    p{int(ports[z_idx])}: "
+                            f"{int(weighted[z_idx].sum())} cell-cycles at x = "
+                            + ", ".join(f"{x_cm[i]:g}" for i in positions)
+                            + " cm"
+                        )
+
                 print(f"  Fitting {te_masked.shape[2]} cycles …")
                 te_filled = fill_te_grid(
                     te_masked,
@@ -1670,6 +1829,7 @@ def main() -> None:
                     z_cm,
                     trust_radius_cm=trust_radius_cm,
                     trust_blend_cm=trust_blend_cm,
+                    measured_weight_mask=measured_gate,
                     **fill_kwargs,
                 )
                 (
@@ -1699,6 +1859,31 @@ def main() -> None:
                             f"{data['cycle_time_ms'][ci]:.2f}" for ci in cycles
                         )
                         + " ms"
+                    )
+
+                # Provenance: which rows are a measurement of their own port
+                # and which were reconstructed.  Judged on the grid the fill
+                # actually read, so both ways a row can end up empty -- blanked
+                # as unreliable, or dropped by the coverage threshold -- are
+                # counted the same way.
+                effective_measured = te_masked.copy()
+                effective_measured[sparse_z_rows(te_masked, args.min_z_coverage)] = np.nan
+                if measured_gate is not None:
+                    effective_measured[~measured_gate] = np.nan
+                row_measured_cells = np.sum(
+                    np.isfinite(effective_measured), axis=1
+                ).astype(np.int16)
+                core_band_for_rows = (x_cm >= args.core_band_cm[0]) & (
+                    x_cm <= args.core_band_cm[1]
+                )
+                row_measured_core_cells = np.sum(
+                    np.isfinite(effective_measured[:, core_band_for_rows, :]), axis=1
+                ).astype(np.int16)
+                prior_rows = np.flatnonzero(row_measured_cells.max(axis=1) == 0)
+                if prior_rows.size:
+                    print(
+                        "  PRIOR-DERIVED rows (no measured cell at any sample): "
+                        + ", ".join(f"p{int(ports[i])}" for i in prior_rows)
                     )
 
                 (
@@ -1812,6 +1997,10 @@ def main() -> None:
                     f"every shared set-port to {WINDOW_METRIC_RTOL:g} relative."
                 )
                 grp.attrs["te_window_metric_rtol"] = float(WINDOW_METRIC_RTOL)
+                grp.attrs["te_qc_floor_rule"] = QC_FLOOR_RULE
+                grp.attrs["te_qc_floor_radius_cm"] = float(QC_FLOOR_RADIUS_CM)
+                grp.attrs["te_qc_floor_min_n_ok"] = int(QC_FLOOR_MIN_N_OK)
+                grp.attrs["te_row_provenance_definition"] = ROW_PROVENANCE_STATEMENT
                 grp.create_dataset("x_cm",           data=x_cm,                compression="gzip")
                 grp.create_dataset("z_cm",           data=z_cm,                compression="gzip")
                 grp.create_dataset("port",           data=ports,               compression="gzip")
@@ -1875,6 +2064,16 @@ def main() -> None:
                 grp.create_dataset(
                     "te_core_window_sem_ev",
                     data=core_window_sem,
+                    compression="gzip",
+                )
+                grp.create_dataset(
+                    "te_row_measured_cells",
+                    data=row_measured_cells,
+                    compression="gzip",
+                )
+                grp.create_dataset(
+                    "te_row_measured_core_cells",
+                    data=row_measured_core_cells,
                     compression="gzip",
                 )
                 hf_out.flush()

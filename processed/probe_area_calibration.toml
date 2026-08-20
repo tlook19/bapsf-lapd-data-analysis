@@ -10,27 +10,27 @@
 # to raw Probe A current in every downstream density/Mach workflow.
 
 [probe_A]
-ap_L_cm2 = 0.050919
-ap_R_cm2 = 0.055444
-ap_L_std_cm2 = 0.001846
-ap_R_std_cm2 = 0.001608
+ap_L_cm2 = 0.050926
+ap_R_cm2 = 0.055451
+ap_L_std_cm2 = 0.001849
+ap_R_std_cm2 = 0.001610
 estimated = true  # base/reference area copied from probe B
 
 [probe_B]
-ap_L_cm2 = 0.050919
-ap_R_cm2 = 0.055444
-ap_L_std_cm2 = 0.001846
-ap_R_std_cm2 = 0.001608
+ap_L_cm2 = 0.050926
+ap_R_cm2 = 0.055451
+ap_L_std_cm2 = 0.001849
+ap_R_std_cm2 = 0.001610
 
 [probe_C]
-ap_L_cm2 = 0.045814
-ap_R_cm2 = 0.051029
-ap_L_std_cm2 = 0.001688
-ap_R_std_cm2 = 0.001545
+ap_L_cm2 = 0.045878
+ap_R_cm2 = 0.051125
+ap_L_std_cm2 = 0.001750
+ap_R_std_cm2 = 0.001640
 
 [probe_D]
-ap_L_cm2 = 0.058801
-ap_R_cm2 = 0.056324
-ap_L_std_cm2 = 0.001497
-ap_R_std_cm2 = 0.001217
+ap_L_cm2 = 0.058810
+ap_R_cm2 = 0.056333
+ap_L_std_cm2 = 0.001508
+ap_R_std_cm2 = 0.001230
 

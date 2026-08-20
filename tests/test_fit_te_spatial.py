@@ -26,10 +26,13 @@ from scripts.fit_te_spatial import (
     _semi_quantitative_marks,
     _trust_model_for_ports,
     _window_spread_grids,
+    QC_FLOOR_MIN_N_OK,
     _legacy_dln,
     fill_te_cycle,
     load_window_band_spreads,
+    measured_weight_allowed,
     merge_legacy_x0_controls,
+    sparse_z_rows,
 )
 
 ADOPTED_SET_PORTS = (
@@ -739,3 +742,81 @@ def test_a_legacy_only_control_marks_that_ports_core(tmp_path):
     assert reason[0, 1, 0] & SEMI_QUANT_CORE_CONTROL      # x = 0 is in the core
     assert not reason[0, 0, 0] and not reason[0, 2, 0]    # |x| = 11 is not
     assert inflating[0, 1] == pytest.approx(2.146)
+
+
+# ---------------------------------------------------------------------------
+# The radius-conditional QC floor
+# ---------------------------------------------------------------------------
+def test_the_floor_only_asks_about_evidence_beyond_the_aperture():
+    x_cm = np.array([-20.0, -18.0, 0.0, 18.0, 20.0])
+    n_ok = np.full((1, 5, 1), 1, dtype=np.int32)
+
+    allowed = measured_weight_allowed(n_ok, x_cm)
+
+    # Inside 18.415 cm a single surviving cycle is still allowed; outside it is
+    # not, and the boundary sits between the 18 and 20 cm samples.
+    assert allowed[0, :, 0].tolist() == [False, True, True, True, False]
+
+
+def test_the_floor_admits_a_far_cell_with_enough_surviving_cycles():
+    x_cm = np.array([20.0])
+    below = measured_weight_allowed(
+        np.full((1, 1, 1), QC_FLOOR_MIN_N_OK - 1, dtype=np.int32), x_cm
+    )
+    at = measured_weight_allowed(
+        np.full((1, 1, 1), QC_FLOOR_MIN_N_OK, dtype=np.int32), x_cm
+    )
+
+    assert not below[0, 0, 0]
+    assert at[0, 0, 0]
+
+
+def _floor_case(trust_radius, trust_blend):
+    x_cm = np.linspace(-25.0, 25.0, 51)
+    z_cm = np.array([470.1, 789.5, 1045.2])
+    rng = np.random.default_rng(11)
+    te_2d = 8.0 - 0.004 * x_cm[None, :] ** 2 + rng.normal(
+        scale=0.05, size=(z_cm.size, x_cm.size)
+    )
+    gate = np.ones(te_2d.shape, dtype=bool)
+    gate[:, np.abs(x_cm) > X_TRUST_APERTURE_CM] = False   # everything far is gated
+    kwargs = dict(trust_radius_cm=trust_radius, trust_blend_cm=trust_blend)
+    ungated = fill_te_cycle(te_2d, x_cm, z_cm, **kwargs)
+    gated = fill_te_cycle(te_2d, x_cm, z_cm, measured_weight_mask=gate, **kwargs)
+    return x_cm, ungated, gated
+
+
+def test_the_floor_has_no_effect_where_the_measurement_has_no_weight_out_there():
+    """A port on the historical 10 cm model cannot be moved by the floor."""
+    _, ungated, gated = _floor_case(X_CORE_CM, X_EDGE_CM)
+
+    assert np.array_equal(gated.view(np.uint8), ungated.view(np.uint8))
+
+
+def test_the_floor_acts_only_in_the_blend_at_a_port_that_adopted_the_aperture():
+    x_cm, ungated, gated = _floor_case(X_TRUST_APERTURE_CM, X_TRUST_BLEND_CM)
+
+    moved = np.flatnonzero((gated != ungated).any(axis=0))
+    assert moved.size > 0
+    assert np.all(np.abs(x_cm[moved]) > X_TRUST_APERTURE_CM)
+    assert np.all(np.abs(x_cm[moved]) <= X_TRUST_BLEND_CM)
+
+
+def test_a_measured_weight_mask_of_the_wrong_shape_is_refused():
+    x_cm = np.linspace(-25.0, 25.0, 51)
+    z_cm = np.array([470.1, 789.5, 1045.2])
+    te_2d = np.broadcast_to(8.0 - 0.004 * x_cm**2, (z_cm.size, x_cm.size)).copy()
+
+    with pytest.raises(ValueError, match="measured weight mask shape"):
+        fill_te_cycle(
+            te_2d, x_cm, z_cm, measured_weight_mask=np.ones((2, 51), dtype=bool)
+        )
+
+
+def test_sparse_rows_are_the_ones_below_the_coverage_threshold():
+    grid = np.full((3, 4, 5), np.nan)
+    grid[0] = 1.0                      # fully covered
+    grid[1, 0, 0] = 1.0                # 1 of 20 cells
+    sparse = sparse_z_rows(grid, 0.10)
+
+    assert sparse.tolist() == [False, True, True]
