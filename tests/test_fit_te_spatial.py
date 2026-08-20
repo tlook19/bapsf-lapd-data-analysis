@@ -2,11 +2,31 @@ import numpy as np
 import pytest
 
 from scripts.fit_te_spatial import (
+    SEMI_QUANT_CORE_CONTROL,
+    SEMI_QUANT_SUB_EV,
+    SEMI_QUANT_WINDOW,
+    SEMI_QUANTITATIVE_DLN,
+    TRUST_MODEL_BY_SET_PORT,
+    X_CORE_CM,
+    X_EDGE_CM,
+    X_TRUST_APERTURE_CM,
+    X_TRUST_BLEND_CM,
+    _core_window_sem,
     _enforce_core_mean_monotonic_z,
     _mask_untrusted_te_ports,
     _monotonic_z_bound,
+    _qc_surviving_cells,
     _robust_current_spike_mask,
+    _semi_quantitative_marks,
+    _trust_model_for_ports,
+    _window_spread_grids,
     fill_te_cycle,
+    load_window_band_spreads,
+)
+
+ADOPTED_SET_PORTS = (
+    ("1", 11), ("1", 21), ("1", 29), ("1", 41),
+    ("2", 11), ("2", 21), ("2", 29), ("2", 41),
 )
 
 
@@ -245,3 +265,304 @@ def test_fill_blends_across_the_transition_zone_without_a_step():
     order = np.argsort(np.abs(x_cm))
     ramp = np.nan_to_num(weight[0][order], nan=1.0)
     assert np.all(np.diff(ramp) <= 1e-12)
+
+
+# ---------------------------------------------------------------------------
+# The QC gate
+# ---------------------------------------------------------------------------
+def test_qc_gate_keeps_a_cell_whose_surviving_cycles_are_not_outnumbered():
+    n_ok = np.array([[5, 3, 0, 0]])
+    n_bad = np.array([[1, 3, 4, 0]])
+
+    surviving = _qc_surviving_cells(n_ok, n_bad)
+
+    # A clear majority survives, a tie survives, and a cell whose cycles all
+    # only warned (n_ok = n_bad = 0) survives; only the outnumbered cell goes.
+    assert surviving.tolist() == [[True, True, False, True]]
+
+
+def test_qc_gate_is_the_rule_the_loader_applies_at_every_radius():
+    """The gate is one function of the severity counts and knows nothing of x."""
+    n_ok = np.array([4, 4])
+    n_bad = np.array([9, 9])
+
+    assert not _qc_surviving_cells(n_ok, n_bad).any()
+
+
+# ---------------------------------------------------------------------------
+# The per-port trust model
+# ---------------------------------------------------------------------------
+def test_adopted_set_ports_take_the_aperture_trust_radius():
+    ports = np.array([11, 21, 29, 41, 50])
+
+    radius, blend = _trust_model_for_ports("1", ports)
+
+    assert radius[:4].tolist() == [X_TRUST_APERTURE_CM] * 4
+    assert blend[:4].tolist() == [X_TRUST_BLEND_CM] * 4
+    assert radius[4] == X_CORE_CM
+    assert blend[4] == X_EDGE_CM
+
+
+def test_the_adoption_table_holds_exactly_the_eight_ruled_set_ports():
+    assert set(TRUST_MODEL_BY_SET_PORT) == set(ADOPTED_SET_PORTS)
+    assert all(
+        value == (X_TRUST_APERTURE_CM, X_TRUST_BLEND_CM)
+        for value in TRUST_MODEL_BY_SET_PORT.values()
+    )
+
+
+@pytest.mark.parametrize("es_id", ["3", "4"])
+def test_unadopted_experiment_sets_keep_the_historical_core(es_id):
+    ports = np.array([11, 21, 29, 41, 50])
+
+    radius, blend = _trust_model_for_ports(es_id, ports)
+
+    assert np.all(radius == X_CORE_CM)
+    assert np.all(blend == X_EDGE_CM)
+
+
+def test_a_blend_radius_inside_the_trusted_radius_is_refused():
+    with pytest.raises(ValueError, match="must be outside the trusted radius"):
+        _trust_model_for_ports(
+            "1", np.array([11]), trust_model={("1", 11): (20.0, 12.0)}
+        )
+
+
+def test_trust_radii_that_do_not_match_the_rows_are_refused():
+    x_cm = np.linspace(-25.0, 25.0, 51)
+    z_cm = np.array([470.1, 789.5, 1045.2])
+    te_2d = np.broadcast_to(8.0 - 0.004 * x_cm**2, (z_cm.size, x_cm.size)).copy()
+
+    with pytest.raises(ValueError, match="do not broadcast"):
+        fill_te_cycle(
+            te_2d,
+            x_cm,
+            z_cm,
+            trust_radius_cm=np.array([10.0, 10.0]),
+            trust_blend_cm=np.array([15.0, 15.0]),
+        )
+
+
+def _blend_weight(te_2d, x_cm, z_cm, **kwargs):
+    """Return how much of the measurement survives into the fill, per cell."""
+    filled = fill_te_cycle(te_2d, x_cm, z_cm, **kwargs)
+    surface = fill_te_cycle(te_2d, x_cm, z_cm, preserve_measured=False, **kwargs)
+    denominator = te_2d - surface
+    return (filled - surface) / np.where(denominator == 0.0, np.nan, denominator)
+
+
+def test_the_aperture_blend_runs_from_the_aperture_to_the_column_edge():
+    """Trust is total at 18.415 cm, gone at 20.2 cm, and monotone between."""
+    x_cm = np.array(
+        [0.0, 5.0, 10.0, 14.0, 18.0, X_TRUST_APERTURE_CM, 19.0, 19.5,
+         X_TRUST_BLEND_CM, 21.0, 24.0]
+    )
+    x_cm = np.concatenate([-x_cm[::-1][:-1], x_cm])
+    z_cm = np.array([470.1, 789.5, 1045.2])
+    te_2d = np.broadcast_to(8.0 - 0.004 * x_cm**2, (z_cm.size, x_cm.size)).copy()
+    te_2d[:, np.abs(x_cm) > 12.0] += 3.0
+
+    weight = _blend_weight(
+        te_2d,
+        x_cm,
+        z_cm,
+        trust_radius_cm=X_TRUST_APERTURE_CM,
+        trust_blend_cm=X_TRUST_BLEND_CM,
+    )
+
+    inside = np.abs(x_cm) <= X_TRUST_APERTURE_CM
+    outside = np.abs(x_cm) >= X_TRUST_BLEND_CM
+    between = ~inside & ~outside
+    assert np.nanmin(weight[:, inside]) == pytest.approx(1.0)
+    assert np.nanmax(weight[:, outside]) == pytest.approx(0.0, abs=1e-12)
+    assert np.all(np.nan_to_num(weight[:, between]) < 1.0)
+    assert np.all(np.nan_to_num(weight[:, between]) > 0.0)
+    # No step anywhere: the weight falls monotonically with |x|.
+    order = np.argsort(np.abs(x_cm))
+    ramp = np.nan_to_num(weight[0][order], nan=1.0)
+    assert np.all(np.diff(ramp) <= 1e-12)
+
+
+def test_one_row_adopting_the_aperture_does_not_move_the_others():
+    """The trust radius is per row and never enters the RBF, so p50 cannot move."""
+    x_cm = np.linspace(-25.0, 25.0, 51)
+    z_cm = np.array([470.1, 789.5, 1045.2])
+    rng = np.random.default_rng(3)
+    te_2d = 8.0 - 0.002 * (z_cm[:, None] - z_cm[0]) - 0.004 * x_cm[None, :] ** 2
+    te_2d = te_2d + rng.normal(scale=0.05, size=te_2d.shape)
+
+    historical = fill_te_cycle(te_2d, x_cm, z_cm)
+    mixed = fill_te_cycle(
+        te_2d,
+        x_cm,
+        z_cm,
+        trust_radius_cm=np.array([X_TRUST_APERTURE_CM, X_CORE_CM, X_CORE_CM]),
+        trust_blend_cm=np.array([X_TRUST_BLEND_CM, X_EDGE_CM, X_EDGE_CM]),
+    )
+
+    assert np.array_equal(mixed[1:].view(np.uint8), historical[1:].view(np.uint8))
+    band = (np.abs(x_cm) > X_CORE_CM) & (np.abs(x_cm) <= X_TRUST_APERTURE_CM)
+    assert np.all(mixed[0][band] == pytest.approx(te_2d[0][band]))
+
+
+def test_the_default_trust_radii_reproduce_the_historical_fill_exactly():
+    x_cm = np.linspace(-25.0, 25.0, 51)
+    z_cm = np.array([470.1, 789.5, 1045.2])
+    rng = np.random.default_rng(7)
+    te_2d = 6.0 - 0.003 * x_cm[None, :] ** 2 + rng.normal(
+        scale=0.05, size=(z_cm.size, x_cm.size)
+    )
+
+    implicit = fill_te_cycle(te_2d, x_cm, z_cm)
+    explicit = fill_te_cycle(
+        te_2d, x_cm, z_cm, trust_radius_cm=X_CORE_CM, trust_blend_cm=X_EDGE_CM
+    )
+
+    assert np.array_equal(implicit.view(np.uint8), explicit.view(np.uint8))
+
+
+# ---------------------------------------------------------------------------
+# Semi-quantitative marking
+# ---------------------------------------------------------------------------
+def _write_band_csv(path, rows):
+    header = (
+        "set_id,port,run_id,x_cm,is_x0_control,in_band,dln_te_window,"
+        "te_default_med_ev,n_sweeps,at_or_above_criterion\n"
+    )
+    path.write_text(header + "".join(rows))
+    return path
+
+
+def test_band_spreads_round_trip_from_the_tracked_csv(tmp_path):
+    path = _write_band_csv(
+        tmp_path / "band.csv",
+        [
+            "2,50,28,-11,0,1,1.88,1.70,400,1\n",
+            "2,50,28,0,1,0,0.603,2.16,400,1\n",
+            "1,11,01,11,0,1,0.12,7.0,400,0\n",
+        ],
+    )
+
+    spreads = load_window_band_spreads(path)
+
+    assert set(spreads) == {("2", 50), ("1", 11)}
+    assert spreads[("2", 50)]["x0_dln"] == pytest.approx(0.603)
+    assert spreads[("1", 11)]["x0_dln"] != spreads[("1", 11)]["x0_dln"]  # NaN
+    assert spreads[("2", 50)]["x_cm"].tolist() == [-11.0, 0.0]
+
+
+def test_window_spreads_land_on_the_te_grid_cells_they_were_measured_at(tmp_path):
+    path = _write_band_csv(
+        tmp_path / "band.csv",
+        ["1,11,01,11,0,1,0.75,7.0,400,1\n", "1,11,01,0,1,0,0.19,7.0,400,0\n"],
+    )
+    x_cm = np.array([-11.0, 0.0, 11.0])
+
+    dln, control = _window_spread_grids(
+        x_cm, np.array([11, 50]), "1", load_window_band_spreads(path)
+    )
+
+    assert np.isnan(dln[0, 0])          # x = -11 was not in the CSV
+    assert dln[0, 1] == pytest.approx(0.19)
+    assert dln[0, 2] == pytest.approx(0.75)
+    assert np.all(np.isnan(dln[1]))
+    assert control[0] == pytest.approx(0.19)
+    assert np.isnan(control[1])
+
+
+def test_a_window_spread_off_the_te_grid_is_refused(tmp_path):
+    path = _write_band_csv(
+        tmp_path / "band.csv", ["1,11,01,11.5,0,1,0.75,7.0,400,1\n"]
+    )
+    x_cm = np.array([-11.0, 0.0, 11.0])
+
+    with pytest.raises(ValueError, match="is not on the T_e x grid"):
+        _window_spread_grids(
+            x_cm, np.array([11]), "1", load_window_band_spreads(path)
+        )
+
+
+def test_semi_quantitative_marks_name_the_reason_and_keep_the_value():
+    x_cm = np.array([-11.0, 0.0, 11.0])
+    te = np.array([[[5.0], [6.0], [0.4]]])
+    dln = np.array([[np.nan, 0.19, 0.75]])
+    control = np.array([0.19])
+
+    reason, inflating = _semi_quantitative_marks(
+        te, x_cm, dln, control, core_x_cm=10.0
+    )
+
+    assert reason[0, 0, 0] == 0
+    assert reason[0, 1, 0] == 0
+    assert reason[0, 2, 0] == SEMI_QUANT_SUB_EV | SEMI_QUANT_WINDOW
+    assert np.isnan(inflating[0, 0])
+    assert np.isnan(inflating[0, 1])
+    assert inflating[0, 2] == pytest.approx(0.75)
+
+
+def test_a_failing_x0_control_marks_that_ports_whole_core():
+    """The ES2 p50 rider, as uniform machinery rather than a port special case."""
+    x_cm = np.array([-11.0, -5.0, 0.0, 5.0, 11.0])
+    te = np.full((2, 5, 1), 3.0)
+    dln = np.full((2, 5), np.nan)
+    dln[:, 2] = [0.603, 0.19]          # p50 x=0 control fails, p41's passes
+    control = np.array([0.603, 0.19])
+
+    reason, inflating = _semi_quantitative_marks(
+        te, x_cm, dln, control, core_x_cm=10.0
+    )
+
+    core = np.abs(x_cm) <= 10.0
+    assert np.all(reason[0, core, 0] & SEMI_QUANT_CORE_CONTROL)
+    assert not np.any(reason[0, ~core, 0])          # only the core it speaks for
+    assert not np.any(reason[1])                    # the passing port is untouched
+    assert np.all(inflating[0, core] == pytest.approx(0.603))
+    assert np.all(np.isnan(inflating[1]))
+
+
+def test_a_sub_ev_cell_is_marked_but_carries_no_window_inflation():
+    x_cm = np.array([0.0])
+    te = np.array([[[0.5, 2.0]]])
+
+    reason, inflating = _semi_quantitative_marks(
+        te, x_cm, np.array([[np.nan]]), np.array([np.nan])
+    )
+
+    assert reason[0, 0, 0] == SEMI_QUANT_SUB_EV
+    assert reason[0, 0, 1] == 0
+    assert np.isnan(inflating[0, 0])
+
+
+def test_the_criterion_is_inclusive_at_its_threshold():
+    x_cm = np.array([0.0])
+    te = np.full((1, 1, 1), 5.0)
+    dln = np.array([[SEMI_QUANTITATIVE_DLN]])
+
+    reason, _ = _semi_quantitative_marks(te, x_cm, dln, np.array([np.nan]))
+
+    assert reason[0, 0, 0] & SEMI_QUANT_WINDOW
+
+
+def test_the_window_sem_is_the_correlated_core_average_of_the_half_spreads():
+    x_cm = np.array([-5.0, 0.0, 5.0, 20.0])
+    te = np.array([[[4.0], [2.0], [4.0], [9.0]]])
+    inflating = np.array([[0.8, np.nan, 0.8, 3.0]])
+
+    sem = _core_window_sem(te, x_cm, inflating, x_min=-10.0, x_max=10.0)
+
+    # Two of the three core cells are marked; each contributes T sinh(d/2),
+    # they add linearly because the window choice is shared, and the sum is
+    # divided by the number of core cells the mean is taken over.
+    expected = 2.0 * 4.0 * np.sinh(0.4) / 3.0
+    assert sem[0, 0] == pytest.approx(expected)
+
+
+def test_the_window_sem_vanishes_where_nothing_is_marked():
+    x_cm = np.array([-5.0, 0.0, 5.0])
+    te = np.full((2, 3, 4), 3.0)
+
+    sem = _core_window_sem(
+        te, x_cm, np.full((2, 3), np.nan), x_min=-10.0, x_max=10.0
+    )
+
+    assert np.all(sem == 0.0)
