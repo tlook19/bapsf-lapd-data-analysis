@@ -10,6 +10,9 @@ The NPZ product is self-contained and uses simulation-facing units:
 * offset-corrected discharge current in A and cathode-anode voltage in V,
   each with the shot-to-shot standard deviation and the SEM of the mean;
 * per-port fractional spread of the fit-window T_e re-fits, dimensionless;
+* the per-port, per-sample record of where the filled T_e product's core-mean
+  monotonic-z clamp acted, so a consumer can see which T_e samples are a
+  neighbouring port's value rather than their own;
 * all time axes in ms relative to the experimental SIS trigger.
 
 Probe-A density SEM includes the propagated area-calibration uncertainty.
@@ -829,6 +832,19 @@ def export_overlay(
             X_MAX_CM,
             dataset="te_filled",
         )
+        te_group = te_hdf[f"experiment_sets/{experiment_set_key}"]
+        if "core_mean_te_monotonic_clamped" not in te_group:
+            raise ValueError(
+                f"{te_path} ES{experiment_set_id} carries no "
+                "core_mean_te_monotonic_clamped record; rebuild it with "
+                "scripts/fit_te_spatial.py"
+            )
+        te_clamped = np.asarray(
+            te_group["core_mean_te_monotonic_clamped"][()], dtype=np.bool_
+        )
+        te_clamp_scale = np.asarray(
+            te_group["core_mean_te_monotonic_scale"][()], dtype=np.float64
+        )
         if not np.allclose(density.z_cm, te.z_cm):
             raise ValueError(
                 f"ES{experiment_set_id} density and temperature z grids differ"
@@ -897,7 +913,7 @@ def export_overlay(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        schema_version=np.array(13, dtype=np.int16),
+        schema_version=np.array(15, dtype=np.int16),
         experiment_set_id=np.array(experiment_set_id, dtype=np.int16),
         experiment_label=np.array(experiment_label),
         port=PORTS,
@@ -912,6 +928,22 @@ def export_overlay(
         te_sem_ev=te.sem,
         te_core_count=te.count,
         te_window_spread_frac=te_window_spread,
+        te_core_mean_clamped=te_clamped,
+        te_core_mean_clamp_scale=te_clamp_scale,
+        te_core_mean_clamp_definition=np.array(
+            "te_core_mean_clamped[port, sample] is True where the filled T_e "
+            "product's core-mean monotonic-z clamp rescaled that port's radial "
+            "profile so its core mean did not exceed the coolest core mean "
+            "upstream of it, and te_core_mean_clamp_scale is the factor it "
+            "applied about the 0.1 eV boundary temperature (1.0 where it did "
+            "not act).  A clamped sample's te_mean_ev is by construction the "
+            "upstream row's value rather than its own, so the two ports are "
+            "then one number and not two measurements.  The clamp only rewrites "
+            "a port that carries measured core cells where the MEASURED core "
+            "means are themselves non-monotonic; a port with no measured core "
+            "cells is reconstructed from its neighbours and the end boundaries, "
+            "and the prior is its only axial constraint."
+        ),
         core_x_min_cm=np.array(X_MIN_CM),
         core_x_max_cm=np.array(X_MAX_CM),
         probe_a_factor=np.array(factor),

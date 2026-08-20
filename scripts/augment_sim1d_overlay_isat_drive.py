@@ -1,4 +1,4 @@
-"""Append the raw drive-window Isat family to a sim1d overlay (v2/v3/v5/v7/v9/v11/v13).
+"""Append the raw drive-window Isat family to a sim1d overlay (v2..v15 odd).
 
 Adds ``isat_drive_*`` — the upstream ion-saturation current from the
 inter-sweep dead-time cells DURING the drive — to an existing
@@ -10,12 +10,13 @@ drive family is SCHEMA v4, superseding the 7h brief's "v3"), v5 (adds
 the per-port ``te_window_spread_frac``), v7 (adds
 the discharge shot-to-shot standard deviations), v9 (adds the
 flux-tube-averaged density and downstream-face Isat targets), v11
-(adds the ruled upstream-face Isat target), or v13 (the current export,
-which adds the flow-symmetrized geomean target).  A v5 input is written
-back as SCHEMA v6, a v7 as v8, a v9 as v10, a v11 as v12 and a v13 as
-v14, so each family's presence stays readable from the version alone; an
-augmented version is never itself an accepted input, which is what makes
-a second augmentation fail the gate.
+(adds the ruled upstream-face Isat target), v13 (adds the
+flow-symmetrized geomean target), or v15 (the current export, which adds
+the per-port ``te_core_mean_clamped`` record).  A v5 input is written
+back as SCHEMA v6, a v7 as v8, a v9 as v10, a v11 as v12, a v13 as v14
+and a v15 as v16, so each family's presence stays readable from the
+version alone; an augmented version is never itself an accepted input,
+which is what makes a second augmentation fail the gate.
 The consumer is
 ``bapsf-transport/cablp/scripts/compare_sim1d_es1.py --beta-collapse``
 (within-shot area guard + model-free sweep-chain consistency).
@@ -61,7 +62,7 @@ SEAM_WINDOW_MS = 0.25  # first slice of the decay trace used for the seam gate
 # drive family is appended.  Keys are the inputs this script will augment;
 # values are versions it will NOT re-accept, which is what makes an
 # already-augmented overlay fail the gate instead of being augmented twice.
-AUGMENTED_SCHEMA = {2: 4, 3: 4, 5: 6, 7: 8, 9: 10, 11: 12, 13: 14}
+AUGMENTED_SCHEMA = {2: 4, 3: 4, 5: 6, 7: 8, 9: 10, 11: 12, 13: 14, 15: 16}
 
 
 def _seam_gate(new: dict, decay_t, decay_mean, decay_sem) -> list[str]:
