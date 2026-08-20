@@ -1,7 +1,13 @@
+import json
+
+import h5py
 import numpy as np
 import pytest
 
 from scripts.fit_te_spatial import (
+    CONTROL_SOURCE_BAND,
+    CONTROL_SOURCE_LEGACY,
+    CONTROL_SOURCE_NONE,
     SEMI_QUANT_CORE_CONTROL,
     SEMI_QUANT_SUB_EV,
     SEMI_QUANT_WINDOW,
@@ -20,8 +26,10 @@ from scripts.fit_te_spatial import (
     _semi_quantitative_marks,
     _trust_model_for_ports,
     _window_spread_grids,
+    _legacy_dln,
     fill_te_cycle,
     load_window_band_spreads,
+    merge_legacy_x0_controls,
 )
 
 ADOPTED_SET_PORTS = (
@@ -458,7 +466,7 @@ def test_window_spreads_land_on_the_te_grid_cells_they_were_measured_at(tmp_path
     )
     x_cm = np.array([-11.0, 0.0, 11.0])
 
-    dln, control = _window_spread_grids(
+    dln, control, source = _window_spread_grids(
         x_cm, np.array([11, 50]), "1", load_window_band_spreads(path)
     )
 
@@ -468,6 +476,7 @@ def test_window_spreads_land_on_the_te_grid_cells_they_were_measured_at(tmp_path
     assert np.all(np.isnan(dln[1]))
     assert control[0] == pytest.approx(0.19)
     assert np.isnan(control[1])
+    assert source.tolist() == [CONTROL_SOURCE_BAND, CONTROL_SOURCE_NONE]
 
 
 def test_a_window_spread_off_the_te_grid_is_refused(tmp_path):
@@ -566,3 +575,167 @@ def test_the_window_sem_vanishes_where_nothing_is_marked():
     )
 
     assert np.all(sem == 0.0)
+
+
+# ---------------------------------------------------------------------------
+# The union of the two window-refit products, and its metric-identity guard
+# ---------------------------------------------------------------------------
+P_LOW = (3.0, 8.0, 15.0, 25.0, 35.0)
+F_HIGH = (0.05, 0.10, 0.15, 0.30, 0.50)
+
+
+def _grid_with_spread(dln, *, level=4.0):
+    """Return a 5 x 5 window grid whose ln(max/min) is exactly *dln*."""
+    grid = np.full((5, 5), level)
+    grid[0, 0] = level * np.exp(dln)
+    return grid
+
+
+def _write_legacy(path, ports, *, p_low=P_LOW, f_high=F_HIGH,
+                  plateau=(10.0, 19.5), recorded=None):
+    with h5py.File(path, "w") as hdf:
+        hdf.attrs["p_low"] = np.asarray(p_low, dtype=np.float64)
+        hdf.attrs["f_high"] = np.asarray(f_high, dtype=np.float64)
+        hdf.attrs["plateau_ms"] = np.asarray(plateau, dtype=np.float64)
+        for (set_id, port), dln in ports.items():
+            grid = _grid_with_spread(dln)
+            group = hdf.create_group(f"set{set_id}/port{port}")
+            group.attrs["dln_te_window"] = (
+                dln if recorded is None else recorded.get((set_id, port), dln)
+            )
+            group.create_dataset("te_window_ev", data=grid)
+    return path
+
+
+def _write_metadata(path, *, p_low=P_LOW, f_high=F_HIGH, plateau=(10.0, 19.5)):
+    path.write_text(json.dumps({
+        "window_p_low_percent": list(p_low),
+        "window_f_high_fraction": list(f_high),
+        "plateau_ms": list(plateau),
+    }))
+    return path
+
+
+def _band_spreads(ports):
+    return {
+        key: {"x_cm": np.empty(0), "dln": np.empty(0), "x0_dln": dln}
+        for key, dln in ports.items()
+    }
+
+
+def test_the_union_adds_a_port_the_band_pass_never_covered(tmp_path):
+    """ES3 has no band pass, so its x = 0 control can only come from the old product."""
+    legacy = _write_legacy(
+        tmp_path / "legacy.hdf5", {("1", 11): 0.19, ("3", 41): 2.146}
+    )
+    metadata = _write_metadata(tmp_path / "meta.json")
+
+    merged = merge_legacy_x0_controls(
+        _band_spreads({("1", 11): 0.19}), legacy, metadata
+    )
+
+    assert set(merged) == {("1", 11), ("3", 41)}
+    assert merged[("3", 41)]["x0_dln"] == pytest.approx(2.146)
+    assert merged[("3", 41)]["x0_source"] == CONTROL_SOURCE_LEGACY
+    assert merged[("3", 41)]["x_cm"].size == 0      # no per-cell band coverage
+
+
+def test_a_shared_port_keeps_the_band_products_own_value(tmp_path):
+    legacy = _write_legacy(tmp_path / "legacy.hdf5", {("1", 11): 0.19})
+    metadata = _write_metadata(tmp_path / "meta.json")
+    band = _band_spreads({("1", 11): 0.19})
+    band[("1", 11)]["x0_dln"] = 0.19 * (1.0 + 1e-9)   # same value, other platform
+
+    merged = merge_legacy_x0_controls(band, legacy, metadata)
+
+    assert merged[("1", 11)]["x0_dln"] == pytest.approx(0.19 * (1.0 + 1e-9))
+    assert merged[("1", 11)]["x0_source"] == CONTROL_SOURCE_BAND
+
+
+def test_the_guard_refuses_a_different_window_family(tmp_path):
+    legacy = _write_legacy(
+        tmp_path / "legacy.hdf5", {("1", 11): 0.19}, p_low=(3.0, 8.0, 15.0, 25.0, 40.0)
+    )
+    metadata = _write_metadata(tmp_path / "meta.json")
+
+    with pytest.raises(ValueError, match="not the same window sensitivity"):
+        merge_legacy_x0_controls(_band_spreads({("1", 11): 0.19}), legacy, metadata)
+
+
+def test_the_guard_refuses_a_different_plateau(tmp_path):
+    legacy = _write_legacy(
+        tmp_path / "legacy.hdf5", {("1", 11): 0.19}, plateau=(8.0, 19.5)
+    )
+    metadata = _write_metadata(tmp_path / "meta.json")
+
+    with pytest.raises(ValueError, match="not the same window sensitivity"):
+        merge_legacy_x0_controls(_band_spreads({("1", 11): 0.19}), legacy, metadata)
+
+
+def test_the_guard_recomputes_the_metric_and_refuses_a_relabelled_one(tmp_path):
+    """A product whose recorded number is not ln(max/min) of its own grid is refused."""
+    legacy = _write_legacy(
+        tmp_path / "legacy.hdf5",
+        {("1", 11): 0.19},
+        recorded={("1", 11): 0.42},
+    )
+    metadata = _write_metadata(tmp_path / "meta.json")
+
+    with pytest.raises(ValueError, match="not\\s+ln\\(max/min\\) over that grid"):
+        merge_legacy_x0_controls(_band_spreads({("1", 11): 0.19}), legacy, metadata)
+
+
+def test_the_guard_refuses_two_products_that_disagree_on_a_shared_port(tmp_path):
+    legacy = _write_legacy(tmp_path / "legacy.hdf5", {("1", 11): 0.19})
+    metadata = _write_metadata(tmp_path / "meta.json")
+
+    with pytest.raises(ValueError, match="not measuring the same quantity"):
+        merge_legacy_x0_controls(_band_spreads({("1", 11): 0.55}), legacy, metadata)
+
+
+def test_the_guard_refuses_a_product_it_cannot_check_against_anything(tmp_path):
+    legacy = _write_legacy(tmp_path / "legacy.hdf5", {("3", 41): 2.146})
+    metadata = _write_metadata(tmp_path / "meta.json")
+
+    with pytest.raises(ValueError, match="shares no set-port"):
+        merge_legacy_x0_controls(_band_spreads({("1", 11): 0.19}), legacy, metadata)
+
+
+def test_the_guard_refuses_a_grid_the_declared_family_does_not_fit(tmp_path):
+    legacy = tmp_path / "legacy.hdf5"
+    _write_legacy(legacy, {("1", 11): 0.19})
+    with h5py.File(legacy, "r+") as hdf:
+        del hdf["set1/port11/te_window_ev"]
+        hdf["set1/port11"].create_dataset("te_window_ev", data=np.full((4, 5), 4.0))
+    metadata = _write_metadata(tmp_path / "meta.json")
+
+    with pytest.raises(ValueError, match="window family implies"):
+        merge_legacy_x0_controls(_band_spreads({("1", 11): 0.19}), legacy, metadata)
+
+
+def test_the_shared_metric_is_the_log_of_the_grid_extremes():
+    assert _legacy_dln(_grid_with_spread(0.75)) == pytest.approx(0.75)
+    assert np.isnan(_legacy_dln(np.full((5, 5), np.nan)))
+
+
+def test_a_legacy_only_control_marks_that_ports_core(tmp_path):
+    """The ES3 p41/p50 rider: the old product's control marks the core, sem only."""
+    legacy = _write_legacy(
+        tmp_path / "legacy.hdf5", {("1", 11): 0.19, ("3", 41): 2.146}
+    )
+    metadata = _write_metadata(tmp_path / "meta.json")
+    merged = merge_legacy_x0_controls(
+        _band_spreads({("1", 11): 0.19}), legacy, metadata
+    )
+    x_cm = np.array([-11.0, 0.0, 11.0])
+    dln, control, source = _window_spread_grids(x_cm, np.array([41]), "3", merged)
+    te = np.full((1, 3, 1), 2.0)
+
+    reason, inflating = _semi_quantitative_marks(
+        te, x_cm, dln, control, core_x_cm=10.0
+    )
+
+    assert source.tolist() == [CONTROL_SOURCE_LEGACY]
+    assert reason[0, 1, 0] & SEMI_QUANT_CORE_CONTROL      # x = 0 is in the core
+    assert not reason[0, 0, 0] and not reason[0, 2, 0]    # |x| = 11 is not
+    assert inflating[0, 1] == pytest.approx(2.146)

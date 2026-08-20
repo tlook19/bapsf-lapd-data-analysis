@@ -336,6 +336,8 @@ def _write_te_records(path, *, omit=(), core_band=(X_MIN_CM, X_MAX_CM)):
         "te_semi_quantitative_core_count": np.zeros((5, 3), dtype=np.int16),
         "te_semi_quantitative_band_count": np.zeros((5, 3), dtype=np.int16),
         "te_core_window_sem_ev": np.zeros((5, 3)),
+        "te_window_dln_core_control": np.array([0.19, 0.24, 0.17, 2.146, 3.049]),
+        "te_window_dln_core_control_source": np.array([1, 1, 1, 2, 2], dtype=np.int8),
     }
     with h5py.File(path, "w") as hdf:
         group = hdf.create_group("experiment_sets/1")
@@ -348,6 +350,7 @@ def _write_te_records(path, *, omit=(), core_band=(X_MIN_CM, X_MAX_CM)):
         group.attrs["te_trust_model"] = "trust model"
         group.attrs["te_semi_quantitative_rule"] = "semi-quantitative rule"
         group.attrs["te_core_window_sem_definition"] = "window sem"
+        group.attrs["te_window_core_control_source_codes"] = "0 none, 1 band, 2 original"
     return path
 
 
@@ -360,6 +363,8 @@ def test_te_records_are_read_off_the_filled_product(tmp_path):
     assert records["trust_radius_cm"].tolist() == [18.415] * 4 + [10.0]
     assert records["trust_blend_cm"].tolist() == [20.2] * 4 + [15.0]
     assert records["trust_model"] == "trust model"
+    assert records["core_control_dln"].tolist() == [0.19, 0.24, 0.17, 2.146, 3.049]
+    assert records["core_control_source"].tolist() == [1, 1, 1, 2, 2]
 
 
 @pytest.mark.parametrize("missing", REQUIRED_TE_RECORDS)

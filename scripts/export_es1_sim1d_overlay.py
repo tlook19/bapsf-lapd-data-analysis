@@ -730,6 +730,8 @@ REQUIRED_TE_RECORDS = (
     "te_semi_quantitative_core_count",
     "te_semi_quantitative_band_count",
     "te_core_window_sem_ev",
+    "te_window_dln_core_control",
+    "te_window_dln_core_control_source",
 )
 
 
@@ -783,6 +785,15 @@ def _te_trust_records(
         ),
         "window_sem_ev": np.asarray(
             te_group["te_core_window_sem_ev"][()], dtype=np.float64
+        ),
+        "core_control_dln": np.asarray(
+            te_group["te_window_dln_core_control"][()], dtype=np.float64
+        ),
+        "core_control_source": np.asarray(
+            te_group["te_window_dln_core_control_source"][()], dtype=np.int8
+        ),
+        "core_control_source_codes": str(
+            te_group.attrs["te_window_core_control_source_codes"]
         ),
         "trust_model": str(te_group.attrs["te_trust_model"]),
         "semi_quant_rule": str(te_group.attrs["te_semi_quantitative_rule"]),
@@ -982,7 +993,7 @@ def export_overlay(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        schema_version=np.array(17, dtype=np.int16),
+        schema_version=np.array(19, dtype=np.int16),
         experiment_set_id=np.array(experiment_set_id, dtype=np.int16),
         experiment_label=np.array(experiment_label),
         port=PORTS,
@@ -1006,7 +1017,11 @@ def export_overlay(
             "only where a core cell is semi-quantitative for its measured "
             "window spread; see te_window_sem_definition and "
             "te_semi_quantitative_rule.  Schema v15 and earlier carried the "
-            "radial term alone under the name te_sem_ev."
+            "radial term alone under the name te_sem_ev.  Schema v17 read the "
+            "x = 0 core control from the band product only, so the two ES3 "
+            "ports whose control fails were silent there; v19 reads it from "
+            "the union of both window-refit products, and te_core_control_dln "
+            "and te_core_control_source say which product spoke per port."
         ),
         te_window_sem_definition=np.array(te_records["window_sem_definition"]),
         te_trust_radius_cm=te_records["trust_radius_cm"],
@@ -1015,6 +1030,11 @@ def export_overlay(
         te_semi_quantitative_core_count=te_records["semi_quant_core_count"],
         te_semi_quantitative_band_count=te_records["semi_quant_band_count"],
         te_semi_quantitative_rule=np.array(te_records["semi_quant_rule"]),
+        te_core_control_dln=te_records["core_control_dln"],
+        te_core_control_source=te_records["core_control_source"],
+        te_core_control_source_codes=np.array(
+            te_records["core_control_source_codes"]
+        ),
         te_semi_quantitative_definition=np.array(
             "te_semi_quantitative_core_count[port, sample] counts the cells "
             f"inside the core band ({X_MIN_CM:g} to {X_MAX_CM:g} cm) behind "
