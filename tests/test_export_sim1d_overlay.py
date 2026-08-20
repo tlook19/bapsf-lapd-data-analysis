@@ -14,7 +14,9 @@ from scripts.export_es1_sim1d_overlay import (
     _flux_tube_weights,
     _rot0_isat_profiles,
     _subtract_background,
+    _te_trust_records,
     _te_window_spread_frac,
+    REQUIRED_TE_RECORDS,
 )
 from scripts.plot_core_density_temperature_timeseries import _nan_core_stats
 
@@ -320,3 +322,95 @@ def test_geomean_refuses_two_readings_of_the_same_face():
         _flow_symmetrized_profiles(
             _face("i_sweep", 2.0), _face("i_sweep", 3.0), AREAS
         )
+
+
+# ---------------------------------------------------------------------------
+# The filled T_e product's trust and semi-quantitative records
+# ---------------------------------------------------------------------------
+def _write_te_records(path, *, omit=(), core_band=(X_MIN_CM, X_MAX_CM)):
+    records = {
+        "core_mean_te_monotonic_clamped": np.zeros((5, 3), dtype=bool),
+        "core_mean_te_monotonic_scale": np.ones((5, 3)),
+        "te_trust_radius_cm": np.array([18.415, 18.415, 18.415, 18.415, 10.0]),
+        "te_trust_blend_cm": np.array([20.2, 20.2, 20.2, 20.2, 15.0]),
+        "te_semi_quantitative_core_count": np.zeros((5, 3), dtype=np.int16),
+        "te_semi_quantitative_band_count": np.zeros((5, 3), dtype=np.int16),
+        "te_core_window_sem_ev": np.zeros((5, 3)),
+        "te_window_dln_core_control": np.array([0.19, 0.24, 0.17, 2.146, 3.049]),
+        "te_window_dln_core_control_source": np.array([1, 1, 1, 2, 2], dtype=np.int8),
+        "te_row_measured_cells": np.array(
+            [[7, 7, 7], [7, 7, 7], [7, 7, 7], [0, 0, 0], [0, 0, 0]], dtype=np.int16
+        ),
+        "te_row_measured_core_cells": np.array(
+            [[5, 5, 5], [5, 5, 5], [5, 5, 5], [0, 0, 0], [0, 0, 0]], dtype=np.int16
+        ),
+    }
+    with h5py.File(path, "w") as hdf:
+        group = hdf.create_group("experiment_sets/1")
+        for name, value in records.items():
+            if name in omit:
+                continue
+            group.create_dataset(name, data=value)
+        group.attrs["te_core_window_sem_x_min_cm"] = core_band[0]
+        group.attrs["te_core_window_sem_x_max_cm"] = core_band[1]
+        group.attrs["te_trust_model"] = "trust model"
+        group.attrs["te_semi_quantitative_rule"] = "semi-quantitative rule"
+        group.attrs["te_core_window_sem_definition"] = "window sem"
+        group.attrs["te_window_core_control_source_codes"] = "0 none, 1 band, 2 original"
+        group.attrs["te_row_provenance_definition"] = "row provenance"
+        group.attrs["te_qc_floor_rule"] = "qc floor"
+    return path
+
+
+def test_te_records_are_read_off_the_filled_product(tmp_path):
+    path = _write_te_records(tmp_path / "te_filled.hdf5")
+
+    with h5py.File(path, "r") as hdf:
+        records = _te_trust_records(hdf["experiment_sets/1"], path, 1)
+
+    assert records["trust_radius_cm"].tolist() == [18.415] * 4 + [10.0]
+    assert records["trust_blend_cm"].tolist() == [20.2] * 4 + [15.0]
+    assert records["trust_model"] == "trust model"
+    assert records["core_control_dln"].tolist() == [0.19, 0.24, 0.17, 2.146, 3.049]
+    assert records["core_control_source"].tolist() == [1, 1, 1, 2, 2]
+    assert records["row_measured_cells"][:, 0].tolist() == [7, 7, 7, 0, 0]
+    assert records["row_measured_core_cells"][:, 0].tolist() == [5, 5, 5, 0, 0]
+
+
+def test_a_row_with_no_measured_cell_is_flagged_prior_derived(tmp_path):
+    """The seven blanked exception ports must not read as measured ports."""
+    path = _write_te_records(tmp_path / "te_filled.hdf5")
+
+    with h5py.File(path, "r") as hdf:
+        records = _te_trust_records(hdf["experiment_sets/1"], path, 1)
+    measured = records["row_measured_cells"] > 0
+
+    assert measured[:, 0].tolist() == [True, True, True, False, False]
+    assert not measured[3].any() and not measured[4].any()
+
+
+@pytest.mark.parametrize("missing", REQUIRED_TE_RECORDS)
+def test_the_export_refuses_a_product_missing_a_required_record(tmp_path, missing):
+    path = _write_te_records(tmp_path / "te_filled.hdf5", omit=(missing,))
+
+    with h5py.File(path, "r") as hdf:
+        with pytest.raises(ValueError, match=f"carries no {missing} record"):
+            _te_trust_records(hdf["experiment_sets/1"], path, 1)
+
+
+def test_the_export_refuses_a_window_uncertainty_from_a_different_core_band(tmp_path):
+    path = _write_te_records(tmp_path / "te_filled.hdf5", core_band=(-18.415, 18.415))
+
+    with h5py.File(path, "r") as hdf:
+        with pytest.raises(ValueError, match="mixes bands"):
+            _te_trust_records(hdf["experiment_sets/1"], path, 1)
+
+
+def test_the_exported_te_sem_adds_the_window_term_in_quadrature():
+    radial = np.array([[0.30, 0.40]])
+    window = np.array([[0.40, 0.00]])
+
+    combined = np.hypot(radial, np.nan_to_num(window, nan=0.0))
+
+    assert combined[0, 0] == pytest.approx(0.5)
+    assert combined[0, 1] == pytest.approx(0.4)

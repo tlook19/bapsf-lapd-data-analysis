@@ -1,4 +1,4 @@
-"""Append the raw drive-window Isat family to a sim1d overlay (v2/v3/v5/v7/v9/v11/v13).
+"""Append the raw drive-window Isat family to a sim1d overlay (v2..v21 odd).
 
 Adds ``isat_drive_*`` — the upstream ion-saturation current from the
 inter-sweep dead-time cells DURING the drive — to an existing
@@ -10,12 +10,20 @@ drive family is SCHEMA v4, superseding the 7h brief's "v3"), v5 (adds
 the per-port ``te_window_spread_frac``), v7 (adds
 the discharge shot-to-shot standard deviations), v9 (adds the
 flux-tube-averaged density and downstream-face Isat targets), v11
-(adds the ruled upstream-face Isat target), or v13 (the current export,
-which adds the flow-symmetrized geomean target).  A v5 input is written
-back as SCHEMA v6, a v7 as v8, a v9 as v10, a v11 as v12 and a v13 as
-v14, so each family's presence stays readable from the version alone; an
-augmented version is never itself an accepted input, which is what makes
-a second augmentation fail the gate.
+(adds the ruled upstream-face Isat target), v13 (adds the
+flow-symmetrized geomean target), v15 (adds the per-port
+``te_core_mean_clamped`` record), v17 (adds the per-port trust model and
+the semi-quantitative T_e records, and splits ``te_sem_ev`` into a radial
+and a fit-window term), v19 (adds the x = 0 core control read from the union of both
+window-refit products, ``te_core_control_dln``/``te_core_control_source``),
+or v21 (the current export, which adds the per-port measured vs
+prior-derived provenance record ``te_row_measured`` and the
+radius-conditional QC floor statement).  A v5 input is
+written back as SCHEMA v6, a v7 as v8, a v9 as v10, a v11 as v12, a v13
+as v14, a v15 as v16, a v17 as v18, a v19 as v20 and a v21 as v22, so
+each family's presence stays readable from the
+version alone; an augmented version is never itself an accepted input,
+which is what makes a second augmentation fail the gate.
 The consumer is
 ``bapsf-transport/cablp/scripts/compare_sim1d_es1.py --beta-collapse``
 (within-shot area guard + model-free sweep-chain consistency).
@@ -61,7 +69,10 @@ SEAM_WINDOW_MS = 0.25  # first slice of the decay trace used for the seam gate
 # drive family is appended.  Keys are the inputs this script will augment;
 # values are versions it will NOT re-accept, which is what makes an
 # already-augmented overlay fail the gate instead of being augmented twice.
-AUGMENTED_SCHEMA = {2: 4, 3: 4, 5: 6, 7: 8, 9: 10, 11: 12, 13: 14}
+AUGMENTED_SCHEMA = {
+    2: 4, 3: 4, 5: 6, 7: 8, 9: 10, 11: 12, 13: 14, 15: 16, 17: 18, 19: 20,
+    21: 22,
+}
 
 
 def _seam_gate(new: dict, decay_t, decay_mean, decay_sem) -> list[str]:

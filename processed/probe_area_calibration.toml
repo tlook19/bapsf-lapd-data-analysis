@@ -5,31 +5,32 @@
 #
 # A_p_L: left (upstream) face area — Isweep channel
 # A_p_R: right (downstream) face area — Isat channel
-# Probe A: base/reference area copied from probe B. Apply the canonical
-# empirical factor in config/may2026_probe_a_area_calibration.toml once to raw
-# Probe A current in every downstream density/Mach workflow.
+# Probe A: base/reference area copied from probe B; apply the canonical
+# empirical factor in config/may2026_probe_a_area_calibration.toml once
+# to raw Probe A current in every downstream density/Mach workflow.
 
 [probe_A]
-ap_L_cm2 = 0.050614
-ap_R_cm2 = 0.053233
-ap_L_std_cm2 = 0.001540
-ap_R_std_cm2 = 0.001144
+ap_L_cm2 = 0.050926
+ap_R_cm2 = 0.055451
+ap_L_std_cm2 = 0.001849
+ap_R_std_cm2 = 0.001610
 estimated = true  # base/reference area copied from probe B
 
 [probe_B]
-ap_L_cm2 = 0.050614
-ap_R_cm2 = 0.053233
-ap_L_std_cm2 = 0.001540
-ap_R_std_cm2 = 0.001144
+ap_L_cm2 = 0.050926
+ap_R_cm2 = 0.055451
+ap_L_std_cm2 = 0.001849
+ap_R_std_cm2 = 0.001610
 
 [probe_C]
-ap_L_cm2 = 0.045589
-ap_R_cm2 = 0.050461
-ap_L_std_cm2 = 0.001461
-ap_R_std_cm2 = 0.001362
+ap_L_cm2 = 0.045878
+ap_R_cm2 = 0.051125
+ap_L_std_cm2 = 0.001750
+ap_R_std_cm2 = 0.001640
 
 [probe_D]
-ap_L_cm2 = 0.059149
-ap_R_cm2 = 0.056133
-ap_L_std_cm2 = 0.001354
-ap_R_std_cm2 = 0.001102
+ap_L_cm2 = 0.058810
+ap_R_cm2 = 0.056333
+ap_L_std_cm2 = 0.001508
+ap_R_std_cm2 = 0.001230
+

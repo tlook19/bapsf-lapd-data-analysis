@@ -8,6 +8,34 @@ in x and at the cathode/anode ends in z, then fills all NaN cells using a
 The resulting te_filled array is intended for probe-area calibration and
 density analysis where a continuous T_e map is required.
 
+Inside the trusted radius the fill fills gaps: a cell that carries a finite
+measurement keeps its measured value, and the surface is used only where there
+is no measurement.  The sentinels are enforced near-exactly while data points
+carry a finite smoothing, so a fitted surface is otherwise free to sit below a
+measured row in order to reach the imposed end-plate temperature, and it does
+so by an amount that grows towards the ends -- a z-dependent bias on rows that
+have data.  Beyond the trusted radius the scrape-off-layer prior is intended and
+is left in place; the two are blended across a ramp.  See ``fill_te_cycle``.
+
+How far that trusted radius reaches is a per-port, measured question, and the
+answer is read off ``TRUST_MODEL_BY_SET_PORT``.  At the eight set-ports whose
+band-wide fit-window sensitivity was measured and passed
+(``scripts/refit_window_band.py``) the measurement is authoritative out to the
+cathode frame aperture; everywhere else the historical 10 cm core stands.  See
+``_trust_model_for_ports``.
+
+A cell is additionally marked SEMI-QUANTITATIVE where the measurement is at the
+diagnostic's limit -- sub-eV ``T_e``, or a fit-window spread at or above
+``SEMI_QUANTITATIVE_DLN`` in the band product.  A marked cell KEEPS its measured
+value; the marking is an uncertainty statement, not a mask.  See
+``_semi_quantitative_marks``.
+
+The core-mean monotonic-z clamp that runs after the fill is likewise judged on
+the measurement: it rewrites a measured row only where the MEASURED core means
+are themselves non-monotonic, and applies unconditionally only to rows that
+have no measured core cells and are therefore reconstructed.  See
+``_enforce_core_mean_monotonic_z``.
+
 Boundary conditions
 -------------------
   |x| = X_WALL_CM   →  T_e = TE_BOUNDARY_EV  (drift-tube wall)
@@ -26,7 +54,23 @@ processed/te_filled.hdf5
     z_cm            (n_z,)
     cycle_time_ms   (n_cycles,)
     te_masked       (n_z, n_x, n_cycles)   strict-masked data (NaN where hidden)
-    te_filled       (n_z, n_x, n_cycles)   RBF-interpolated, boundary-filled
+    te_filled       (n_z, n_x, n_cycles)   measured cells, RBF fill elsewhere
+    core_mean_te_monotonic_clamped (n_z, n_cycles)  where the clamp acted
+    core_mean_te_monotonic_scale   (n_z, n_cycles)  factor it applied (1 = none)
+    te_trust_radius_cm  (n_z,)   measurement-authoritative |x| for that port
+    te_trust_blend_cm   (n_z,)   |x| beyond which the prior is used alone
+    te_window_dln       (n_z, n_x)  measured fit-window spread, NaN where none
+    te_window_dln_core_control (n_z,)  the port's x = 0 window spread
+    te_window_dln_core_control_source (n_z,)  0 none, 1 band, 2 original x=0
+    te_window_dln_inflating    (n_z, n_x)  the spread that marked a cell
+    te_semi_quantitative       (n_z, n_x, n_cycles)  bool
+    te_semi_quantitative_reason(n_z, n_x, n_cycles)  bit 1 sub-eV, 2 window,
+                                                     4 core control
+    te_semi_quantitative_core_count (n_z, n_cycles)  marked cells in the core
+    te_semi_quantitative_band_count (n_z, n_cycles)  marked cells in the band
+    te_core_window_sem_ev           (n_z, n_cycles)  window term for the SEM
+    te_row_measured_cells           (n_z, n_cycles)  measured cells behind a row
+    te_row_measured_core_cells      (n_z, n_cycles)  of those, inside the core
 
 figures/te_filled_expset{es_id}.png
   Masked vs filled T_e at four representative cycles.
@@ -42,7 +86,10 @@ Usage
 from __future__ import annotations
 
 import argparse
+import csv
+import json
 import sys
+import warnings
 from pathlib import Path
 
 import h5py
@@ -57,6 +104,29 @@ from scipy.interpolate import RBFInterpolator
 HDF5_INPUT  = Path("processed/langmuir_sweeps.hdf5")
 HDF5_OUTPUT = Path("processed/te_filled.hdf5")
 ISWEEP_DEADTIME_INPUT = Path("processed/isweep_deadtime_profiles.hdf5")
+#: Per-cell fit-window spreads across the measurement band, written by
+#: ``scripts/refit_window_band.py``.  Tracked, because the trust model below
+#: conditions on it and a fresh checkout has to be able to reproduce the fill.
+WINDOW_BAND_INPUT = Path("processed/window_refit_band_summary.csv")
+#: The band product's protocol record, which carries the window family and the
+#: plateau the metric-identity guard checks the older product against.
+WINDOW_BAND_METADATA = Path("processed/window_refit_band_metadata.json")
+#: The ORIGINAL x = 0 window-refit product (2026-07-22).  It measures the same
+#: quantity over the same window family as the band product, but covers
+#: experiment sets 1-3 rather than 1-2, so it is the only evidence there is
+#: about the x = 0 window control at ES3.  Read for the core-control marking
+#: only, and only once the metric-identity guard has passed; gitignored like
+#: the other large derived products and regenerated by refit_sweep_windows.py.
+LEGACY_WINDOW_REFITS = Path("processed/sweep_window_refits.hdf5")
+#: Relative tolerance the two products' x = 0 controls must agree to for the
+#: metric-identity guard to accept them as the same quantity.  Exact equality
+#: is not available: the older product was computed on macOS/arm64 before the
+#: 2026-08-16 desktop migration and the band product on linux-64, and the two
+#: ISAs contract floating-point expressions differently.  The measured
+#: disagreement over the ten overlapping set-ports is 1.4e-8; 1e-6 is two
+#: orders looser than that and many orders tighter than any change of
+#: definition could hide under.
+WINDOW_METRIC_RTOL = 1.0e-6
 OUTPUT_DIR  = Path("figures")
 
 PORT_SPACING_CM = 31.95   # from config.py
@@ -115,19 +185,216 @@ MONO_Z_PADDING  = 0.25
 CORE_HOTSPOT_CURRENT_SIGMA = 3.0
 CORE_HOTSPOT_CURRENT_RATIO = 1.25
 
+# ---------------------------------------------------------------------------
+# Trust model: how far out the measurement is authoritative, per set-port
+# ---------------------------------------------------------------------------
+#: Outer radius of the measurement-authoritative band at an adopting port: half
+#: the caliper-measured 14.5 in cathode frame aperture (36.830 cm diameter,
+#: 2026-08-17).  Field lines inside the aperture-mapped radius connect to the
+#: source, so this is the radius across which T_e has a reason to be flat, and
+#: it is the same radius the flux-tube average in the overlay export uses.
+X_TRUST_APERTURE_CM = 18.415
+#: Outer end of the blend at an adopting port.  The measured column edge is
+#: bracketed at 18.9--20.2 cm; taking the far end as the point where the prior
+#: stands alone is a stated CONVENTION, not a measurement.
+X_TRUST_BLEND_CM = 20.2
+
+#: The measurement-authoritative radius and the outer end of the blend, keyed by
+#: (experiment set id, port).  A set-port that is not listed keeps the
+#: historical (X_CORE_CM, X_EDGE_CM) model, so the table is a declared adoption
+#: list rather than a set of scattered conditionals and an unlisted port cannot
+#: change behaviour by accident.
+#:
+#: The eight listed set-ports are the ones whose in-band per-cell fit-window
+#: spread was measured across the band and passed the pre-declared criterion
+#: (median dln_te_window < SEMI_QUANTITATIVE_DLN; medians 0.107--0.288).  Both
+#: p50 rows FAILED it (1.056 and 2.688) and keep the 10 cm model; experiment
+#: sets 3 and 4 were never measured across the band and keep it as well.
+TRUST_MODEL_BY_SET_PORT = {
+    ("1", 11): (X_TRUST_APERTURE_CM, X_TRUST_BLEND_CM),
+    ("1", 21): (X_TRUST_APERTURE_CM, X_TRUST_BLEND_CM),
+    ("1", 29): (X_TRUST_APERTURE_CM, X_TRUST_BLEND_CM),
+    ("1", 41): (X_TRUST_APERTURE_CM, X_TRUST_BLEND_CM),
+    ("2", 11): (X_TRUST_APERTURE_CM, X_TRUST_BLEND_CM),
+    ("2", 21): (X_TRUST_APERTURE_CM, X_TRUST_BLEND_CM),
+    ("2", 29): (X_TRUST_APERTURE_CM, X_TRUST_BLEND_CM),
+    ("2", 41): (X_TRUST_APERTURE_CM, X_TRUST_BLEND_CM),
+}
+
+# ---------------------------------------------------------------------------
+# Semi-quantitative marking
+# ---------------------------------------------------------------------------
+#: A filled T_e below this is at the swept diagnostic's low-temperature limit
+#: and is semi-quantitative by the standing convention.
+SEMI_QUANTITATIVE_TE_EV = 1.0
+#: A measured fit-window spread ln(Te_max / Te_min) at or above this makes the
+#: cell semi-quantitative.  It is the same threshold as the band product's
+#: per-port pass criterion, applied cell by cell.
+SEMI_QUANTITATIVE_DLN = 0.50
+
+#: Bit flags recorded in ``te_semi_quantitative_reason``.
+SEMI_QUANT_SUB_EV = 1
+SEMI_QUANT_WINDOW = 2
+SEMI_QUANT_CORE_CONTROL = 4
+
+#: What the trust model is, stated once so the product carries it verbatim.
+TRUST_MODEL_STATEMENT = (
+    "The filled T_e reports the MEASUREMENT out to te_trust_radius_cm, blends "
+    "measurement into the scrape-off-layer prior linearly from there to "
+    "te_trust_blend_cm, and reports the prior alone beyond it; a cell with no "
+    "surviving measurement takes the fitted surface at every radius.  The "
+    f"radius is {X_TRUST_APERTURE_CM:g} cm -- half the caliper-measured 14.5 in "
+    f"cathode frame aperture -- with the blend closing at {X_TRUST_BLEND_CM:g} "
+    "cm at the set-ports listed in te_trust_adopted_ports, and the historical "
+    "10 cm core elsewhere.  The adoption list is per PORT, not per radius and "
+    "not inherited across a set: it is the eight set-ports whose per-cell "
+    "fit-window spread was measured across the band and passed the "
+    "pre-declared criterion.  The outer blend radius is the far end of the "
+    "18.9-20.2 cm measured column-edge bracket and is a stated CONVENTION.  "
+    "The per-point RBF smoothing zone is unchanged by the adoption, so the "
+    "fitted surface is the same one an unadopted port would have seen."
+)
+
+#: Beyond this radius a measured cell must clear ``QC_FLOOR_MIN_N_OK`` before
+#: its value is allowed into the filled product.  It is the aperture radius:
+#: inside it the trust extension rests on a measured, band-wide window
+#: sensitivity; outside it the measurement is only ever partially carried, and
+#: how much evidence stands behind a cell has to be asked separately.
+QC_FLOOR_RADIUS_CM = X_TRUST_APERTURE_CM
+#: Minimum surviving-cycle count for a measured cell beyond
+#: ``QC_FLOOR_RADIUS_CM``.  Four is the boundary of the pathology it targets:
+#: the far-band junk cells are backed by one to three surviving cycles against
+#: fifteen to nineteen that only warned, where one survivor outvotes zero
+#: failures and the majority rule cannot see it.
+QC_FLOOR_MIN_N_OK = 4
+
+#: What the radius-conditional floor is, stated once so the product carries it.
+QC_FLOOR_RULE = (
+    f"Beyond |x| = {QC_FLOOR_RADIUS_CM:g} cm a measured cell is carried into "
+    f"the filled product only if at least {QC_FLOOR_MIN_N_OK} of its cycles "
+    "survived QC.  The floor gates the measurement's WEIGHT IN THE FILL, not "
+    "its use as an interpolation constraint: the cell still informs the RBF "
+    "surface, so the fitted surface is unchanged and no port can be moved by "
+    "a neighbour's gated cell.  One rule, stated by radius rather than by "
+    "port.  It can only bite where the measurement still has weight beyond "
+    "the aperture, which is exactly the ports that adopted the aperture trust "
+    "radius; every other port has weight identically zero there and is "
+    "untouched by construction rather than by exemption.  A cell backed by "
+    "several rot-0 runs is judged on the best-supported of them."
+)
+
+#: What the per-row provenance record means, stated once for the same reason.
+ROW_PROVENANCE_STATEMENT = (
+    "te_row_measured_cells[port, sample] counts the QC-surviving measured "
+    "cells behind that row at that sample, over the whole scan, and "
+    "te_row_measured_core_cells counts those inside the core band the "
+    "exported T_e statistics are taken over.  A row with ZERO measured cells "
+    "is PRIOR-DERIVED: it was reconstructed entirely from neighbouring rows, "
+    "the scrape-off-layer anchors and the end-plate sentinels, and its T_e is "
+    "not a measurement of that port.  Rows reach that state two ways, and the "
+    "count sees both: an experiment set whose later ports approach the swept "
+    "diagnostic's low-temperature limit has them blanked before the fill "
+    "(excluded_unreliable_te_ports), and a row too sparsely sampled to "
+    "constrain the interpolant is dropped by the coverage threshold.  Read "
+    "this before treating a port's T_e or anything derived from it as an "
+    "independent measurement."
+)
+
+#: What the semi-quantitative class is, stated once for the same reason.
+SEMI_QUANTITATIVE_STATEMENT = (
+    "A cell is semi-quantitative when its filled T_e is below "
+    f"{SEMI_QUANTITATIVE_TE_EV:g} eV (the swept diagnostic's low-temperature "
+    "limit), OR its own measured fit-window spread ln(Te_max/Te_min) is at or "
+    f"above {SEMI_QUANTITATIVE_DLN:g}, OR its port's x = 0 window control is, "
+    "in which case that port's whole core is marked.  The control is read from "
+    "the UNION of the two window-refit products -- the band product and the "
+    "original x = 0 product, which between them cover experiment sets 1-3 -- "
+    "so a port is marked wherever its control fails and not according to which "
+    "product happened to measure it; the two are proved to be the same "
+    "quantity before the union is taken, and the source is recorded per port "
+    "in te_window_dln_core_control_source.  te_semi_quantitative_"
+    "reason records which, as bits 1, 2 and 4.  A marked cell KEEPS its "
+    "measured value: the class is an uncertainty statement and NOT a mask -- "
+    "the defect being corrected was a prior overriding measurements.  One rule "
+    "everywhere, no port special cases and no second trust radius."
+)
+
+#: What the window term added to the T_e uncertainty is.
+CORE_WINDOW_SEM_STATEMENT = (
+    "te_core_window_sem_ev is the core-band T_e uncertainty contributed by the "
+    "fit-window convention, in eV.  A cell whose measured spread is d = "
+    "ln(Te_max/Te_min) has half-spread T * sinh(d/2) about the window family's "
+    "geometric centre; the window convention is one choice applied to every "
+    "cell at once, so those half-spreads are fully correlated and are averaged "
+    "(not added in quadrature) over the core band, with an unmarked cell "
+    "contributing zero.  A cell marked only for being sub-eV contributes "
+    "nothing here: it has no measured window spread, and its rider is the "
+    "standing sub-eV one.  Combine with the radial SEM in quadrature -- the "
+    "two are independent."
+)
+
 CMAP            = "plasma"
 
 
 # ---------------------------------------------------------------------------
-# Data loading (strict mask: n_bad > n_ok)
+# Data loading and the QC gate
 # ---------------------------------------------------------------------------
+#: The QC rule, stated once so the product can carry it verbatim.
+QC_RULE = (
+    "a cell survives when the surviving-cycle count is at least the failed "
+    "count, n_ok >= n_bad, in the contributing rot-0 run; a cell excluded in "
+    "every contributing run is NaN.  Applied at ALL radii, so the band the "
+    "trust model now treats as authoritative is gated by the same rule as the "
+    "core rather than by inspection.  n_ok and n_bad are the per-cell severity "
+    "counts from evaluate_langmuir_quality; cells where every cycle only "
+    "warned (n_ok = n_bad = 0) survive, as do ties."
+)
+
+
+def _qc_surviving_cells(n_ok: np.ndarray, n_bad: np.ndarray) -> np.ndarray:
+    """Return the boolean mask of cells that pass QC.
+
+    The single definition of which cells the fill is allowed to read, applied
+    at every radius.  A cell passes when its surviving-cycle count is at least
+    its failed count; see ``QC_RULE`` for the exact statement, including what
+    happens to ties and to cells whose cycles only warned.
+    """
+    return np.asarray(n_ok) >= np.asarray(n_bad)
+
+
+def measured_weight_allowed(
+    n_ok: np.ndarray,
+    x_cm: np.ndarray,
+    *,
+    floor_radius_cm: float = QC_FLOOR_RADIUS_CM,
+    min_n_ok: int = QC_FLOOR_MIN_N_OK,
+) -> np.ndarray:
+    """Return where a measured cell may carry weight in the fill.
+
+    ``n_ok`` is the surviving-cycle count behind each cell, shaped
+    ``(n_z, n_x, n_cycles)``; ``x_cm`` indexes its second axis.  Inside
+    *floor_radius_cm* every cell is allowed and the answer is True; outside it
+    a cell needs at least *min_n_ok* surviving cycles.  See ``QC_FLOOR_RULE``.
+
+    This is a statement about the FILL's weighting, not about the data: a cell
+    that fails still enters the RBF as an interpolation constraint, so the
+    fitted surface is untouched and the gate cannot propagate between ports.
+    """
+    inside = np.abs(np.asarray(x_cm)) <= floor_radius_cm
+    return inside[np.newaxis, :, np.newaxis] | (
+        np.asarray(n_ok) >= min_n_ok
+    )
+
+
 def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
-    """Load strict-masked T_e(n_z, n_x, n_cycles) for one experiment set.
+    """Load QC-masked T_e(n_z, n_x, n_cycles) for one experiment set.
 
     Only rot=0 runs are used.  Probe shadowing makes rot=180 measurements
     unreliable for T_e (the downstream face sits in the probe's own shadow).
     The rotation_deg attribute reflects any known swap corrections (e.g. ES3
     p21 runs 32/33).
+
+    Which cells survive is ``_qc_surviving_cells``; the rule is ``QC_RULE``.
     """
     x_cm = hf["x_cm"][:]
     eg   = hf["experiment_sets"][es_id]
@@ -160,18 +427,27 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
     n_x      = len(x_cm)
     n_cycles = len(cycle_time_s)
     te_grid  = np.full((n_z, n_x, n_cycles), np.nan)
+    n_ok_grid = np.zeros((n_z, n_x, n_cycles), dtype=np.int32)
+    n_qc_excluded = 0
 
     for zi, z in enumerate(z_vals):
         te_sum = np.zeros((n_x, n_cycles))
         weight = np.zeros((n_x, n_cycles))
         mask_bad = np.zeros((n_x, n_cycles), dtype=bool)
+        best_n_ok = np.zeros((n_x, n_cycles), dtype=np.int32)
 
         for te, n_ok, n_bad in z_groups[z]:
-            cell_bad = n_bad > n_ok          # strict mask
+            cell_bad = ~_qc_surviving_cells(n_ok, n_bad)
+            n_qc_excluded += int(cell_bad.sum())
             mask_bad |= cell_bad
             valid     = ~cell_bad
             te_sum   += np.where(valid, te, 0.0)
             weight   += valid.astype(float)
+            # The surviving-cycle count standing behind the cell: the best
+            # supported of the contributing runs, so a second rot-0 run can
+            # only ever strengthen a cell's case, never weaken it.
+            best_n_ok = np.maximum(best_n_ok, np.where(valid, n_ok, 0))
+        n_ok_grid[zi] = best_n_ok
 
         with np.errstate(invalid="ignore"):
             te_avg = np.where(weight > 0, te_sum / weight, np.nan)
@@ -188,6 +464,8 @@ def _load_experiment_set(hf: h5py.File, es_id: str) -> dict:
         "es_label":       eg.attrs.get("label", f"set {es_id}"),
         "v_bank":         eg.attrs.get("v_bank_v", "?"),
         "es_id":          es_id,
+        "n_qc_excluded":  n_qc_excluded,
+        "n_ok":           n_ok_grid,
     }
 
 
@@ -209,6 +487,8 @@ def _load_filled_source_experiment_set(hf: h5py.File, es_id: str) -> dict:
         "es_label":       grp.attrs.get("label", f"set {es_id}"),
         "v_bank":         grp.attrs.get("v_bank_v", "?"),
         "es_id":          es_id,
+        "n_qc_excluded":  -1,   # the QC gate ran when the source was built
+        "n_ok":           None,  # severity counts do not survive into te_filled
     }
 
 
@@ -291,6 +571,66 @@ def _normalise(x: np.ndarray, z: np.ndarray,
     return np.column_stack([x_n, z_n])
 
 
+def _core_transition(
+    x_pts: np.ndarray,
+    x_core: float,
+    x_edge: float,
+) -> np.ndarray:
+    """Return 0 inside the trusted radius, 1 at and beyond the outer end.
+
+    The single definition of how far a radius sits from a trusted region into
+    the noisy scrape-off layer, used for two separate ramps that are read off
+    it with DIFFERENT radii:
+
+    * ``_point_smoothing`` asks how tightly the RBF should fit a data point.
+      That is a statement about the surface and about how noisy a point is as
+      an interpolation constraint, and it runs on the fixed ``X_CORE_CM`` to
+      ``X_EDGE_CM`` zone at every port.
+    * ``fill_te_cycle`` asks how far a MEASURED value is carried into the
+      filled product before the scrape-off-layer prior takes over.  That is a
+      statement about which of the two the product should report where they
+      disagree, it is answered per port by ``TRUST_MODEL_BY_SET_PORT``, and it
+      runs on that port's own radii.
+
+    The two were one ramp until the aperture trust radius was adopted, on the
+    argument that they could not then drift apart.  They are separated here
+    because they answer different questions and the evidence that moved one
+    -- a measured, per-port, band-wide fit-window sensitivity -- says nothing
+    about the other.  Keeping the smoothing ramp fixed also keeps the fitted
+    surface itself untouched, so a port that did not adopt is not moved by a
+    neighbour that did.
+    """
+    return np.clip((np.abs(x_pts) - x_core) / (x_edge - x_core), 0.0, 1.0)
+
+
+def _trust_model_for_ports(
+    es_id: str,
+    ports: np.ndarray,
+    *,
+    x_core: float = X_CORE_CM,
+    x_edge: float = X_EDGE_CM,
+    trust_model: dict[tuple[str, int], tuple[float, float]] = TRUST_MODEL_BY_SET_PORT,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the per-z-row trusted radius and outer blend radius, in cm.
+
+    A ``(set, port)`` listed in *trust_model* takes its declared pair; every
+    other row falls back to ``(x_core, x_edge)``.  The lookup is by port rather
+    than by z so the adoption list reads as the ruling does.
+    """
+    radii = np.empty(len(ports), dtype=np.float64)
+    blends = np.empty(len(ports), dtype=np.float64)
+    for index, port in enumerate(ports):
+        radius, blend = trust_model.get((str(es_id), int(port)), (x_core, x_edge))
+        if not blend > radius:
+            raise ValueError(
+                f"ES {es_id} p{int(port)}: trust blend radius {blend:g} cm must "
+                f"be outside the trusted radius {radius:g} cm"
+            )
+        radii[index] = radius
+        blends[index] = blend
+    return radii, blends
+
+
 def _point_smoothing(
     x_pts: np.ndarray,
     *,
@@ -305,7 +645,7 @@ def _point_smoothing(
     x_core < |x| < x_edge   → linearly interpolated
     |x| ≥ x_edge            → smoothing_edge  (loose: noisier edge data)
     """
-    t = np.clip((np.abs(x_pts) - x_core) / (x_edge - x_core), 0.0, 1.0)
+    t = _core_transition(x_pts, x_core, x_edge)
     return smoothing_core + t * (smoothing_edge - smoothing_core)
 
 
@@ -325,6 +665,10 @@ def fill_te_cycle(
     edge_anchor:     float = EDGE_ANCHOR_CM,
     te_edge_anchor:  float = TE_EDGE_ANCHOR_EV,
     smoothing_edge_anchor: float = SMOOTHING_EDGE_ANCHOR,
+    preserve_measured: bool = True,
+    trust_radius_cm: np.ndarray | float | None = None,
+    trust_blend_cm: np.ndarray | float | None = None,
+    measured_weight_mask: np.ndarray | None = None,
 ) -> np.ndarray:
     """Return filled (n_z, n_x) T_e array with no NaN cells.
 
@@ -332,16 +676,87 @@ def fill_te_cycle(
       |x| ≤ x_core  → smoothing_core (fit closely; trusted core data)
       |x| ≥ x_edge  → smoothing_edge (fit loosely; noisy edge data)
     Sentinel boundary points use smoothing=0 (exact enforcement).
+
+    With *preserve_measured* (the default) a measured cell inside the trusted
+    radius keeps its measured value and the surface is used only where there is
+    no measurement; from there out to the blend radius the two are mixed on a
+    linear ramp, so beyond it the scrape-off-layer prior (the edge anchors and
+    ``smoothing_edge``) is left entirely intact and there is no step anywhere in
+    the profile.
+
+    *trust_radius_cm* and *trust_blend_cm* are that ramp's two radii.  Each may
+    be a scalar or one value per z-row, which is how a port that adopted the
+    aperture trust radius sits in the same fit as one that did not; they default
+    to ``x_core`` and ``x_edge``, the historical model.  They do NOT enter the
+    RBF: the per-point smoothing keeps its own fixed zone, so changing a port's
+    trusted radius does not move the fitted surface and cannot move a
+    neighbouring port.  See ``_core_transition``.
+
+    *measured_weight_mask*, when given, is a ``(n_z, n_x)`` boolean saying
+    which measured cells may carry weight at all; False forces the blend onto
+    the surface there.  It is how the radius-conditional QC floor is applied
+    (``QC_FLOOR_RULE``), and like the trust radii it never enters the RBF, so a
+    gated cell still constrains the surface that replaces it.
+
+    This is what the boundary sentinels make necessary: they are enforced
+    near-exactly (``SMOOTHING_SENTINEL``) while data points carry
+    ``smoothing_core``, so the fitted surface is free to sit below a measured
+    row that lies near an end plate in order to reach the imposed T_e there.
+    The effect falls off with distance from the boundary and is therefore a
+    z-dependent bias, not a uniform offset: it does not cancel in a ratio or a
+    difference between rows, and it can invert the ordering of two rows whose
+    measured separation is smaller than the bias.
+
+    The blend is deliberately not carried out to the wall.  Outside the core
+    the fill is not merely interpolating: the edge anchors and the loose edge
+    smoothing are a prior that exists precisely because scan-edge measurements
+    are fluctuation-prone, and it holds the surface 1-2 eV below the measured
+    cells at EVERY axial row, including rows the sentinels barely touch.  That
+    is a separate, intended choice and is left alone here.
+
+    Setting *preserve_measured* to False restores the surface-everywhere
+    behaviour for comparison.
     """
     zz, xx = np.meshgrid(z_cm, x_cm, indexing="ij")  # (n_z, n_x) each
     valid = np.isfinite(te_2d)
+
+    radius = np.reshape(
+        np.asarray(x_core if trust_radius_cm is None else trust_radius_cm, dtype=float),
+        (-1, 1),
+    )
+    blend = np.reshape(
+        np.asarray(x_edge if trust_blend_cm is None else trust_blend_cm, dtype=float),
+        (-1, 1),
+    )
+    if radius.shape[0] not in (1, te_2d.shape[0]) or blend.shape != radius.shape:
+        raise ValueError(
+            f"trust radii shaped {radius.shape}/{blend.shape} do not broadcast "
+            f"onto the {te_2d.shape[0]} z-rows of the T_e grid"
+        )
+    if measured_weight_mask is not None:
+        measured_weight_mask = np.asarray(measured_weight_mask, dtype=bool)
+        if measured_weight_mask.shape != te_2d.shape:
+            raise ValueError(
+                f"measured weight mask shape {measured_weight_mask.shape} does "
+                f"not match the T_e grid {te_2d.shape}"
+            )
+
+    def _trust(grid_x: np.ndarray) -> np.ndarray:
+        weight = 1.0 - _core_transition(grid_x, radius, blend)
+        if measured_weight_mask is not None:
+            weight = np.where(measured_weight_mask, weight, 0.0)
+        return weight
 
     # Data coordinates and values
     data_coords = np.column_stack([xx[valid], zz[valid]])   # [x, z]
     data_values = te_2d[valid]
 
     if data_values.size < 4:
-        return np.full_like(te_2d, te_boundary)
+        flat = np.full_like(te_2d, te_boundary)
+        if preserve_measured:
+            trust = _trust(xx)
+            flat = np.where(valid, trust * te_2d + (1.0 - trust) * flat, flat)
+        return np.clip(flat, te_boundary, None)
 
     # Per-point smoothing for data points
     data_smoothing = _point_smoothing(
@@ -381,7 +796,26 @@ def fill_te_cycle(
     # Evaluate on full grid
     grid_norm = _normalise(xx.ravel(), zz.ravel(), x_wall, z_lo, z_hi)
     te_out = rbf(grid_norm).reshape(te_2d.shape)
+    if preserve_measured:
+        trust = _trust(xx)
+        te_out = np.where(valid, trust * te_2d + (1.0 - trust) * te_out, te_out)
     return np.clip(te_out, te_boundary, None)
+
+
+def sparse_z_rows(
+    te_grid: np.ndarray,
+    min_z_coverage: float = MIN_Z_COVERAGE,
+) -> np.ndarray:
+    """Return which z-rows are too sparsely sampled to constrain the fit.
+
+    A row whose fraction of finite cells, pooled over all x and all cycles,
+    falls below *min_z_coverage* cannot hold the interpolant and is dropped
+    from it.  The single definition of that test, so the fill and the record
+    of which rows ended up prior-derived cannot disagree about it.
+    """
+    n_z = te_grid.shape[0]
+    coverage = np.array([np.isfinite(te_grid[zi]).mean() for zi in range(n_z)])
+    return coverage < min_z_coverage
 
 
 def fill_te_grid(
@@ -390,6 +824,7 @@ def fill_te_grid(
     z_cm: np.ndarray,
     *,
     min_z_coverage: float = MIN_Z_COVERAGE,
+    measured_weight_mask: np.ndarray | None = None,
     **kwargs,                   # forwarded to fill_te_cycle
 ) -> np.ndarray:
     """Fill every cycle in the grid; prints progress.
@@ -403,7 +838,7 @@ def fill_te_grid(
     """
     n_z = te_grid.shape[0]
     z_coverage = np.array([np.isfinite(te_grid[zi]).mean() for zi in range(n_z)])
-    sparse = z_coverage < min_z_coverage
+    sparse = sparse_z_rows(te_grid, min_z_coverage)
     if sparse.any():
         te_grid = te_grid.copy()
         te_grid[sparse] = np.nan
@@ -416,7 +851,16 @@ def fill_te_grid(
     n_cycles = te_grid.shape[2]
     filled = np.empty_like(te_grid)
     for ci in range(n_cycles):
-        filled[:, :, ci] = fill_te_cycle(te_grid[:, :, ci], x_cm, z_cm, **kwargs)
+        cycle_mask = (
+            None if measured_weight_mask is None else measured_weight_mask[:, :, ci]
+        )
+        filled[:, :, ci] = fill_te_cycle(
+            te_grid[:, :, ci],
+            x_cm,
+            z_cm,
+            measured_weight_mask=cycle_mask,
+            **kwargs,
+        )
         pct = 100 * (ci + 1) / n_cycles
         sys.stdout.write(f"\r    cycle {ci + 1}/{n_cycles} ({pct:.0f}%)")
         sys.stdout.flush()
@@ -442,17 +886,318 @@ def _mask_untrusted_te_ports(
     return out, untrusted
 
 
+# ---------------------------------------------------------------------------
+# Semi-quantitative marking
+# ---------------------------------------------------------------------------
+def load_window_band_spreads(path: Path) -> dict[tuple[str, int], dict]:
+    """Return the per-cell fit-window spreads, keyed by (set id, port).
+
+    Reads the tracked per-cell CSV written by ``scripts/refit_window_band.py``.
+    Each entry carries the cells that were re-fitted (``x_cm`` and their
+    ``dln_te_window``) and the port's ``x = 0`` control value, which is the
+    same quantity measured at the one radius the published x = 0 product also
+    covers.  A set-port the band pass never covered is simply absent, and the
+    caller then has no window evidence for it either way.
+    """
+    spreads: dict[tuple[str, int], dict] = {}
+    with path.open(newline="") as handle:
+        for row in csv.DictReader(handle):
+            key = (str(int(row["set_id"])), int(row["port"]))
+            entry = spreads.setdefault(
+                key, {"x_cm": [], "dln": [], "x0_dln": np.nan}
+            )
+            dln = float(row["dln_te_window"])
+            x_cm = float(row["x_cm"])
+            entry["x_cm"].append(x_cm)
+            entry["dln"].append(dln)
+            if int(row["is_x0_control"]):
+                entry["x0_dln"] = dln
+    for entry in spreads.values():
+        entry["x_cm"] = np.asarray(entry["x_cm"], dtype=np.float64)
+        entry["dln"] = np.asarray(entry["dln"], dtype=np.float64)
+    return spreads
+
+
+#: Where a port's x = 0 window control came from, as stored in
+#: ``te_window_dln_core_control_source``.
+CONTROL_SOURCE_NONE = 0
+CONTROL_SOURCE_BAND = 1
+CONTROL_SOURCE_LEGACY = 2
+
+
+def _legacy_dln(grid: np.ndarray) -> float:
+    """Return ``ln(max/min)`` over a 5 x 5 window grid -- the shared definition."""
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", category=RuntimeWarning)
+        lowest, highest = np.nanmin(grid), np.nanmax(grid)
+    if not np.isfinite(lowest) or lowest <= 0:
+        return float("nan")
+    return float(np.log(highest / lowest))
+
+
+def merge_legacy_x0_controls(
+    spreads: dict[tuple[str, int], dict],
+    legacy_path: Path,
+    metadata_path: Path,
+    *,
+    rtol: float = WINDOW_METRIC_RTOL,
+) -> dict[tuple[str, int], dict]:
+    """Add the older product's x = 0 window controls, after proving them equal.
+
+    The core-control marking asks one question -- does this port's ``T_e`` move
+    by half a natural log or more when the retarding fit window is varied
+    inside its family -- and two products answer it, over different coverage.
+    Consuming their union is what stops a port being marked because it happened
+    to be measured twice.  It is only legitimate if the two really do measure
+    the same thing, so this REFUSES to read the older product unless that is
+    demonstrated rather than assumed:
+
+    * the window family (``p_low`` x ``f_high``) and the plateau window in the
+      older product must equal the band product's recorded protocol exactly;
+    * its stored grid must have the shape that family implies;
+    * at every set-port the two products share, ``ln(max/min)`` RECOMPUTED from
+      the older product's own stored grid must reproduce the value it recorded,
+      and must agree with the band product's independently measured x = 0
+      control to *rtol*;
+    * there must be at least one shared set-port, since a guard that checks
+      nothing proves nothing.
+
+    Names are never compared.  Where both products carry a control the band
+    product's value is kept -- it was computed on the platform the fill runs
+    on -- and the source is recorded per port either way.
+    """
+    metadata = json.loads(metadata_path.read_text())
+    with h5py.File(legacy_path, "r") as legacy:
+        for name, expected in (
+            ("p_low", metadata["window_p_low_percent"]),
+            ("f_high", metadata["window_f_high_fraction"]),
+            ("plateau_ms", metadata["plateau_ms"]),
+        ):
+            if name not in legacy.attrs:
+                raise ValueError(
+                    f"{legacy_path} records no {name}; it cannot be shown to "
+                    "measure the same window sensitivity as "
+                    f"{metadata_path} and will not be read"
+                )
+            if not np.array_equal(
+                np.asarray(legacy.attrs[name], dtype=np.float64),
+                np.asarray(expected, dtype=np.float64),
+            ):
+                raise ValueError(
+                    f"{legacy_path} {name} = {np.asarray(legacy.attrs[name])} "
+                    f"does not match the band product's {expected}; the two "
+                    "are not the same window sensitivity"
+                )
+        expected_shape = (
+            len(metadata["window_p_low_percent"]),
+            len(metadata["window_f_high_fraction"]),
+        )
+
+        merged = dict(spreads)
+        shared = 0
+        for set_name in sorted(legacy.keys()):
+            es_id = set_name.removeprefix("set")
+            for port_name in sorted(legacy[set_name].keys()):
+                port = int(port_name.removeprefix("port"))
+                group = legacy[f"{set_name}/{port_name}"]
+                grid = np.asarray(group["te_window_ev"][()], dtype=np.float64)
+                if grid.shape != expected_shape:
+                    raise ValueError(
+                        f"{legacy_path} {set_name}/{port_name} grid is "
+                        f"{grid.shape}, not the {expected_shape} the declared "
+                        "window family implies"
+                    )
+                recomputed = _legacy_dln(grid)
+                recorded = float(group.attrs["dln_te_window"])
+                if not np.isclose(recomputed, recorded, rtol=rtol, atol=0.0):
+                    raise ValueError(
+                        f"{legacy_path} {set_name}/{port_name} records "
+                        f"dln_te_window = {recorded!r} but its own grid gives "
+                        f"{recomputed!r}; the recorded metric is not "
+                        "ln(max/min) over that grid"
+                    )
+                key = (es_id, port)
+                existing = merged.get(key)
+                if existing is not None and np.isfinite(existing["x0_dln"]):
+                    shared += 1
+                    if not np.isclose(
+                        recomputed, existing["x0_dln"], rtol=rtol, atol=0.0
+                    ):
+                        raise ValueError(
+                            f"ES {es_id} p{port}: the two window products "
+                            f"disagree on the x = 0 control, {recomputed!r} vs "
+                            f"{existing['x0_dln']!r} (rtol {rtol:g}); they are "
+                            "not measuring the same quantity"
+                        )
+                    existing["x0_source"] = CONTROL_SOURCE_BAND
+                    continue
+                merged[key] = {
+                    "x_cm": np.empty(0, dtype=np.float64),
+                    "dln": np.empty(0, dtype=np.float64),
+                    "x0_dln": recomputed,
+                    "x0_source": CONTROL_SOURCE_LEGACY,
+                }
+    if shared == 0:
+        raise ValueError(
+            f"{legacy_path} shares no set-port with {metadata_path}, so the "
+            "metric-identity guard has nothing to check it against"
+        )
+    return merged
+
+
+def _window_spread_grids(
+    x_cm: np.ndarray,
+    ports: np.ndarray,
+    es_id: str,
+    spreads: dict[tuple[str, int], dict],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return the (n_z, n_x) window spreads, the per-port control, and its source."""
+    dln_grid = np.full((len(ports), len(x_cm)), np.nan)
+    core_control = np.full(len(ports), np.nan)
+    control_source = np.full(len(ports), CONTROL_SOURCE_NONE, dtype=np.int8)
+    for z_idx, port in enumerate(ports):
+        entry = spreads.get((str(es_id), int(port)))
+        if entry is None:
+            continue
+        core_control[z_idx] = entry["x0_dln"]
+        if np.isfinite(entry["x0_dln"]):
+            control_source[z_idx] = entry.get("x0_source", CONTROL_SOURCE_BAND)
+        for x_value, dln in zip(entry["x_cm"], entry["dln"]):
+            x_idx = int(np.argmin(np.abs(x_cm - x_value)))
+            if not np.isclose(x_cm[x_idx], x_value, atol=1e-6):
+                raise ValueError(
+                    f"ES {es_id} p{int(port)}: window-spread cell at "
+                    f"x = {x_value:g} cm is not on the T_e x grid"
+                )
+            dln_grid[z_idx, x_idx] = dln
+    return dln_grid, core_control, control_source
+
+
+def _semi_quantitative_marks(
+    te_filled: np.ndarray,
+    x_cm: np.ndarray,
+    dln_grid: np.ndarray,
+    core_control: np.ndarray,
+    *,
+    core_x_cm: float = X_CORE_CM,
+    te_ev: float = SEMI_QUANTITATIVE_TE_EV,
+    criterion: float = SEMI_QUANTITATIVE_DLN,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return the semi-quantitative reason bitmask and the inflating spread.
+
+    One rule, applied everywhere, with three ways a cell can enter the class:
+
+    ``SEMI_QUANT_SUB_EV``
+        the filled value is below *te_ev*, the swept diagnostic's
+        low-temperature limit.  This is the standing convention and it is
+        cycle-dependent, since a cell can be sub-eV at some times and not
+        others.
+    ``SEMI_QUANT_WINDOW``
+        the cell's OWN measured fit-window spread is at or above *criterion*:
+        moving the retarding fit window inside its declared family moves this
+        cell's T_e by at least that much, so the value is convention-dependent.
+    ``SEMI_QUANT_CORE_CONTROL``
+        the port's ``x = 0`` control spread is at or above *criterion*, which
+        indicts the whole core of that port rather than one cell.  This is the
+        same rule as the cell rule, read at the one radius where the control
+        was measured and applied to the region the control speaks for.
+
+    A marked cell KEEPS its measured value: the class is an uncertainty
+    statement.  The second return value is the spread that DID the marking, per
+    cell, and is NaN where nothing did -- including for a cell marked only for
+    being sub-eV, which has no measured window spread to inflate by.
+    """
+    n_z, n_x, _ = te_filled.shape
+    reason = np.zeros(te_filled.shape, dtype=np.uint8)
+
+    with np.errstate(invalid="ignore"):
+        sub_ev = np.isfinite(te_filled) & (te_filled < te_ev)
+    reason[sub_ev] |= SEMI_QUANT_SUB_EV
+
+    cell_fails = np.isfinite(dln_grid) & (dln_grid >= criterion)
+    reason[np.broadcast_to(cell_fails[:, :, None], reason.shape)] |= SEMI_QUANT_WINDOW
+
+    core = np.abs(x_cm) <= core_x_cm
+    control_fails = np.isfinite(core_control) & (core_control >= criterion)
+    core_fails = control_fails[:, None] & core[None, :]
+    reason[np.broadcast_to(core_fails[:, :, None], reason.shape)] |= (
+        SEMI_QUANT_CORE_CONTROL
+    )
+
+    inflating = np.full((n_z, n_x), np.nan)
+    inflating = np.where(cell_fails, dln_grid, inflating)
+    control_grid = np.where(core_fails, core_control[:, None], np.nan)
+    inflating = np.fmax(inflating, control_grid)
+    return reason, inflating
+
+
+def _core_window_sem(
+    te_filled: np.ndarray,
+    x_cm: np.ndarray,
+    inflating_dln: np.ndarray,
+    *,
+    x_min: float,
+    x_max: float,
+) -> np.ndarray:
+    """Return the (n_z, n_cycles) window term for the core-band T_e uncertainty.
+
+    A cell whose window spread is ``d = ln(T_max / T_min)`` has a window family
+    spanning a factor ``exp(d)``, so about the family's geometric centre its
+    half-spread is ``T * sinh(d / 2)``; that is the per-cell uncertainty the
+    window convention carries.
+
+    The exported core T_e is the unweighted mean of the core-band cells, and
+    the window convention is ONE choice applied to every cell at once, so the
+    per-cell half-spreads are fully correlated and add LINEARLY inside that
+    mean rather than in quadrature.  A cell with no inflating spread
+    contributes zero, which is what makes the term vanish where nothing is
+    marked.  The result is combined with the radial SEM in quadrature by the
+    consumer, since the two are independent: one is where the window sits, the
+    other is how much the profile scatters.
+    """
+    band = (x_cm >= x_min) & (x_cm <= x_max)
+    if not np.any(band):
+        raise ValueError(f"No x samples in the core band {x_min:g} to {x_max:g} cm")
+    half_spread = np.sinh(np.where(np.isfinite(inflating_dln), inflating_dln, 0.0) / 2.0)
+    weighted = te_filled[:, band, :] * half_spread[:, band, None]
+    count = np.sum(np.isfinite(te_filled[:, band, :]), axis=1)
+    total = np.sum(np.where(np.isfinite(weighted), weighted, 0.0), axis=1)
+    return np.where(count > 0, total / np.maximum(count, 1), np.nan)
+
+
 def _enforce_core_mean_monotonic_z(
     te_grid: np.ndarray,
     x_cm: np.ndarray,
     *,
     core_x_cm: float = X_CORE_CM,
     te_floor: float = TE_BOUNDARY_EV,
-) -> tuple[np.ndarray, int, float]:
+    measured_grid: np.ndarray | None = None,
+) -> tuple[np.ndarray, int, float, np.ndarray, np.ndarray]:
     """Scale downstream rows so core-mean T_e is non-increasing with z.
 
     Each row keeps its radial shape. Scaling is performed about ``te_floor``
     so the imposed wall/end temperature is not pushed below its boundary.
+
+    ``measured_grid`` is the masked measurement the filled grid was built from,
+    on the same axes.  When it is supplied, a row-cycle is only rescaled where
+    the prior is not contradicted by the measurement it would be rewriting:
+
+    * a row with no finite measured core cell at that cycle is reconstructed
+      from neighbouring rows and the end boundaries, so the monotonic prior is
+      the only axial constraint it has and the clamp applies as before;
+    * a row that does carry measured core cells is rescaled only when the
+      MEASURED core means are themselves non-monotonic there, i.e. when the row
+      is warmer than the coolest measured row upstream of it.
+
+    Without that restriction the clamp also fires on inversions the fill
+    invented (a row whose fitted surface was pulled down by the end-plate
+    sentinels reads cooler than the row below it), and the row it then rewrites
+    is a measured one.  The prior is an axial statement about the plasma, so it
+    must be judged on the measurement, not on the interpolant.
+
+    Returns the adjusted grid, the number of rescaled row-cycles, the largest
+    fractional reduction applied, the per-row-cycle boolean record of where the
+    clamp acted, and the per-row-cycle scale factor (1.0 where it did not).
     """
     out = np.asarray(te_grid, dtype=np.float64).copy()
     core = np.abs(np.asarray(x_cm)) <= core_x_cm
@@ -461,14 +1206,35 @@ def _enforce_core_mean_monotonic_z(
     if not np.any(core):
         raise ValueError("No x positions fall inside the monotonic core region")
 
-    for cycle_idx in range(out.shape[2]):
+    n_z, _, n_cycles = out.shape
+    clamped = np.zeros((n_z, n_cycles), dtype=bool)
+    scales = np.ones((n_z, n_cycles), dtype=np.float64)
+
+    if measured_grid is None:
+        measured_core_mean = np.full((n_z, n_cycles), np.nan)
+    else:
+        measured = np.asarray(measured_grid, dtype=np.float64)
+        if measured.shape != out.shape:
+            raise ValueError(
+                f"measured grid shape {measured.shape} does not match the "
+                f"filled T_e grid {out.shape}"
+            )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            measured_core_mean = np.nanmean(measured[:, core, :], axis=1)
+
+    for cycle_idx in range(n_cycles):
         previous_mean = np.inf
-        for z_idx in range(out.shape[0]):
+        previous_measured = np.inf
+        for z_idx in range(n_z):
             row = out[z_idx, :, cycle_idx]
             mean = float(np.nanmean(row[core]))
+            measured_mean = float(measured_core_mean[z_idx, cycle_idx])
             if not np.isfinite(mean):
                 continue
-            if mean > previous_mean:
+            if mean > previous_mean and _monotonic_clamp_permitted(
+                measured_mean, previous_measured
+            ):
                 if mean <= te_floor or previous_mean <= te_floor:
                     scale = 0.0
                 else:
@@ -476,13 +1242,37 @@ def _enforce_core_mean_monotonic_z(
                 scale = float(np.clip(scale, 0.0, 1.0))
                 out[z_idx, :, cycle_idx] = te_floor + (row - te_floor) * scale
                 adjusted += 1
+                clamped[z_idx, cycle_idx] = True
+                scales[z_idx, cycle_idx] = scale
                 maximum_fractional_reduction = max(
                     maximum_fractional_reduction,
                     1.0 - scale,
                 )
                 mean = previous_mean
             previous_mean = min(previous_mean, mean)
-    return out, adjusted, maximum_fractional_reduction
+            if np.isfinite(measured_mean):
+                previous_measured = min(previous_measured, measured_mean)
+    return out, adjusted, maximum_fractional_reduction, clamped, scales
+
+
+def _monotonic_clamp_permitted(
+    measured_mean: float,
+    previous_measured_mean: float,
+) -> bool:
+    """Return whether the monotonic-z clamp may rewrite this row-cycle.
+
+    ``measured_mean`` is the row's own measured core mean and
+    ``previous_measured_mean`` the smallest measured core mean upstream of it,
+    both ``NaN``/``inf`` when no such measurement exists.  Permission is granted
+    when the row is reconstructed rather than measured, when nothing measured
+    sits upstream to judge it against, or when the measurements themselves run
+    the wrong way in z.
+    """
+    if not np.isfinite(measured_mean):
+        return True
+    if not np.isfinite(previous_measured_mean):
+        return True
+    return measured_mean > previous_measured_mean
 
 
 # ---------------------------------------------------------------------------
@@ -798,6 +1588,28 @@ def main() -> None:
                         help="Fractional allowance above the upstream T_e envelope for the "
                              "monotonic-z upper bound.  Set to a large value (e.g. 1e6) to "
                              f"disable.  Default: {MONO_Z_PADDING}.")
+    parser.add_argument("--window-band", type=Path, default=WINDOW_BAND_INPUT,
+                        help="Per-cell fit-window spreads across the measurement "
+                             "band (scripts/refit_window_band.py).  The trust "
+                             "model conditions on it and the semi-quantitative "
+                             "marking is read from it.")
+    parser.add_argument("--window-band-metadata", type=Path,
+                        default=WINDOW_BAND_METADATA,
+                        help="Band-product protocol record; supplies the window "
+                             "family the metric-identity guard checks the "
+                             "original x = 0 product against.")
+    parser.add_argument("--legacy-window-refits", type=Path,
+                        default=LEGACY_WINDOW_REFITS,
+                        help="The original x = 0 window-refit product "
+                             "(scripts/refit_sweep_windows.py).  Read for the "
+                             "x = 0 core control only, and only once it is "
+                             "proved to measure the same window sensitivity.")
+    parser.add_argument("--core-band-cm", nargs=2, type=float, default=(-10.0, 10.0),
+                        help="Core band the exported per-port T_e statistics are "
+                             "taken over, and hence the band whose window-spread "
+                             "uncertainty is accumulated into "
+                             "te_core_window_sem_ev.  Must match the overlay "
+                             "exporter's core band.")
     parser.add_argument("--isweep-deadtime", type=Path, default=ISWEEP_DEADTIME_INPUT,
                         help="Optional -I_SWEEP dead-time profile HDF5 used to preserve "
                              "core T_e hot spots that coincide with current spikes.")
@@ -815,6 +1627,18 @@ def main() -> None:
                              "for a z-row to be included in the RBF fit. Rows below this "
                              "threshold are blanked and filled by boundary extrapolation. "
                              f"Default: {MIN_Z_COVERAGE}.")
+    parser.add_argument("--no-preserve-measured-cells", action="store_true",
+                        help="Let the RBF surface overwrite core cells that carry a "
+                             "finite measurement, instead of filling only the NaN cells "
+                             "there.  This is the pre-2026-08-20 behaviour and lets the "
+                             "near-exactly enforced boundary sentinels bias measured "
+                             "rows near the end plates; kept for comparison only.")
+    parser.add_argument("--no-measured-monotonic-gate", action="store_true",
+                        help="Let the core-mean monotonic-z clamp rewrite a measured row "
+                             "even where the measured core means are themselves "
+                             "monotonic.  This is the pre-2026-08-20 behaviour, in which "
+                             "the clamp also fires on inversions the fill invented; kept "
+                             "for comparison only.")
     parser.add_argument("--no-plots",       action="store_true",
                         help="skip comparison figures")
     args = parser.parse_args()
@@ -823,6 +1647,30 @@ def main() -> None:
         raise FileNotFoundError(
             f"{args.input} not found — run process_langmuir_sweeps.py first."
         )
+    if not args.window_band.exists():
+        raise FileNotFoundError(
+            f"{args.window_band} not found — run scripts/refit_window_band.py "
+            "first.  The trust model conditions on the measured band-wide "
+            "fit-window spreads, so the fill is not defined without them."
+        )
+    if not args.window_band_metadata.exists():
+        raise FileNotFoundError(
+            f"{args.window_band_metadata} not found — it carries the window "
+            "family the metric-identity guard checks the original x = 0 "
+            "product against; run scripts/refit_window_band.py first."
+        )
+    if not args.legacy_window_refits.exists():
+        raise FileNotFoundError(
+            f"{args.legacy_window_refits} not found — run "
+            "scripts/refit_sweep_windows.py first.  It is the only x = 0 "
+            "window control there is for experiment set 3, and the "
+            "semi-quantitative marking conditions on it."
+        )
+    window_spreads = merge_legacy_x0_controls(
+        load_window_band_spreads(args.window_band),
+        args.legacy_window_refits,
+        args.window_band_metadata,
+    )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -840,6 +1688,7 @@ def main() -> None:
         te_edge_anchor  = args.te_edge_anchor,
         smoothing_edge_anchor = args.smoothing_edge_anchor,
         min_z_coverage  = args.min_z_coverage,
+        preserve_measured = not args.no_preserve_measured_cells,
     )
 
     current_hf = (
@@ -867,6 +1716,36 @@ def main() -> None:
                 n_finite = int(np.isfinite(te_masked).sum())
                 n_total  = int(te_masked.size)
                 print(f"  {n_finite}/{n_total} cells finite ({100*n_finite/n_total:.1f}%) before fill")
+                if data["n_qc_excluded"] >= 0:
+                    print(
+                        f"  QC gate (n_ok >= n_bad, all radii): "
+                        f"{data['n_qc_excluded']} run-cells excluded"
+                    )
+
+                trust_radius_cm, trust_blend_cm = _trust_model_for_ports(
+                    es_id,
+                    ports,
+                    x_core=args.x_core,
+                    x_edge=args.x_edge,
+                )
+                adopted = trust_radius_cm > args.x_core
+                if adopted.any():
+                    print(
+                        "  Measurement-authoritative to the aperture at: "
+                        + ", ".join(
+                            f"p{int(ports[i])} (|x| <= {trust_radius_cm[i]:g} cm, "
+                            f"blend to {trust_blend_cm[i]:g} cm)"
+                            for i in np.flatnonzero(adopted)
+                        )
+                    )
+                if (~adopted).any():
+                    print(
+                        "  Historical core trust kept at: "
+                        + ", ".join(
+                            f"p{int(ports[i])} (|x| <= {trust_radius_cm[i]:g} cm)"
+                            for i in np.flatnonzero(~adopted)
+                        )
+                    )
 
                 te_masked, untrusted_ports = _mask_untrusted_te_ports(
                     te_masked,
@@ -910,21 +1789,158 @@ def main() -> None:
                 if n_preserved:
                     print(f"    {n_preserved} core hot-spot cells preserved")
 
-                print(f"  Fitting {te_masked.shape[2]} cycles …")
-                te_filled = fill_te_grid(te_masked, x_cm, z_cm, **fill_kwargs)
-                te_filled, n_monotonic_rows, max_monotonic_reduction = (
-                    _enforce_core_mean_monotonic_z(
-                        te_filled,
-                        x_cm,
-                        core_x_cm=args.x_core,
-                        te_floor=args.te_boundary,
+                if data["n_ok"] is None:
+                    measured_gate = None
+                    print(
+                        "  Radius-conditional QC floor NOT applied: the input "
+                        "carries no severity counts"
                     )
+                else:
+                    measured_gate = measured_weight_allowed(data["n_ok"], x_cm)
+                    beyond = np.abs(x_cm) > QC_FLOOR_RADIUS_CM
+                    gated = np.isfinite(te_masked) & ~measured_gate
+                    weighted = gated & (
+                        (1.0 - _core_transition(
+                            np.broadcast_to(x_cm, te_masked.shape[:2]),
+                            trust_radius_cm[:, None],
+                            trust_blend_cm[:, None],
+                        ) > 0.0)[:, :, None]
+                    )
+                    print(
+                        f"  Radius-conditional QC floor (|x| > "
+                        f"{QC_FLOOR_RADIUS_CM:g} cm needs n_ok >= "
+                        f"{QC_FLOOR_MIN_N_OK}): {int(gated.sum())} measured "
+                        f"cells gated, of which {int(weighted.sum())} carried "
+                        "weight in this trust model"
+                    )
+                    for z_idx in np.flatnonzero(weighted.any(axis=(1, 2))):
+                        positions = np.flatnonzero(weighted[z_idx].any(axis=1))
+                        print(
+                            f"    p{int(ports[z_idx])}: "
+                            f"{int(weighted[z_idx].sum())} cell-cycles at x = "
+                            + ", ".join(f"{x_cm[i]:g}" for i in positions)
+                            + " cm"
+                        )
+
+                print(f"  Fitting {te_masked.shape[2]} cycles …")
+                te_filled = fill_te_grid(
+                    te_masked,
+                    x_cm,
+                    z_cm,
+                    trust_radius_cm=trust_radius_cm,
+                    trust_blend_cm=trust_blend_cm,
+                    measured_weight_mask=measured_gate,
+                    **fill_kwargs,
+                )
+                (
+                    te_filled,
+                    n_monotonic_rows,
+                    max_monotonic_reduction,
+                    monotonic_clamped,
+                    monotonic_scale,
+                ) = _enforce_core_mean_monotonic_z(
+                    te_filled,
+                    x_cm,
+                    core_x_cm=args.x_core,
+                    te_floor=args.te_boundary,
+                    measured_grid=None if args.no_measured_monotonic_gate else te_masked,
                 )
                 print(
                     "  Core-mean monotonic-z enforcement: "
                     f"{n_monotonic_rows} row-cycles adjusted, "
                     f"maximum reduction {max_monotonic_reduction:.1%}"
                 )
+                for z_idx in np.flatnonzero(monotonic_clamped.any(axis=1)):
+                    cycles = np.flatnonzero(monotonic_clamped[z_idx])
+                    print(
+                        f"    z = {z_cm[z_idx]:.1f} cm (p{int(ports[z_idx])}): "
+                        f"{cycles.size} row-cycles clamped at t = "
+                        + ", ".join(
+                            f"{data['cycle_time_ms'][ci]:.2f}" for ci in cycles
+                        )
+                        + " ms"
+                    )
+
+                # Provenance: which rows are a measurement of their own port
+                # and which were reconstructed.  Judged on the grid the fill
+                # actually read, so both ways a row can end up empty -- blanked
+                # as unreliable, or dropped by the coverage threshold -- are
+                # counted the same way.
+                effective_measured = te_masked.copy()
+                effective_measured[sparse_z_rows(te_masked, args.min_z_coverage)] = np.nan
+                if measured_gate is not None:
+                    effective_measured[~measured_gate] = np.nan
+                row_measured_cells = np.sum(
+                    np.isfinite(effective_measured), axis=1
+                ).astype(np.int16)
+                core_band_for_rows = (x_cm >= args.core_band_cm[0]) & (
+                    x_cm <= args.core_band_cm[1]
+                )
+                row_measured_core_cells = np.sum(
+                    np.isfinite(effective_measured[:, core_band_for_rows, :]), axis=1
+                ).astype(np.int16)
+                prior_rows = np.flatnonzero(row_measured_cells.max(axis=1) == 0)
+                if prior_rows.size:
+                    print(
+                        "  PRIOR-DERIVED rows (no measured cell at any sample): "
+                        + ", ".join(f"p{int(ports[i])}" for i in prior_rows)
+                    )
+
+                (
+                    window_dln,
+                    window_core_control,
+                    window_control_source,
+                ) = _window_spread_grids(x_cm, ports, es_id, window_spreads)
+                semi_quant_reason, window_inflating = _semi_quantitative_marks(
+                    te_filled,
+                    x_cm,
+                    window_dln,
+                    window_core_control,
+                    core_x_cm=args.x_core,
+                )
+                semi_quantitative = semi_quant_reason != 0
+                core_band = (x_cm >= args.core_band_cm[0]) & (
+                    x_cm <= args.core_band_cm[1]
+                )
+                band_cells = (np.abs(x_cm) > args.x_core) & (
+                    np.abs(x_cm) <= X_TRUST_APERTURE_CM
+                )
+                semi_quant_core_count = np.sum(
+                    semi_quantitative[:, core_band, :], axis=1
+                ).astype(np.int16)
+                semi_quant_band_count = np.sum(
+                    semi_quantitative[:, band_cells, :], axis=1
+                ).astype(np.int16)
+                core_window_sem = _core_window_sem(
+                    te_filled,
+                    x_cm,
+                    window_inflating,
+                    x_min=args.core_band_cm[0],
+                    x_max=args.core_band_cm[1],
+                )
+                print(
+                    "  Semi-quantitative cells: "
+                    f"{int((semi_quant_reason & SEMI_QUANT_SUB_EV).astype(bool).sum())}"
+                    " sub-eV, "
+                    f"{int((semi_quant_reason & SEMI_QUANT_WINDOW).astype(bool).sum())}"
+                    " window-spread, "
+                    f"{int((semi_quant_reason & SEMI_QUANT_CORE_CONTROL).astype(bool).sum())}"
+                    " core-control"
+                )
+                for z_idx in np.flatnonzero(
+                    np.isfinite(window_core_control)
+                    & (window_core_control >= SEMI_QUANTITATIVE_DLN)
+                ):
+                    source = {
+                        CONTROL_SOURCE_BAND: "band product",
+                        CONTROL_SOURCE_LEGACY: "original x = 0 product",
+                    }[int(window_control_source[z_idx])]
+                    print(
+                        f"    p{int(ports[z_idx])}: x = 0 window control "
+                        f"{window_core_control[z_idx]:.3f} >= "
+                        f"{SEMI_QUANTITATIVE_DLN:g} ({source}); its whole core "
+                        "is semi-quantitative"
+                    )
 
                 # Write to HDF5
                 grp = hf_out["experiment_sets"].create_group(es_id)
@@ -947,12 +1963,119 @@ def main() -> None:
                 grp.attrs["core_mean_te_monotonic_max_fractional_reduction"] = float(
                     max_monotonic_reduction
                 )
+                grp.attrs["core_mean_te_monotonic_measured_gate"] = bool(
+                    not args.no_measured_monotonic_gate
+                )
+                grp.attrs["measured_cells_preserved_in_fill"] = bool(
+                    not args.no_preserve_measured_cells
+                )
+                grp.attrs["qc_rule"] = QC_RULE
+                grp.attrs["qc_excluded_run_cells"] = int(data["n_qc_excluded"])
+                grp.attrs["te_trust_model"] = TRUST_MODEL_STATEMENT
+                grp.attrs["te_trust_adopted_ports"] = ",".join(
+                    str(int(ports[i])) for i in np.flatnonzero(adopted)
+                )
+                grp.attrs["te_trust_default_radius_cm"] = float(args.x_core)
+                grp.attrs["te_trust_default_blend_cm"] = float(args.x_edge)
+                grp.attrs["te_semi_quantitative_rule"] = SEMI_QUANTITATIVE_STATEMENT
+                grp.attrs["te_semi_quantitative_te_ev"] = float(SEMI_QUANTITATIVE_TE_EV)
+                grp.attrs["te_semi_quantitative_dln"] = float(SEMI_QUANTITATIVE_DLN)
+                grp.attrs["te_core_window_sem_definition"] = CORE_WINDOW_SEM_STATEMENT
+                grp.attrs["te_core_window_sem_x_min_cm"] = float(args.core_band_cm[0])
+                grp.attrs["te_core_window_sem_x_max_cm"] = float(args.core_band_cm[1])
+                grp.attrs["te_window_band_source"] = str(args.window_band)
+                grp.attrs["te_window_legacy_source"] = str(args.legacy_window_refits)
+                grp.attrs["te_window_core_control_source_codes"] = (
+                    f"{CONTROL_SOURCE_NONE} = no x = 0 control measured; "
+                    f"{CONTROL_SOURCE_BAND} = the band product; "
+                    f"{CONTROL_SOURCE_LEGACY} = the original x = 0 product.  "
+                    "The two are proved to measure the same window sensitivity "
+                    "before their union is taken: same window family, same "
+                    "plateau, and ln(max/min) recomputed from the original "
+                    "product's own stored grid reproduces both its recorded "
+                    "value and the band product's independent measurement at "
+                    f"every shared set-port to {WINDOW_METRIC_RTOL:g} relative."
+                )
+                grp.attrs["te_window_metric_rtol"] = float(WINDOW_METRIC_RTOL)
+                grp.attrs["te_qc_floor_rule"] = QC_FLOOR_RULE
+                grp.attrs["te_qc_floor_radius_cm"] = float(QC_FLOOR_RADIUS_CM)
+                grp.attrs["te_qc_floor_min_n_ok"] = int(QC_FLOOR_MIN_N_OK)
+                grp.attrs["te_row_provenance_definition"] = ROW_PROVENANCE_STATEMENT
                 grp.create_dataset("x_cm",           data=x_cm,                compression="gzip")
                 grp.create_dataset("z_cm",           data=z_cm,                compression="gzip")
                 grp.create_dataset("port",           data=ports,               compression="gzip")
                 grp.create_dataset("cycle_time_ms",  data=data["cycle_time_ms"], compression="gzip")
                 grp.create_dataset("te_masked",      data=te_masked,            compression="gzip", compression_opts=4)
                 grp.create_dataset("te_filled",      data=te_filled,            compression="gzip", compression_opts=4)
+                grp.create_dataset(
+                    "core_mean_te_monotonic_clamped",
+                    data=monotonic_clamped,
+                    compression="gzip",
+                )
+                grp.create_dataset(
+                    "core_mean_te_monotonic_scale",
+                    data=monotonic_scale,
+                    compression="gzip",
+                )
+                grp.create_dataset(
+                    "te_trust_radius_cm", data=trust_radius_cm, compression="gzip"
+                )
+                grp.create_dataset(
+                    "te_trust_blend_cm", data=trust_blend_cm, compression="gzip"
+                )
+                grp.create_dataset(
+                    "te_window_dln", data=window_dln, compression="gzip"
+                )
+                grp.create_dataset(
+                    "te_window_dln_core_control",
+                    data=window_core_control,
+                    compression="gzip",
+                )
+                grp.create_dataset(
+                    "te_window_dln_core_control_source",
+                    data=window_control_source,
+                    compression="gzip",
+                )
+                grp.create_dataset(
+                    "te_window_dln_inflating",
+                    data=window_inflating,
+                    compression="gzip",
+                )
+                grp.create_dataset(
+                    "te_semi_quantitative",
+                    data=semi_quantitative,
+                    compression="gzip",
+                )
+                grp.create_dataset(
+                    "te_semi_quantitative_reason",
+                    data=semi_quant_reason,
+                    compression="gzip",
+                )
+                grp.create_dataset(
+                    "te_semi_quantitative_core_count",
+                    data=semi_quant_core_count,
+                    compression="gzip",
+                )
+                grp.create_dataset(
+                    "te_semi_quantitative_band_count",
+                    data=semi_quant_band_count,
+                    compression="gzip",
+                )
+                grp.create_dataset(
+                    "te_core_window_sem_ev",
+                    data=core_window_sem,
+                    compression="gzip",
+                )
+                grp.create_dataset(
+                    "te_row_measured_cells",
+                    data=row_measured_cells,
+                    compression="gzip",
+                )
+                grp.create_dataset(
+                    "te_row_measured_core_cells",
+                    data=row_measured_core_cells,
+                    compression="gzip",
+                )
                 hf_out.flush()
 
                 if not args.no_plots:

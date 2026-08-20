@@ -1,0 +1,461 @@
+"""Per-cell fit-window re-fits across the measurement band (the D-i product).
+
+``refit_sweep_windows.py`` asks how far a port's ``T_e`` moves when the
+electron-retarding fit window is varied, at ``x = 0`` only.  This script asks
+the same question CELL BY CELL across the band that the filled ``T_e`` product
+was asked to treat as measurement-authoritative, so that the trust extension is
+conditioned on a measured window-convention sensitivity rather than on the
+assumption that the core's window stability carries outward.
+
+Protocol (PRE-DECLARED 2026-08-20, before the numbers existed)
+--------------------------------------------------------------
+* the SAME window family as the ``x = 0`` product: ``p_low`` in
+  {3, 8, 15, 25, 35} percent x ``f_high`` in {0.05, 0.10, 0.15, 0.30, 0.50},
+  ion branch held fixed at the pipeline defaults, imported from
+  ``refit_sweep_windows.refit_sweep`` rather than restated;
+* rot-0 runs of experiment sets 1 and 2, every port;
+* every plateau cycle in 10--19.5 ms and every shot -- no subsampling;
+* cells ``BAND_MIN_CM < |x| <= BAND_MAX_CM``, plus ``x = 0`` retained per port
+  as an internal control against the published ``x = 0`` product;
+* metric per cell ``dln_te_window = ln(max / min)`` over the 5 x 5 grid of
+  nanmedian-over-sweeps ``T_e``, exactly the published product's definition;
+* criterion, fixed before the first look: a port passes when its in-band MEDIAN
+  ``dln_te_window`` is below ``CRITERION_DLN``; the full per-cell distribution
+  is reported either way and the criterion is not adjusted afterwards.
+
+Outputs
+-------
+processed/window_refit_band.hdf5
+  The full product, including the per-cell 5 x 5 ``T_e`` window grids.  Large
+  and regenerable, so it is gitignored like the other derived HDF5 outputs.
+
+processed/window_refit_band_summary.csv
+  One row per cell: the per-cell ``dln_te_window``, ``x_cm``, the default-window
+  median ``T_e``, and the sweep count.  Small and TRACKED, because the filled
+  ``T_e`` product conditions on it -- ``fit_te_spatial.py`` reads this file to
+  mark semi-quantitative cells, so it has to be present in a fresh checkout.
+
+processed/window_refit_band_metadata.json
+  Protocol, criterion, adjudication reference and the per-port summary.  Also
+  tracked, following ``isweep_frontside_arc_shot_exclusions_metadata.json``.
+
+Usage
+-----
+  MPLCONFIGDIR=.matplotlib python scripts/refit_window_band.py
+
+Each ``(set, port)`` is checkpointed to an ``npz`` in ``--work-dir`` as it
+completes and an existing checkpoint is reused, so an interrupted pass resumes
+and the archival step can be re-run without repeating ~30 minutes of raw-trace
+reads.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import datetime as _datetime
+import importlib.util
+import json
+import sys
+import time
+from pathlib import Path
+
+import h5py
+import numpy as np
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "src"))
+
+from bapsf_lapd import ChannelKind, LapdDataset  # noqa: E402
+
+from bapsf_lapd.filtering import butterworth_lowpass  # noqa: E402
+
+
+def _load_script(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+#: The x = 0 window-refit product.  Its ``refit_sweep`` and its window family
+#: are imported rather than restated so the two products cannot drift apart.
+_rw = _load_script("refit_sweep_windows", ROOT / "scripts" / "refit_sweep_windows.py")
+_pls = _rw.pls
+
+OUTPUT_HDF5 = ROOT / "processed" / "window_refit_band.hdf5"
+OUTPUT_SUMMARY = ROOT / "processed" / "window_refit_band_summary.csv"
+OUTPUT_METADATA = ROOT / "processed" / "window_refit_band_metadata.json"
+WORK_DIR = ROOT / "processed" / "window_refit_band_work"
+
+SETS = (1, 2)
+PLATEAU_MS = (10.0, 19.5)
+CLIP_US = 10.0
+FILTER_ORDER = 4
+
+#: Inner edge of the band: inside this radius the published x = 0 control and
+#: the core-band statistics already speak, so the band starts outside it.
+BAND_MIN_CM = 10.0
+#: Outer edge: the caliper-measured cathode frame opening (half of the 14.5 in
+#: aperture, 2026-08-17), the radius the trust question is asked about.
+BAND_MAX_CM = 18.415
+#: A cell at or above this window spread is SEMI-QUANTITATIVE; a port passes
+#: when its in-band median is below it.  Fixed before the first look.
+CRITERION_DLN = 0.50
+
+PROTOCOL = (
+    "Per-cell fit-window re-fits, PRE-DECLARED 2026-08-20 before the numbers "
+    "existed: same window family as processed/sweep_window_refits.hdf5 "
+    "(p_low 3/8/15/25/35 percent x f_high 0.05/0.10/0.15/0.30/0.50, ion branch "
+    "fixed at pipeline defaults); rot-0 runs of experiment sets 1 and 2, all "
+    "ports; all plateau cycles 10-19.5 ms and all shots, no subsampling; cells "
+    f"{BAND_MIN_CM:g} < |x| <= {BAND_MAX_CM:g} cm plus x = 0 per port as an "
+    "internal control; metric dln_te_window = ln(max/min) over the 5x5 grid of "
+    "nanmedian-over-sweeps T_e; criterion = per-port in-band median "
+    f"dln_te_window < {CRITERION_DLN:g}, fixed before the first look and not "
+    "adjusted afterwards."
+)
+ADJUDICATION = (
+    "Adjudicated 2026-08-20 (CAMPAIGN_LOG 2026-08-20z), ratified 2026-08-20aa: "
+    "trust-to-aperture ADOPTED at eight set-ports (ES1 and ES2, p11/p21/p29/"
+    "p41); REFUSED at both p50s and at ES3 entirely.  Any in-band cell with "
+    f"dln_te_window >= {CRITERION_DLN:g} is marked semi-quantitative and keeps "
+    "its measured value; a port whose x = 0 control fails the criterion has its "
+    "whole core marked the same way."
+)
+LINEAGE = (
+    "Grown from scripts/refit_sweep_windows.py (the x = 0 product, 2026-07-22), "
+    "which supplies refit_sweep(), the window family and the run selection; the "
+    "band pass was first executed 2026-08-20 as the D-i discriminator and "
+    "archived here so the filled T_e product can condition on it."
+)
+
+#: The eight set-ports the 2026-08-20z ruling adopted, recorded per port group
+#: so the product carries the verdict it was used to reach.
+ADOPTED_SET_PORTS = frozenset(
+    {(1, 11), (1, 21), (1, 29), (1, 41), (2, 11), (2, 21), (2, 29), (2, 41)}
+)
+
+
+def band_cell_indices(x_cm: np.ndarray) -> tuple[np.ndarray, int]:
+    """Return the fitted cell indices and the index of the ``x = 0`` control.
+
+    The in-band cells come first, in scan order, and the ``x = 0`` control is
+    appended last, which is the layout the checkpoints already carry.
+    """
+    index_x0 = int(np.abs(x_cm).argmin())
+    in_band = np.flatnonzero(
+        (np.abs(x_cm) > BAND_MIN_CM) & (np.abs(x_cm) <= BAND_MAX_CM)
+    )
+    return np.concatenate([in_band, [index_x0]]), index_x0
+
+
+def refit_port(
+    dataset: LapdDataset,
+    run_id: str,
+    set_id: int,
+    port: int,
+    x_cm: np.ndarray,
+    cells: np.ndarray,
+    index_x0: int,
+    *,
+    plateau_ms: tuple[float, float],
+    clip_us: float,
+    order: int,
+) -> dict:
+    """Re-fit every window in the family, for every sweep, at every band cell."""
+    started = time.time()
+    run = dataset.run(run_id)
+    cycle_start_s = _pls._cycle_start_times(run)
+    in_plateau = np.flatnonzero(
+        (cycle_start_s * 1e3 >= plateau_ms[0]) & (cycle_start_s * 1e3 <= plateau_ms[1])
+    )
+    core_cutoff_hz, _ = _pls._cutoff_hz_for_run(run, 100.0e3)
+    sample_rate_hz = run.config.acquisition.sample_rate_hz
+    i_offset = run.default_zero_offset_v(ChannelKind.I_SWEEP)
+    v_offset = run.default_zero_offset_v(ChannelKind.V_SWEEP)
+    ramp_slices = run.sweep_ramp_sample_slices(clip_s=clip_us * 1e-6)
+
+    te_default = {cell: [] for cell in cells}
+    te_grid = {cell: [] for cell in cells}
+    for cycle in in_plateau:
+        ramp = ramp_slices[cycle]
+        i_all = run.langmuir_traces(ChannelKind.I_SWEEP, ramp, zero_offset_v=i_offset)
+        v_all = run.langmuir_traces(ChannelKind.V_SWEEP, ramp, zero_offset_v=v_offset)
+        for cell in cells:
+            i_cell = butterworth_lowpass(
+                i_all[cell],
+                sample_rate_hz=sample_rate_hz,
+                cutoff_hz=core_cutoff_hz,
+                order=order,
+            )
+            v_cell = butterworth_lowpass(
+                v_all[cell],
+                sample_rate_hz=sample_rate_hz,
+                cutoff_hz=core_cutoff_hz,
+                order=order,
+            )
+            for shot in range(i_cell.shape[0]):
+                default, grid = _rw.refit_sweep(v_cell[shot], i_cell[shot])
+                te_default[cell].append(default)
+                te_grid[cell].append(grid)
+        del i_all, v_all
+
+    n_cells = len(cells)
+    dln = np.full(n_cells, np.nan)
+    te_default_med = np.full(n_cells, np.nan)
+    n_sweeps = np.zeros(n_cells, dtype=int)
+    med_grids = np.full((n_cells, len(_rw.P_LOW), len(_rw.F_HIGH)), np.nan)
+    for index, cell in enumerate(cells):
+        defaults = np.asarray(te_default[cell], dtype=float)
+        grids = np.asarray(te_grid[cell], dtype=float)
+        defaults[(defaults <= 0.05) | (defaults > 30.0)] = np.nan
+        grids[(grids <= 0.05) | (grids > 30.0)] = np.nan
+        median_grid = np.nanmedian(grids, axis=0)
+        med_grids[index] = median_grid
+        te_min, te_max = np.nanmin(median_grid), np.nanmax(median_grid)
+        if np.isfinite(te_min) and te_min > 0:
+            dln[index] = float(np.log(te_max / te_min))
+        te_default_med[index] = float(np.nanmedian(defaults))
+        n_sweeps[index] = int(np.isfinite(defaults).sum())
+
+    return dict(
+        cells=cells,
+        x_cm=x_cm[cells],
+        is_x0=(cells == index_x0),
+        dln_te_window=dln,
+        te_default_med=te_default_med,
+        n_sweeps=n_sweeps,
+        med_grids=med_grids,
+        run_id=run_id,
+        sid=set_id,
+        port=port,
+        wall_s=time.time() - started,
+        n_plateau=len(in_plateau),
+    )
+
+
+def _port_summary(record: dict) -> dict:
+    """Return the per-port in-band statistics and the criterion verdict."""
+    is_x0 = np.asarray(record["is_x0"], dtype=bool)
+    dln = np.asarray(record["dln_te_window"], dtype=float)
+    in_band = dln[~is_x0]
+    x0 = float(dln[is_x0][0])
+    median = float(np.nanmedian(in_band))
+    return {
+        "set_id": int(record["sid"]),
+        "port": int(record["port"]),
+        "run_id": str(record["run_id"]),
+        "n_plateau_cycles": int(record["n_plateau"]),
+        "in_band_cells": int(in_band.size),
+        "in_band_median_dln": median,
+        "in_band_upper_quartile_dln": float(np.nanpercentile(in_band, 75)),
+        "in_band_max_dln": float(np.nanmax(in_band)),
+        "in_band_fraction_at_or_above_criterion": float(
+            np.mean(in_band >= CRITERION_DLN)
+        ),
+        "x0_control_dln": x0,
+        "criterion_dln": CRITERION_DLN,
+        "passes_criterion": bool(median < CRITERION_DLN),
+        "x0_control_passes_criterion": bool(x0 < CRITERION_DLN),
+        "adopted_2026_08_20z": bool(
+            (int(record["sid"]), int(record["port"])) in ADOPTED_SET_PORTS
+        ),
+    }
+
+
+def write_product(
+    records: list[dict],
+    x_cm: np.ndarray,
+    *,
+    hdf5_path: Path,
+    summary_path: Path,
+    metadata_path: Path,
+) -> list[dict]:
+    """Write the HDF5 product, the tracked per-cell CSV and the metadata."""
+    created = _datetime.datetime.now(_datetime.UTC).isoformat(timespec="seconds")
+    summaries = [_port_summary(record) for record in records]
+
+    hdf5_path.parent.mkdir(parents=True, exist_ok=True)
+    with h5py.File(hdf5_path, "w") as hdf:
+        hdf.attrs["protocol"] = PROTOCOL
+        hdf.attrs["adjudication"] = ADJUDICATION
+        hdf.attrs["lineage"] = LINEAGE
+        hdf.attrs["generating_script"] = "scripts/refit_window_band.py"
+        hdf.attrs["criterion_dln_te_window"] = CRITERION_DLN
+        hdf.attrs["band_min_cm"] = BAND_MIN_CM
+        hdf.attrs["band_max_cm"] = BAND_MAX_CM
+        hdf.attrs["plateau_ms"] = np.asarray(PLATEAU_MS, dtype=np.float64)
+        hdf.attrs["clip_us"] = CLIP_US
+        hdf.attrs["filter_order"] = FILTER_ORDER
+        hdf.attrs["window_p_low_percent"] = np.asarray(_rw.P_LOW, dtype=np.float64)
+        hdf.attrs["window_f_high_fraction"] = np.asarray(_rw.F_HIGH, dtype=np.float64)
+        hdf.attrs["source_sweeps_hdf5"] = str(_rw.SWEEPS_H5.name)
+        hdf.attrs["created_utc"] = created
+        hdf.create_dataset("x_cm", data=x_cm)
+        for record, summary in zip(records, summaries):
+            group = hdf.create_group(f"set{summary['set_id']}/port{summary['port']}")
+            for key, value in summary.items():
+                group.attrs[key] = value
+            group.attrs["wall_s"] = float(record["wall_s"])
+            group.create_dataset("cell_index", data=np.asarray(record["cells"]))
+            group.create_dataset("x_cm", data=np.asarray(record["x_cm"]))
+            group.create_dataset("is_x0", data=np.asarray(record["is_x0"], dtype=bool))
+            group.create_dataset(
+                "in_band", data=~np.asarray(record["is_x0"], dtype=bool)
+            )
+            group.create_dataset("dln_te_window", data=record["dln_te_window"])
+            group.create_dataset("te_default_med_ev", data=record["te_default_med"])
+            group.create_dataset("n_sweeps", data=np.asarray(record["n_sweeps"]))
+            group.create_dataset("te_window_ev", data=record["med_grids"])
+    print(f"wrote {hdf5_path}")
+
+    with summary_path.open("w", newline="") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "set_id",
+                "port",
+                "run_id",
+                "x_cm",
+                "is_x0_control",
+                "in_band",
+                "dln_te_window",
+                "te_default_med_ev",
+                "n_sweeps",
+                "at_or_above_criterion",
+            ]
+        )
+        for record, summary in zip(records, summaries):
+            is_x0 = np.asarray(record["is_x0"], dtype=bool)
+            for index in range(is_x0.size):
+                dln = float(record["dln_te_window"][index])
+                writer.writerow(
+                    [
+                        summary["set_id"],
+                        summary["port"],
+                        summary["run_id"],
+                        f"{float(record['x_cm'][index]):.6g}",
+                        int(is_x0[index]),
+                        int(not is_x0[index]),
+                        f"{dln:.9g}",
+                        f"{float(record['te_default_med'][index]):.9g}",
+                        int(record["n_sweeps"][index]),
+                        int(np.isfinite(dln) and dln >= CRITERION_DLN),
+                    ]
+                )
+    print(f"wrote {summary_path}")
+
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "product": "window_refit_band",
+                "created_utc": created,
+                "generating_script": "scripts/refit_window_band.py",
+                "protocol": PROTOCOL,
+                "adjudication": ADJUDICATION,
+                "lineage": LINEAGE,
+                "criterion_dln_te_window": CRITERION_DLN,
+                "band_min_cm": BAND_MIN_CM,
+                "band_max_cm": BAND_MAX_CM,
+                "plateau_ms": list(PLATEAU_MS),
+                "window_p_low_percent": list(_rw.P_LOW),
+                "window_f_high_fraction": list(_rw.F_HIGH),
+                "full_product_hdf5": str(hdf5_path.relative_to(ROOT)),
+                "per_cell_csv": str(summary_path.relative_to(ROOT)),
+                "ports": summaries,
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    print(f"wrote {metadata_path}")
+    return summaries
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument("--output", type=Path, default=OUTPUT_HDF5)
+    parser.add_argument("--summary", type=Path, default=OUTPUT_SUMMARY)
+    parser.add_argument("--metadata", type=Path, default=OUTPUT_METADATA)
+    parser.add_argument(
+        "--work-dir",
+        type=Path,
+        default=WORK_DIR,
+        help="per-(set, port) npz checkpoints; an existing checkpoint is reused",
+    )
+    parser.add_argument("--plateau-ms", nargs=2, type=float, default=PLATEAU_MS)
+    parser.add_argument("--clip-us", type=float, default=CLIP_US)
+    parser.add_argument("--order", type=int, default=FILTER_ORDER)
+    args = parser.parse_args()
+
+    args.work_dir.mkdir(parents=True, exist_ok=True)
+    with h5py.File(_rw.SWEEPS_H5, "r") as hdf:
+        x_cm = hdf["x_cm"][:]
+    cells, index_x0 = band_cell_indices(x_cm)
+    dataset = LapdDataset.from_manifest(_rw.MANIFEST)
+
+    records = []
+    for set_id, run_id, port in _rw.rot0_runs(sets=SETS):
+        checkpoint = args.work_dir / f"di_set{set_id}_port{port}.npz"
+        if checkpoint.exists():
+            with np.load(checkpoint, allow_pickle=False) as loaded:
+                record = {key: loaded[key] for key in loaded.files}
+            record["run_id"] = str(record["run_id"])
+            print(f"[reuse] set{set_id} port{port} <- {checkpoint.name}")
+        else:
+            record = refit_port(
+                dataset,
+                run_id,
+                set_id,
+                port,
+                x_cm,
+                cells,
+                index_x0,
+                plateau_ms=tuple(args.plateau_ms),
+                clip_us=args.clip_us,
+                order=args.order,
+            )
+            np.savez(checkpoint, **record)
+            print(
+                f"[done] set{set_id} port{port} run={run_id} "
+                f"wall={record['wall_s']:.0f}s"
+            )
+        if not np.array_equal(np.asarray(record["cells"]), cells):
+            raise ValueError(
+                f"{checkpoint} was fitted on a different cell set than the "
+                "current band definition"
+            )
+        records.append(record)
+
+    summaries = write_product(
+        records,
+        x_cm,
+        hdf5_path=args.output,
+        summary_path=args.summary,
+        metadata_path=args.metadata,
+    )
+
+    print(
+        f"\n{'set':>3} {'port':>5} {'median':>7} {'UQ':>7} {'max':>7} "
+        f"{'frac>=c':>8} {'x0':>7}  verdict"
+    )
+    for summary in summaries:
+        verdict = "PASS" if summary["passes_criterion"] else "FAIL"
+        if not summary["x0_control_passes_criterion"]:
+            verdict += " (x0 control FAILS)"
+        print(
+            f"{summary['set_id']:>3} {summary['port']:>5} "
+            f"{summary['in_band_median_dln']:7.3f} "
+            f"{summary['in_band_upper_quartile_dln']:7.3f} "
+            f"{summary['in_band_max_dln']:7.3f} "
+            f"{summary['in_band_fraction_at_or_above_criterion']:8.2f} "
+            f"{summary['x0_control_dln']:7.3f}  {verdict}"
+        )
+
+
+if __name__ == "__main__":
+    main()

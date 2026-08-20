@@ -5,11 +5,17 @@ The NPZ product is self-contained and uses simulation-facing units:
 * core density and total SEM in cm^-3;
 * flux-tube-averaged density in cm^-3 and flux-tube-averaged ion-saturation
   current in A, the second radial-averaging convention (see below);
-* core electron temperature and radial SEM in eV;
+* core electron temperature in eV and its total SEM, the radial scatter and
+  the fit-window convention added in quadrature;
+* the per-port trust model the filled T_e was built under, and the per-port,
+  per-sample count of semi-quantitative cells behind each T_e row;
 * offset-corrected upstream ion-saturation current at x=0 in A;
 * offset-corrected discharge current in A and cathode-anode voltage in V,
   each with the shot-to-shot standard deviation and the SEM of the mean;
 * per-port fractional spread of the fit-window T_e re-fits, dimensionless;
+* the per-port, per-sample record of where the filled T_e product's core-mean
+  monotonic-z clamp acted, so a consumer can see which T_e samples are a
+  neighbouring port's value rather than their own;
 * all time axes in ms relative to the experimental SIS trigger.
 
 Probe-A density SEM includes the propagated area-calibration uncertainty.
@@ -709,6 +715,106 @@ def _te_window_spread_frac(
     return spread
 
 
+#: Records the filled T_e product has to carry before it can be exported.  A
+#: product without them is REFUSED rather than
+#: exported silently without the record, the same way the monotonic-z
+#: clamp record has been required since schema v15: a consumer scoring a T_e
+#: row must be able to see which cells behind it are semi-quantitative and how
+#: far out the measurement was trusted, and a missing record is indistinguish-
+#: able from "nothing was marked" once it is gone.
+REQUIRED_TE_RECORDS = (
+    "core_mean_te_monotonic_clamped",
+    "core_mean_te_monotonic_scale",
+    "te_trust_radius_cm",
+    "te_trust_blend_cm",
+    "te_semi_quantitative_core_count",
+    "te_semi_quantitative_band_count",
+    "te_core_window_sem_ev",
+    "te_window_dln_core_control",
+    "te_window_dln_core_control_source",
+    "te_row_measured_cells",
+    "te_row_measured_core_cells",
+)
+
+
+def _te_trust_records(
+    te_group: h5py.Group,
+    te_path: Path,
+    experiment_set_id: int,
+) -> dict[str, np.ndarray | str]:
+    """Return the filled T_e product's trust and semi-quantitative records.
+
+    Refuses a product that is missing any of ``REQUIRED_TE_RECORDS``, and one
+    whose window-spread uncertainty was accumulated over a different core band
+    than this exporter's, since the two are then not the same quantity and
+    combining them would silently mix bands.
+    """
+    for required in REQUIRED_TE_RECORDS:
+        if required not in te_group:
+            raise ValueError(
+                f"{te_path} ES{experiment_set_id} carries no {required} "
+                "record; rebuild it with scripts/fit_te_spatial.py"
+            )
+    window_band = (
+        float(te_group.attrs["te_core_window_sem_x_min_cm"]),
+        float(te_group.attrs["te_core_window_sem_x_max_cm"]),
+    )
+    if window_band != (X_MIN_CM, X_MAX_CM):
+        raise ValueError(
+            f"{te_path} ES{experiment_set_id} accumulated its window-spread "
+            f"uncertainty over {window_band} cm, not this exporter's core band "
+            f"({X_MIN_CM:g}, {X_MAX_CM:g}) cm; the two must agree or the "
+            "exported te_sem_ev mixes bands"
+        )
+    return {
+        "clamped": np.asarray(
+            te_group["core_mean_te_monotonic_clamped"][()], dtype=np.bool_
+        ),
+        "clamp_scale": np.asarray(
+            te_group["core_mean_te_monotonic_scale"][()], dtype=np.float64
+        ),
+        "trust_radius_cm": np.asarray(
+            te_group["te_trust_radius_cm"][()], dtype=np.float64
+        ),
+        "trust_blend_cm": np.asarray(
+            te_group["te_trust_blend_cm"][()], dtype=np.float64
+        ),
+        "semi_quant_core_count": np.asarray(
+            te_group["te_semi_quantitative_core_count"][()], dtype=np.int16
+        ),
+        "semi_quant_band_count": np.asarray(
+            te_group["te_semi_quantitative_band_count"][()], dtype=np.int16
+        ),
+        "window_sem_ev": np.asarray(
+            te_group["te_core_window_sem_ev"][()], dtype=np.float64
+        ),
+        "core_control_dln": np.asarray(
+            te_group["te_window_dln_core_control"][()], dtype=np.float64
+        ),
+        "core_control_source": np.asarray(
+            te_group["te_window_dln_core_control_source"][()], dtype=np.int8
+        ),
+        "core_control_source_codes": str(
+            te_group.attrs["te_window_core_control_source_codes"]
+        ),
+        "row_measured_cells": np.asarray(
+            te_group["te_row_measured_cells"][()], dtype=np.int16
+        ),
+        "row_measured_core_cells": np.asarray(
+            te_group["te_row_measured_core_cells"][()], dtype=np.int16
+        ),
+        "row_provenance_definition": str(
+            te_group.attrs["te_row_provenance_definition"]
+        ),
+        "qc_floor_rule": str(te_group.attrs["te_qc_floor_rule"]),
+        "trust_model": str(te_group.attrs["te_trust_model"]),
+        "semi_quant_rule": str(te_group.attrs["te_semi_quantitative_rule"]),
+        "window_sem_definition": str(
+            te_group.attrs["te_core_window_sem_definition"]
+        ),
+    }
+
+
 def _discharge_stats(
     dataset: LapdDataset,
     experiment_set_id: int,
@@ -829,6 +935,8 @@ def export_overlay(
             X_MAX_CM,
             dataset="te_filled",
         )
+        te_group = te_hdf[f"experiment_sets/{experiment_set_key}"]
+        te_records = _te_trust_records(te_group, te_path, experiment_set_id)
         if not np.allclose(density.z_cm, te.z_cm):
             raise ValueError(
                 f"ES{experiment_set_id} density and temperature z grids differ"
@@ -897,7 +1005,7 @@ def export_overlay(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        schema_version=np.array(13, dtype=np.int16),
+        schema_version=np.array(21, dtype=np.int16),
         experiment_set_id=np.array(experiment_set_id, dtype=np.int16),
         experiment_label=np.array(experiment_label),
         port=PORTS,
@@ -909,9 +1017,77 @@ def export_overlay(
         density_core_count=density.count,
         te_time_ms=te.time_ms,
         te_mean_ev=te.mean,
-        te_sem_ev=te.sem,
+        te_sem_ev=np.hypot(
+            te.sem, np.nan_to_num(te_records["window_sem_ev"], nan=0.0)
+        ),
+        te_radial_sem_ev=te.sem,
+        te_window_sem_ev=te_records["window_sem_ev"],
+        te_sem_definition=np.array(
+            "te_sem_ev is the radial scatter of the core-band cells "
+            "(te_radial_sem_ev) and the fit-window convention term "
+            "(te_window_sem_ev) added in quadrature.  The second is non-zero "
+            "only where a core cell is semi-quantitative for its measured "
+            "window spread; see te_window_sem_definition and "
+            "te_semi_quantitative_rule.  Schema v15 and earlier carried the "
+            "radial term alone under the name te_sem_ev.  Schema v17 read the "
+            "x = 0 core control from the band product only, so the two ES3 "
+            "ports whose control fails were silent there; v19 reads it from "
+            "the union of both window-refit products, and te_core_control_dln "
+            "and te_core_control_source say which product spoke per port."
+        ),
+        te_window_sem_definition=np.array(te_records["window_sem_definition"]),
+        te_trust_radius_cm=te_records["trust_radius_cm"],
+        te_trust_blend_cm=te_records["trust_blend_cm"],
+        te_trust_model=np.array(te_records["trust_model"]),
+        te_semi_quantitative_core_count=te_records["semi_quant_core_count"],
+        te_semi_quantitative_band_count=te_records["semi_quant_band_count"],
+        te_semi_quantitative_rule=np.array(te_records["semi_quant_rule"]),
+        te_core_control_dln=te_records["core_control_dln"],
+        te_core_control_source=te_records["core_control_source"],
+        te_core_control_source_codes=np.array(
+            te_records["core_control_source_codes"]
+        ),
+        te_row_measured=(te_records["row_measured_cells"] > 0),
+        te_row_measured_cells=te_records["row_measured_cells"],
+        te_row_measured_core_cells=te_records["row_measured_core_cells"],
+        te_row_provenance_definition=np.array(
+            te_records["row_provenance_definition"]
+            + "  te_row_measured[port, sample] is the boolean form: False "
+            "means the T_e row at that port and sample is PRIOR-DERIVED and "
+            "is not a measurement of that port.  Seven port-rows in this "
+            "dataset are prior-derived at every sample -- ES3 p21/p41/p50 and "
+            "ES4 p21/p29/p41/p50 -- and anything computed from their T_e, "
+            "including the density and the flux-tube average, inherits that."
+        ),
+        te_qc_floor_rule=np.array(te_records["qc_floor_rule"]),
+        te_semi_quantitative_definition=np.array(
+            "te_semi_quantitative_core_count[port, sample] counts the cells "
+            f"inside the core band ({X_MIN_CM:g} to {X_MAX_CM:g} cm) behind "
+            "that te_mean_ev which are semi-quantitative; a non-zero count "
+            "means the T_e row is semi-quantitative at that sample.  "
+            "te_semi_quantitative_band_count is the same count over the "
+            "measurement band outside the core, the cells that reach the "
+            "density chain through C_s but never enter te_mean_ev.  A marked "
+            "cell keeps its measured value in the filled product."
+        ),
         te_core_count=te.count,
         te_window_spread_frac=te_window_spread,
+        te_core_mean_clamped=te_records["clamped"],
+        te_core_mean_clamp_scale=te_records["clamp_scale"],
+        te_core_mean_clamp_definition=np.array(
+            "te_core_mean_clamped[port, sample] is True where the filled T_e "
+            "product's core-mean monotonic-z clamp rescaled that port's radial "
+            "profile so its core mean did not exceed the coolest core mean "
+            "upstream of it, and te_core_mean_clamp_scale is the factor it "
+            "applied about the 0.1 eV boundary temperature (1.0 where it did "
+            "not act).  A clamped sample's te_mean_ev is by construction the "
+            "upstream row's value rather than its own, so the two ports are "
+            "then one number and not two measurements.  The clamp only rewrites "
+            "a port that carries measured core cells where the MEASURED core "
+            "means are themselves non-monotonic; a port with no measured core "
+            "cells is reconstructed from its neighbours and the end boundaries, "
+            "and the prior is its only axial constraint."
+        ),
         core_x_min_cm=np.array(X_MIN_CM),
         core_x_max_cm=np.array(X_MAX_CM),
         probe_a_factor=np.array(factor),

@@ -35,3 +35,7 @@ processed/*.hdf5
 processed/*.npz
 processed/isweep_frontside_arc_shot_exclusions.csv
 processed/sweep_log.txt
+
+# Per-(set, port) window-refit checkpoints; the assembled product and its
+# tracked summary/metadata are what matter, and the checkpoints are large.
+processed/window_refit_band_work/
