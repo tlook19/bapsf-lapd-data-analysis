@@ -1,4 +1,4 @@
-"""Append the raw drive-window Isat family to a sim1d overlay (v2..v21 odd).
+"""Append the raw drive-window Isat family to a sim1d overlay (v2..v23 odd).
 
 Adds ``isat_drive_*`` — the upstream ion-saturation current from the
 inter-sweep dead-time cells DURING the drive — to an existing
@@ -16,11 +16,15 @@ flow-symmetrized geomean target), v15 (adds the per-port
 the semi-quantitative T_e records, and splits ``te_sem_ev`` into a radial
 and a fit-window term), v19 (adds the x = 0 core control read from the union of both
 window-refit products, ``te_core_control_dln``/``te_core_control_source``),
-or v21 (the current export, which adds the per-port measured vs
+v21 (adds the per-port measured vs
 prior-derived provenance record ``te_row_measured`` and the
-radius-conditional QC floor statement).  A v5 input is
+radius-conditional QC floor statement), or v23 (the current export,
+which adds the downstream-face afterglow trace, the x = 0
+flow-symmetrized geomean, and the interferometer chord family).
+A v5 input is
 written back as SCHEMA v6, a v7 as v8, a v9 as v10, a v11 as v12, a v13
-as v14, a v15 as v16, a v17 as v18, a v19 as v20 and a v21 as v22, so
+as v14, a v15 as v16, a v17 as v18, a v19 as v20, a v21 as v22 and a
+v23 as v24, so
 each family's presence stays readable from the
 version alone; an augmented version is never itself an accepted input,
 which is what makes a second augmentation fail the gate.
@@ -71,7 +75,7 @@ SEAM_WINDOW_MS = 0.25  # first slice of the decay trace used for the seam gate
 # already-augmented overlay fail the gate instead of being augmented twice.
 AUGMENTED_SCHEMA = {
     2: 4, 3: 4, 5: 6, 7: 8, 9: 10, 11: 12, 13: 14, 15: 16, 17: 18, 19: 20,
-    21: 22,
+    21: 22, 23: 24,
 }
 
 

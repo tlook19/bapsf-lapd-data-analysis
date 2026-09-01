@@ -891,7 +891,6 @@ def _interferometer_decay_stats(
     }
 
 
-
 def _te_window_spread_frac(
     refits_path: Path,
     experiment_set_id: int,
@@ -1232,7 +1231,7 @@ def export_overlay(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        schema_version=np.array(21, dtype=np.int16),
+        schema_version=np.array(23, dtype=np.int16),
         experiment_set_id=np.array(experiment_set_id, dtype=np.int16),
         experiment_label=np.array(experiment_label),
         port=PORTS,
@@ -1354,8 +1353,8 @@ def export_overlay(
         isat_decay_dn_source_file=np.array(str(rot0_isat_profile_path)),
         isat_decay_dn_source_channel=isat_decay_dn["source_channel"],
         isat_decay_dn_source_inverted=isat_decay_dn["source_inverted"],
-        isat_decay_geomean_a=isat_decay_geomean["geomean_a_per_cm2"],
-        isat_decay_geomean_sem_a=isat_decay_geomean["sem_a_per_cm2"],
+        isat_decay_geomean_a_per_cm2=isat_decay_geomean["geomean_a_per_cm2"],
+        isat_decay_geomean_sem_a_per_cm2=isat_decay_geomean["sem_a_per_cm2"],
         isat_decay_geomean_area_cm2=isat_decay_geomean["area_cm2"],
         isat_decay_geomean_pairing=isat_decay_geomean["pairing"],
         isat_decay_face_convention=np.array(
@@ -1382,20 +1381,21 @@ def export_overlay(
             "isat_decay_n_shots_rejected for the upstream face and "
             "isat_decay_dn_n_shots_used / isat_decay_dn_n_shots_rejected for "
             "the downstream one, and they are not equal port by port.  "
-            "isat_decay_geomean_a is sqrt(J_up * J_dn) of the two faces' "
-            "AREA-NORMALIZED currents and is therefore in A cm^-2, NOT in "
-            "amperes despite the name: the per-run (upstream, downstream) face "
-            "areas actually used are isat_decay_geomean_area_cm2 and the "
-            "channel/area pairing is isat_decay_geomean_pairing, so "
-            "sqrt(A_up * A_dn) x isat_decay_geomean_a recovers a current in A. "
-            " In the Chung two-sided model the faces carry reciprocal flow "
+            "isat_decay_geomean_a_per_cm2 is sqrt(J_up * J_dn) of the two "
+            "faces' AREA-NORMALIZED currents, in A cm^-2: the per-run "
+            "(upstream, downstream) face areas actually used are "
+            "isat_decay_geomean_area_cm2 and the channel/area pairing is "
+            "isat_decay_geomean_pairing, so sqrt(A_up * A_dn) x "
+            "isat_decay_geomean_a_per_cm2 recovers a current in A.  In the "
+            "Chung two-sided model the faces carry reciprocal flow "
             "factors exp(+K M / 2) and exp(-K M / 2), which cancel in the "
             "geometric mean to first order in M, so the geomean is the "
             "flow-artifact-cancelled central estimator while each single face "
             "keeps that artifact with the opposite sign; this is the same "
             "construction as isat_ftavg_geomean_* (see "
             "isat_ftavg_geomean_definition and ftavg_face_ruling).  "
-            "isat_decay_geomean_sem_a uses that family's propagation, "
+            "isat_decay_geomean_sem_a_per_cm2 uses that family's "
+            "propagation, "
             "geomean x 0.5 x hypot(sem_up / I_up, sem_dn / I_dn).  A sample is "
             "NaN wherever either face is non-finite or non-positive -- the p50 "
             "upstream trace decays through zero late in the afterglow, so the "
