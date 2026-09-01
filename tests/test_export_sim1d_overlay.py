@@ -1,3 +1,5 @@
+from pathlib import Path
+
 import h5py
 import numpy as np
 import pytest
@@ -5,6 +7,7 @@ import pytest
 from scripts.export_es1_sim1d_overlay import (
     DESPIKE_MIN_PEAK_FRACTION,
     FLUX_TUBE_RADIUS_CM,
+    PLASMA_DIAMETER_CM,
     PORTS,
     X_MAX_CM,
     X_MIN_CM,
@@ -12,6 +15,8 @@ from scripts.export_es1_sim1d_overlay import (
     _flux_tube_profile_stats,
     _flow_symmetrized_profiles,
     _flux_tube_weights,
+    _interferometer_decay_stats,
+    _isat_decay_geomean,
     _rot0_isat_profiles,
     _subtract_background,
     _te_trust_records,
@@ -414,3 +419,344 @@ def test_the_exported_te_sem_adds_the_window_term_in_quadrature():
 
     assert combined[0, 0] == pytest.approx(0.5)
     assert combined[0, 1] == pytest.approx(0.4)
+
+
+# ---------------------------------------------------------------------------
+# Both probe faces through the afterglow, and their geometric mean
+# ---------------------------------------------------------------------------
+def _decay_face(channel, current, sem=1.0, run_id="01", port=11):
+    """One face of the x=0 afterglow pair, in ``_isat_decay_stats``' return shape."""
+    current = np.atleast_1d(np.asarray(current, dtype=np.float64))
+    sem = np.broadcast_to(
+        np.atleast_1d(np.asarray(sem, dtype=np.float64)), current.shape
+    )
+    return {
+        "time_ms": np.arange(current.size, dtype=np.float64),
+        "mean_a": current[None, :].copy(),
+        "sem_a": np.array(sem, dtype=np.float64)[None, :].copy(),
+        "port": np.array([port], dtype=np.int16),
+        "run_id": np.asarray([run_id]),
+        "source_channel": np.asarray([channel]),
+    }
+
+
+def test_decay_geomean_normalizes_each_face_by_its_own_channel_area():
+    combined = _isat_decay_geomean(
+        _decay_face("i_sweep", 6.0), _decay_face("isat", 8.0), AREAS
+    )
+    # sqrt((6/2) * (8/4)) = sqrt(6), in A cm^-2 and not in amperes.
+    assert combined["geomean_a_per_cm2"][0, 0] == pytest.approx(np.sqrt(6.0))
+    assert combined["area_cm2"].tolist() == [[2.0, 4.0]]
+    assert "ap_L_cm2" in str(combined["pairing"][0])
+
+
+def test_decay_geomean_is_symmetric_under_exchanging_the_two_faces():
+    forward = _isat_decay_geomean(
+        _decay_face("i_sweep", 6.0), _decay_face("isat", 8.0), AREAS
+    )
+    swapped = _isat_decay_geomean(
+        _decay_face("isat", 8.0), _decay_face("i_sweep", 6.0), AREAS
+    )
+    assert forward["geomean_a_per_cm2"][0, 0] == pytest.approx(
+        swapped["geomean_a_per_cm2"][0, 0]
+    )
+
+
+def test_decay_geomean_cancels_reciprocal_flow_factors():
+    # Chung: the faces carry exp(+KM/2) and exp(-KM/2) about a common level.
+    boost = np.exp(0.37)
+    plain = _isat_decay_geomean(
+        _decay_face("i_sweep", 2.0), _decay_face("isat", 4.0), AREAS
+    )
+    flowing = _isat_decay_geomean(
+        _decay_face("i_sweep", 2.0 * boost), _decay_face("isat", 4.0 / boost), AREAS
+    )
+    assert flowing["geomean_a_per_cm2"][0, 0] == pytest.approx(
+        plain["geomean_a_per_cm2"][0, 0]
+    )
+
+
+def test_decay_geomean_relative_error_is_half_the_quadrature_of_the_faces():
+    combined = _isat_decay_geomean(
+        _decay_face("i_sweep", 2.0, sem=0.2),
+        _decay_face("isat", 4.0, sem=0.8),
+        AREAS,
+    )
+    value = combined["geomean_a_per_cm2"][0, 0]
+    expected = value * 0.5 * np.hypot(0.2 / 2.0, 0.8 / 4.0)
+    assert combined["sem_a_per_cm2"][0, 0] == pytest.approx(expected)
+
+
+def test_decay_geomean_is_nan_where_a_face_is_not_positive_and_clips_nothing():
+    """The p50 upstream face decays through zero; that sample is NaN, not clipped."""
+    combined = _isat_decay_geomean(
+        _decay_face("i_sweep", [2.0, -1.0, 3.0, 0.0]),
+        _decay_face("isat", [4.0, 4.0, 4.0, 4.0]),
+        AREAS,
+    )
+    geomean = combined["geomean_a_per_cm2"][0]
+    sem = combined["sem_a_per_cm2"][0]
+
+    # J_up = [1, -0.5, 1.5, 0] and J_dn = 1 everywhere, so only 0 and 2 survive.
+    assert np.isfinite(geomean).tolist() == [True, False, True, False]
+    assert geomean[0] == pytest.approx(1.0)
+    assert geomean[2] == pytest.approx(np.sqrt(1.5))
+    assert np.isfinite(sem).tolist() == [True, False, True, False]
+
+
+def test_decay_geomean_refuses_two_readings_of_the_same_face():
+    with pytest.raises(ValueError, match="no second face"):
+        _isat_decay_geomean(
+            _decay_face("i_sweep", 2.0), _decay_face("i_sweep", 3.0), AREAS
+        )
+
+
+def test_decay_geomean_refuses_faces_that_disagree_on_ports_runs_or_time():
+    with pytest.raises(ValueError, match="disagree on ports"):
+        _isat_decay_geomean(
+            _decay_face("i_sweep", 2.0),
+            _decay_face("isat", 3.0, port=50),
+            AREAS,
+        )
+    with pytest.raises(ValueError, match="disagree on runs"):
+        _isat_decay_geomean(
+            _decay_face("i_sweep", 2.0),
+            _decay_face("isat", 3.0, run_id="08"),
+            AREAS,
+        )
+    shifted = _decay_face("isat", 3.0)
+    shifted["time_ms"] = shifted["time_ms"] + 1.0
+    with pytest.raises(ValueError, match="disagree on the time grid"):
+        _isat_decay_geomean(_decay_face("i_sweep", 2.0), shifted, AREAS)
+
+
+# ---------------------------------------------------------------------------
+# Interferometer chords
+# ---------------------------------------------------------------------------
+LECROY_MS = np.array([0.0, 1.0, 2.0])
+RIGOL_MS = np.array([-1.0, 0.5, 2.5])
+
+
+class _StubRun:
+    def __init__(self, path):
+        self.path = str(path)
+
+
+class _StubDataset:
+    """The two ``LapdDataset`` entry points the interferometer reader uses."""
+
+    def __init__(self, paths_by_run_id):
+        self._paths = dict(paths_by_run_id)
+
+    def experiment_set_run_ids(self, experiment_set_id):
+        return list(self._paths)
+
+    def run(self, run_id):
+        return _StubRun(self._paths[run_id])
+
+
+def _write_interferometer(
+    path,
+    shots,
+    *,
+    calibration=1.0,
+    missing=(),
+    rigol_time_ms=RIGOL_MS,
+):
+    """Minimal stand-in for one run's ``diagnostics/interferometer`` group."""
+    with h5py.File(path, "w") as hdf:
+        group = hdf.create_group("diagnostics/interferometer")
+        lecroy = group.create_group("time_array")
+        rigol = group.create_group("time_array_p40")
+        for port in (20, 29, 40):
+            phase_group = group.create_group(f"phase_p{port}")
+            phase_group.attrs["calibration factor (m^-3/rad)"] = calibration
+            for key, phase in shots[port].items():
+                dataset = phase_group.create_dataset(
+                    str(key), data=np.asarray(phase, dtype=np.float64)
+                )
+                if (port, key) in missing:
+                    dataset.attrs["rigol_missing"] = True
+                grid = rigol if port == 40 else lecroy
+                if str(key) not in grid:
+                    grid.create_dataset(
+                        str(key),
+                        data=(rigol_time_ms if port == 40 else LECROY_MS),
+                    )
+    return path
+
+
+def _flat_shots(values, n_samples=3):
+    return {
+        port: {
+            index: np.full(n_samples, float(value))
+            for index, value in enumerate(values)
+        }
+        for port in (20, 29, 40)
+    }
+
+
+def test_interferometer_pools_every_shot_of_every_run(tmp_path):
+    first = _write_interferometer(tmp_path / "a.hdf5", _flat_shots([1.0, 3.0]))
+    second = _write_interferometer(tmp_path / "b.hdf5", _flat_shots([5.0, 7.0]))
+    dataset = _StubDataset({"01": first, "02": second})
+
+    stats = _interferometer_decay_stats(dataset, 1)
+
+    scale = 1.0e-6 * PLASMA_DIAMETER_CM
+    assert stats["n_shots"].tolist() == [4, 4, 4]
+    assert stats["line_density_cm2"][0, 0] == pytest.approx(4.0 * scale)
+    # ddof=1 over [1, 3, 5, 7] is sqrt(20/3); the SEM divides by sqrt(4).
+    assert stats["sem_cm2"][0, 0] == pytest.approx(
+        np.sqrt(20.0 / 3.0) / 2.0 * scale
+    )
+    assert stats["port"].tolist() == [20, 29, 40]
+    assert stats["z_cm"].tolist() == pytest.approx([757.6, 1045.15, 1396.6])
+    assert stats["run_id"].shape == (3, 2)
+    assert stats["plasma_diameter_cm"] == PLASMA_DIAMETER_CM
+
+
+def test_interferometer_applies_each_chord_calibration_factor(tmp_path):
+    path = _write_interferometer(
+        tmp_path / "a.hdf5", _flat_shots([2.0]), calibration=3.0
+    )
+    dataset = _StubDataset({"01": path})
+
+    stats = _interferometer_decay_stats(dataset, 1)
+
+    assert stats["line_density_cm2"][1, 0] == pytest.approx(
+        2.0 * 3.0 * 1.0e-6 * PLASMA_DIAMETER_CM
+    )
+
+
+def test_interferometer_skips_rigol_missing_shots(tmp_path):
+    path = _write_interferometer(
+        tmp_path / "a.hdf5",
+        _flat_shots([1.0, 99.0]),
+        missing=((40, 1),),
+    )
+    dataset = _StubDataset({"01": path})
+
+    stats = _interferometer_decay_stats(dataset, 1)
+
+    assert stats["n_shots"].tolist() == [2, 2, 1]
+    assert stats["line_density_cm2"][2, 0] == pytest.approx(
+        1.0e-6 * PLASMA_DIAMETER_CM
+    )
+
+
+def test_interferometer_puts_the_rigol_chord_on_the_shared_lecroy_grid(tmp_path):
+    ramp = {
+        port: {0: (RIGOL_MS if port == 40 else LECROY_MS) * 2.0 + 1.0}
+        for port in (20, 29, 40)
+    }
+    path = _write_interferometer(tmp_path / "a.hdf5", ramp)
+    dataset = _StubDataset({"01": path})
+
+    stats = _interferometer_decay_stats(dataset, 1)
+
+    assert np.array_equal(stats["time_ms"], LECROY_MS)
+    assert stats["line_density_cm2"].shape == (3, LECROY_MS.size)
+    assert stats["sem_cm2"].shape == (3, LECROY_MS.size)
+    # The ramp is linear in t on both grids, so the interpolation is exact.
+    expected = (LECROY_MS * 2.0 + 1.0) * 1.0e-6 * PLASMA_DIAMETER_CM
+    assert stats["line_density_cm2"][2] == pytest.approx(expected)
+    assert stats["line_density_cm2"][0] == pytest.approx(expected)
+
+
+def test_interferometer_refuses_a_chord_that_stops_short_of_the_shared_grid(tmp_path):
+    path = _write_interferometer(
+        tmp_path / "a.hdf5",
+        _flat_shots([1.0]),
+        rigol_time_ms=np.array([0.5, 1.0, 1.5]),
+    )
+    dataset = _StubDataset({"01": path})
+
+    with pytest.raises(ValueError, match="does not cover the shared grid"):
+        _interferometer_decay_stats(dataset, 1)
+
+
+# ---------------------------------------------------------------------------
+# The exported product, when a regenerated one is on disk
+# ---------------------------------------------------------------------------
+OVERLAY_NPZ = Path("processed/es1_sim1d_overlay.npz")
+NEW_ISAT_KEYS = (
+    "isat_decay_dn_mean_a",
+    "isat_decay_dn_sem_a",
+    "isat_decay_dn_n_shots_used",
+    "isat_decay_dn_n_shots_rejected",
+    "isat_decay_geomean_a",
+    "isat_decay_geomean_sem_a",
+    "isat_decay_geomean_area_cm2",
+    "isat_decay_face_convention",
+)
+NEW_INTERF_KEYS = (
+    "interf_decay_time_ms",
+    "interf_decay_line_density_cm2",
+    "interf_decay_sem_cm2",
+    "interf_decay_port",
+    "interf_decay_z_cm",
+    "interf_decay_n_shots",
+    "interf_decay_run_ids",
+    "interf_decay_convention",
+    "interf_decay_chord_caveat",
+    "interf_decay_clock_offset",
+)
+
+
+@pytest.mark.skipif(
+    not OVERLAY_NPZ.exists(), reason="no regenerated ES1 overlay on disk"
+)
+def test_the_exported_overlay_carries_both_faces_and_the_chords():
+    overlay = np.load(OVERLAY_NPZ, allow_pickle=True)
+    for key in NEW_ISAT_KEYS + NEW_INTERF_KEYS:
+        assert key in overlay.files, key
+
+    n_ports = overlay["isat_decay_port"].size
+    n_time = overlay["isat_decay_time_ms"].size
+    for key in ("isat_decay_dn_mean_a", "isat_decay_dn_sem_a", "isat_decay_geomean_a",
+                "isat_decay_geomean_sem_a"):
+        assert overlay[key].shape == (n_ports, n_time), key
+    assert overlay["isat_decay_dn_n_shots_used"].shape == (n_ports,)
+    assert overlay["isat_decay_dn_n_shots_rejected"].shape == (n_ports,)
+    assert overlay["isat_decay_geomean_area_cm2"].shape == (n_ports, 2)
+
+    n_chords = overlay["interf_decay_port"].size
+    n_interf = overlay["interf_decay_time_ms"].size
+    assert overlay["interf_decay_port"].tolist() == [20, 29, 40]
+    assert overlay["interf_decay_line_density_cm2"].shape == (n_chords, n_interf)
+    assert overlay["interf_decay_sem_cm2"].shape == (n_chords, n_interf)
+    assert overlay["interf_decay_z_cm"].shape == (n_chords,)
+    assert overlay["interf_decay_n_shots"].shape == (n_chords,)
+    assert overlay["interf_decay_run_ids"].shape[0] == n_chords
+
+
+@pytest.mark.skipif(
+    not OVERLAY_NPZ.exists(), reason="no regenerated ES1 overlay on disk"
+)
+def test_the_exported_geomean_is_the_two_faces_area_normalized_geometric_mean():
+    overlay = np.load(OVERLAY_NPZ, allow_pickle=True)
+    areas = overlay["isat_decay_geomean_area_cm2"]
+    upstream = overlay["isat_decay_mean_a"] / areas[:, 0][:, None]
+    downstream = overlay["isat_decay_dn_mean_a"] / areas[:, 1][:, None]
+    product = upstream * downstream
+    expected = np.where(
+        np.isfinite(product) & (product > 0.0), np.sqrt(np.abs(product)), np.nan
+    )
+
+    assert np.array_equal(overlay["isat_decay_geomean_a"], expected, equal_nan=True)
+    # The NaN policy is load-bearing: at least one port decays through zero.
+    assert not np.isfinite(overlay["isat_decay_geomean_a"]).all()
+
+
+@pytest.mark.skipif(
+    not OVERLAY_NPZ.exists(), reason="no regenerated ES1 overlay on disk"
+)
+def test_the_two_faces_reject_different_shots():
+    overlay = np.load(OVERLAY_NPZ, allow_pickle=True)
+    upstream = overlay["isat_decay_n_shots_rejected"]
+    downstream = overlay["isat_decay_dn_n_shots_rejected"]
+
+    assert upstream.shape == downstream.shape
+    assert not np.array_equal(upstream, downstream)
+    assert "REJECT" in str(overlay["isat_decay_face_convention"])

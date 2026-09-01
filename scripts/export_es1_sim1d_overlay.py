@@ -9,7 +9,10 @@ The NPZ product is self-contained and uses simulation-facing units:
   the fit-window convention added in quadrature;
 * the per-port trust model the filled T_e was built under, and the per-port,
   per-sample count of semi-quantitative cells behind each T_e row;
-* offset-corrected upstream ion-saturation current at x=0 in A;
+* offset-corrected ion-saturation current at x=0 in A for BOTH Mach-probe
+  faces, and the flow-symmetrized geometric mean of the two in A cm^-2;
+* shot-averaged interferometer line-integrated density in cm^-2 for the
+  three chords, on the raw interferometer clock;
 * offset-corrected discharge current in A and cathode-anode voltage in V,
   each with the shot-to-shot standard deviation and the SEM of the mean;
 * per-port fractional spread of the fit-window T_e re-fits, dimensionless;
@@ -23,7 +26,16 @@ The ion-current decay uses the same one-sided high-current detector as the
 profile pipeline.  A shot is excluded from the continuous decay trace if it is
 flagged in any pre-afterglow inter-sweep cell at x=0.  The retained traces are
 100 kHz low-pass filtered and reduced to approximately 10 us time bins before
-the shot mean and SEM are computed.
+the shot mean and SEM are computed.  The downstream face runs the identical
+pipeline against its own product, and therefore builds its OWN shot ensemble
+from its own channel's flags: the two faces reject different shots and both
+ensemble sizes are exported.  See ``isat_decay_face_convention``.
+
+The interferometer chords are read with the repo's own reader and alignment
+(``plot_interferometer_by_experiment_set``): per-chord Welford statistics over
+every stored shot of every run in the set, pooled, on that chord's reference
+time grid, then put on one shared grid.  Its clock is NOT the Isat clock; see
+``interf_decay_clock_offset``.
 Each run's discharge current has its own additive channel zero offset
 subtracted before smoothing; the per-run values are exported alongside the
 traces.  Discharge traces are smoothed with the same 9-sample moving average
@@ -90,6 +102,7 @@ import numpy as np
 from scipy.ndimage import uniform_filter1d
 
 from bapsf_lapd import ChannelKind, LapdDataset
+from bapsf_lapd.config import z_from_port
 from bapsf_lapd.filtering import butterworth_lowpass
 from plot_core_density_temperature_timeseries import (
     DENSITY_SCALE_M3,
@@ -101,6 +114,14 @@ from plot_decay_rates_x0 import (
     _load_zero_offsets,
     _padded_sample_window,
     _zero_offset_v,
+)
+from plot_interferometer_by_experiment_set import (
+    INTERFEROMETER_PORTS,
+    PLASMA_DIAMETER_CM,
+    RunningTraceStats,
+    _phase_group,
+    _reference_time_grid,
+    _time_group,
 )
 from plot_isat_profiles import _deadtime_shot_means, _high_shot_outlier_mask
 
@@ -682,6 +703,195 @@ def _isat_decay_stats(
     }
 
 
+def _isat_decay_geomean(
+    upstream: dict,
+    downstream: dict,
+    areas_cm2: dict[str, dict[str, float]],
+) -> dict[str, np.ndarray]:
+    """Return the flow-artifact-cancelled x=0 afterglow current density.
+
+    The x=0 continuous-trace form of ``_flow_symmetrized_profiles``: per port
+    and per time sample, the geometric mean ``sqrt(J_up * J_dn)`` of the two
+    probe faces' AREA-NORMALIZED currents, in A cm^-2.  The Chung argument and
+    the SEM propagation are that function's; only the array rank differs, since
+    the decay traces carry no x axis.
+
+    The two faces must come from the same runs in the same order and must agree
+    on the time grid, and each run must report a DIFFERENT electrical channel
+    for its two faces -- otherwise there is no second face to symmetrize
+    against.  The area normalization is keyed off each run's own recorded
+    channel, not off which product supplied it.
+
+    A sample is NaN wherever either face is non-finite or non-positive; a
+    geometric mean of a non-positive current is not defined, and a face that
+    has decayed through zero is data, not an artifact to be clipped away.
+    """
+    if not np.array_equal(upstream["port"], downstream["port"]):
+        raise ValueError(
+            f"Isat decay faces disagree on ports: {upstream['port']} vs "
+            f"{downstream['port']}"
+        )
+    if not np.array_equal(upstream["run_id"], downstream["run_id"]):
+        raise ValueError(
+            f"Isat decay faces disagree on runs: {upstream['run_id']} vs "
+            f"{downstream['run_id']}"
+        )
+    if not np.allclose(
+        upstream["time_ms"], downstream["time_ms"], rtol=0.0, atol=1e-9
+    ):
+        raise ValueError("Isat decay faces disagree on the time grid")
+
+    geomean = np.empty_like(np.asarray(upstream["mean_a"], dtype=np.float64))
+    sem = np.empty_like(geomean)
+    used_areas = []
+    pairing = []
+    for index, run_id in enumerate(upstream["run_id"]):
+        run_id = str(run_id)
+        channels = (
+            str(upstream["source_channel"][index]),
+            str(downstream["source_channel"][index]),
+        )
+        if channels[0] == channels[1]:
+            raise ValueError(
+                f"run {run_id}: both Isat decay faces report the {channels[0]} "
+                "channel, so there is no second face to symmetrize against"
+            )
+        currents = (upstream["mean_a"][index], downstream["mean_a"][index])
+        sems = (upstream["sem_a"][index], downstream["sem_a"][index])
+        densities = []
+        relatives = []
+        run_areas = []
+        for channel, current, current_sem in zip(channels, currents, sems):
+            if channel not in CHANNEL_AREA_ATTR:
+                raise ValueError(f"run {run_id}: unknown probe channel {channel}")
+            area = float(areas_cm2[run_id][CHANNEL_AREA_ATTR[channel]])
+            if area <= 0.0:
+                raise ValueError(f"run {run_id}: non-positive {channel} face area")
+            run_areas.append(area)
+            densities.append(current / area)
+            with np.errstate(invalid="ignore", divide="ignore"):
+                relatives.append(current_sem / current)
+        product = densities[0] * densities[1]
+        usable = np.isfinite(product) & (product > 0.0)
+        geomean[index] = np.where(usable, np.sqrt(np.abs(product)), np.nan)
+        # d(sqrt(ab))/sqrt(ab) = 0.5 * hypot(da/a, db/b)
+        sem[index] = geomean[index] * 0.5 * np.hypot(relatives[0], relatives[1])
+        pairing.append(
+            f"{channels[0]}/{CHANNEL_AREA_ATTR[channels[0]]}={run_areas[0]:.6f} cm2"
+            f" x {channels[1]}/{CHANNEL_AREA_ATTR[channels[1]]}="
+            f"{run_areas[1]:.6f} cm2"
+        )
+        used_areas.append(run_areas)
+    return {
+        "geomean_a_per_cm2": geomean,
+        "sem_a_per_cm2": sem,
+        "area_cm2": np.asarray(used_areas, dtype=np.float64),
+        "pairing": np.asarray(pairing),
+    }
+
+
+def _interferometer_decay_stats(
+    dataset: LapdDataset,
+    experiment_set_id: int,
+) -> dict[str, np.ndarray]:
+    """Return the shot-averaged interferometer line density for the three chords.
+
+    The reader, the calibration, the ``rigol_missing`` skip, the Welford shot
+    statistics, the per-chord reference time grid and the ``np.interp``
+    alignment onto it are all
+    ``plot_interferometer_by_experiment_set.build_grouped_stats``, restricted
+    to one experiment set; the line-integrated normalization is that module's
+    ``PLASMA_DIAMETER_CM`` (40 cm) times the line-average density.  Every shot
+    of every run in the set enters ONE pooled accumulator per chord, so the
+    exported mean is not a mean of per-run means and the exported SEM is the
+    pooled standard deviation over ``n_shots``.
+
+    The three chords do not share a digitizer: p20 and p29 sit on the LeCroy
+    ``time_array`` and p40 on the Rigol ``time_array_p40``.  Each chord is
+    reduced on its own reference grid first, and the result is then
+    interpolated once onto the first chord's grid so the exported product has a
+    single time axis.  A chord whose own grid does not cover that shared grid is
+    REFUSED rather than silently extrapolated by ``np.interp``'s endpoint hold.
+
+    ``MSI/Interferometer array`` is malformed in these files and is never read.
+    """
+    run_ids = list(dataset.experiment_set_run_ids(experiment_set_id))
+    chord_time_ms = []
+    chord_mean_cm3 = []
+    chord_sem_cm3 = []
+    chord_n = []
+    for port in INTERFEROMETER_PORTS:
+        reference_time_ms = _reference_time_grid(dataset, experiment_set_id, port)
+        stats = RunningTraceStats.empty(reference_time_ms)
+        phase_group = _phase_group(port)
+        time_group = _time_group(port)
+        for run_id in run_ids:
+            run = dataset.run(run_id)
+            with h5py.File(run.path, "r") as hdf:
+                calibration = float(
+                    hdf[phase_group].attrs["calibration factor (m^-3/rad)"]
+                )
+                for key in sorted(hdf[phase_group].keys(), key=int):
+                    phase_ds = hdf[f"{phase_group}/{key}"]
+                    if bool(phase_ds.attrs.get("rigol_missing", False)):
+                        continue
+                    phase = phase_ds[()].astype(np.float64)
+                    time_ms = hdf[f"{time_group}/{key}"][()].astype(np.float64)
+                    line_average_cm3 = phase * calibration * M3_TO_CM3
+                    if np.array_equal(time_ms, reference_time_ms):
+                        aligned = line_average_cm3
+                    else:
+                        aligned = np.interp(
+                            reference_time_ms, time_ms, line_average_cm3
+                        )
+                    stats.update(aligned)
+        if stats.count == 0:
+            raise RuntimeError(
+                f"No experiment-set-{experiment_set_id} interferometer shots "
+                f"for chord p{port}"
+            )
+        chord_time_ms.append(reference_time_ms)
+        chord_mean_cm3.append(stats.mean)
+        chord_sem_cm3.append(stats.stderr)
+        chord_n.append(stats.count)
+
+    shared_time_ms = chord_time_ms[0]
+    mean = []
+    sem = []
+    for index, port in enumerate(INTERFEROMETER_PORTS):
+        own_time_ms = chord_time_ms[index]
+        if np.array_equal(own_time_ms, shared_time_ms):
+            mean.append(chord_mean_cm3[index])
+            sem.append(chord_sem_cm3[index])
+            continue
+        if (
+            own_time_ms[0] > shared_time_ms[0]
+            or own_time_ms[-1] < shared_time_ms[-1]
+        ):
+            raise ValueError(
+                f"interferometer chord p{port} spans "
+                f"[{own_time_ms[0]:g}, {own_time_ms[-1]:g}] ms and does not "
+                f"cover the shared grid "
+                f"[{shared_time_ms[0]:g}, {shared_time_ms[-1]:g}] ms"
+            )
+        mean.append(np.interp(shared_time_ms, own_time_ms, chord_mean_cm3[index]))
+        sem.append(np.interp(shared_time_ms, own_time_ms, chord_sem_cm3[index]))
+
+    return {
+        "time_ms": shared_time_ms,
+        "line_density_cm2": np.stack(mean, axis=0) * PLASMA_DIAMETER_CM,
+        "sem_cm2": np.stack(sem, axis=0) * PLASMA_DIAMETER_CM,
+        "port": np.asarray(INTERFEROMETER_PORTS, dtype=np.int16),
+        "z_cm": np.asarray(
+            [z_from_port(port) for port in INTERFEROMETER_PORTS], dtype=np.float64
+        ),
+        "n_shots": np.asarray(chord_n, dtype=np.int32),
+        "run_id": np.asarray([run_ids for _ in INTERFEROMETER_PORTS]),
+        "plasma_diameter_cm": PLASMA_DIAMETER_CM,
+    }
+
+
+
 def _te_window_spread_frac(
     refits_path: Path,
     experiment_set_id: int,
@@ -964,6 +1174,23 @@ def export_overlay(
             f"ES{experiment_set_id} Isat decay ports {isat_decay['port']} "
             f"do not match expected {PORTS}"
         )
+    isat_decay_dn = _isat_decay_stats(
+        dataset,
+        rot0_isat_profile_path,
+        zero_offsets_path,
+        experiment_set_id,
+    )
+    if not np.array_equal(isat_decay_dn["port"], PORTS):
+        raise ValueError(
+            f"ES{experiment_set_id} downstream Isat decay ports "
+            f"{isat_decay_dn['port']} do not match expected {PORTS}"
+        )
+    isat_decay_geomean = _isat_decay_geomean(
+        isat_decay,
+        isat_decay_dn,
+        face_areas_cm2,
+    )
+    interf_decay = _interferometer_decay_stats(dataset, experiment_set_id)
     discharge = _discharge_stats(dataset, experiment_set_id)
     te_window_spread = _te_window_spread_frac(
         window_refits_path,
@@ -1118,6 +1345,121 @@ def export_overlay(
         ),
         isat_decay_face=np.array(
             "upstream-facing electrical channel at x=0; see per-port source metadata"
+        ),
+        isat_decay_dn_mean_a=isat_decay_dn["mean_a"],
+        isat_decay_dn_sem_a=isat_decay_dn["sem_a"],
+        isat_decay_dn_n_shots_used=isat_decay_dn["n_shots_used"],
+        isat_decay_dn_n_shots_rejected=isat_decay_dn["n_shots_rejected"],
+        isat_decay_dn_zero_offset_v=isat_decay_dn["zero_offset_v"],
+        isat_decay_dn_source_file=np.array(str(rot0_isat_profile_path)),
+        isat_decay_dn_source_channel=isat_decay_dn["source_channel"],
+        isat_decay_dn_source_inverted=isat_decay_dn["source_inverted"],
+        isat_decay_geomean_a=isat_decay_geomean["geomean_a_per_cm2"],
+        isat_decay_geomean_sem_a=isat_decay_geomean["sem_a_per_cm2"],
+        isat_decay_geomean_area_cm2=isat_decay_geomean["area_cm2"],
+        isat_decay_geomean_pairing=isat_decay_geomean["pairing"],
+        isat_decay_face_convention=np.array(
+            "BOTH Mach-probe faces at x = 0, on the shared isat_decay_time_ms "
+            "grid, at the same ports and the same runs (isat_decay_port, "
+            "isat_decay_run_id apply to both).  isat_decay_mean_a / "
+            "isat_decay_sem_a are the UPSTREAM face at rot-0 -- the 'i_sweep' "
+            "channel, ruled the Isat truth channel 2026-08-18 -- and "
+            "isat_decay_dn_mean_a / isat_decay_dn_sem_a are the DOWNSTREAM "
+            "face, the 'isat' channel, which collects in the probe body's flow "
+            "shadow and under-reads.  Both are raw currents in A with no "
+            "Probe-A effective-area factor applied, exactly as before.  Each "
+            "face's channel and polarity are read from its own product's run "
+            "attrs and exported as isat_decay_source_channel / "
+            "isat_decay_dn_source_channel and the matching _source_inverted "
+            "arrays; the source products are isat_decay_dn_source_file and the "
+            "upstream default of --isat-profiles.  The two faces run the "
+            "IDENTICAL pipeline (padded read window, per-shot digitizer "
+            "Scale/Offset, cached zero-offset subtraction, channel "
+            "calibration, polarity, 100 kHz zero-phase low-pass, 10 us mean "
+            "bins) but each builds its OWN fixed shot ensemble from its own "
+            "channel's inter-sweep outlier flags, so THE TWO FACES REJECT "
+            "DIFFERENT SHOTS: the sizes are isat_decay_n_shots_used / "
+            "isat_decay_n_shots_rejected for the upstream face and "
+            "isat_decay_dn_n_shots_used / isat_decay_dn_n_shots_rejected for "
+            "the downstream one, and they are not equal port by port.  "
+            "isat_decay_geomean_a is sqrt(J_up * J_dn) of the two faces' "
+            "AREA-NORMALIZED currents and is therefore in A cm^-2, NOT in "
+            "amperes despite the name: the per-run (upstream, downstream) face "
+            "areas actually used are isat_decay_geomean_area_cm2 and the "
+            "channel/area pairing is isat_decay_geomean_pairing, so "
+            "sqrt(A_up * A_dn) x isat_decay_geomean_a recovers a current in A. "
+            " In the Chung two-sided model the faces carry reciprocal flow "
+            "factors exp(+K M / 2) and exp(-K M / 2), which cancel in the "
+            "geometric mean to first order in M, so the geomean is the "
+            "flow-artifact-cancelled central estimator while each single face "
+            "keeps that artifact with the opposite sign; this is the same "
+            "construction as isat_ftavg_geomean_* (see "
+            "isat_ftavg_geomean_definition and ftavg_face_ruling).  "
+            "isat_decay_geomean_sem_a uses that family's propagation, "
+            "geomean x 0.5 x hypot(sem_up / I_up, sem_dn / I_dn).  A sample is "
+            "NaN wherever either face is non-finite or non-positive -- the p50 "
+            "upstream trace decays through zero late in the afterglow, so the "
+            "p50 geomean is NaN from there on.  That is the data and is NOT "
+            "clipped."
+        ),
+        interf_decay_time_ms=interf_decay["time_ms"],
+        interf_decay_line_density_cm2=interf_decay["line_density_cm2"],
+        interf_decay_sem_cm2=interf_decay["sem_cm2"],
+        interf_decay_port=interf_decay["port"],
+        interf_decay_z_cm=interf_decay["z_cm"],
+        interf_decay_n_shots=interf_decay["n_shots"],
+        interf_decay_run_ids=interf_decay["run_id"],
+        interf_decay_plasma_diameter_cm=np.array(
+            interf_decay["plasma_diameter_cm"]
+        ),
+        interf_decay_convention=np.array(
+            "Shot-averaged interferometer LINE-INTEGRATED density, shaped "
+            "(chord, time).  Units cm^-2 = interf_decay_plasma_diameter_cm "
+            "(40 cm) x the line-average density in cm^-3, the calibration's "
+            "own convention.  Per chord the stored phase is multiplied by that "
+            "chord's 'calibration factor (m^-3/rad)' attribute, shots carrying "
+            "rigol_missing are skipped, and the shot statistics are the repo's "
+            "Welford accumulation over EVERY stored shot of ALL the runs in "
+            "interf_decay_run_ids, pooled into one accumulator per chord -- "
+            "this is not a mean of per-run means.  interf_decay_n_shots is "
+            "that pooled count and interf_decay_sem_cm2 is the pooled sample "
+            "standard deviation divided by sqrt(interf_decay_n_shots), so it "
+            "carries the shot-to-shot machine jitter and no per-shot time "
+            "alignment is applied.  Alignment is the repo's own: each shot is "
+            "np.interp-ed onto its chord's reference grid, the first stored "
+            "time array of the set's first run.  p20 and p29 sit on the LeCroy "
+            "'time_array' and p40 on the Rigol 'time_array_p40', so the p40 "
+            "chord mean and SEM are interpolated once more onto the p20 grid "
+            "and all three chords share interf_decay_time_ms; p40's own grid "
+            "strictly contains that shared grid, so nothing is extrapolated.  "
+            "interf_decay_time_ms is the RAW interferometer clock, uncorrected "
+            "-- see interf_decay_clock_offset.  MSI/'Interferometer array' is "
+            "malformed in these files and is never read."
+        ),
+        interf_decay_chord_caveat=np.array(
+            "A chord is a LINE INTEGRAL across the whole column at its port, "
+            "not a core quantity: it weights the edge and the scrape-off layer "
+            "the same as the axis, and the 40 cm plasma diameter behind the "
+            "cm^-2 normalization is the calibration's fixed assumption, not a "
+            "per-shot measured width.  It is therefore NOT commensurate with "
+            "the core-band density_mean_cm3 or with the flux-tube "
+            "density_ftavg_cm3, and it must not be compared to either as a "
+            "level without stating that.  The chords also sit at ports "
+            "20/29/40 (interf_decay_z_cm), which are not the probe ports "
+            "11/21/29/41/50 -- only p29 coincides.  Use it as a decay SHAPE "
+            "and as an independent line-integrated magnitude."
+        ),
+        interf_decay_clock_offset=np.array(
+            "UNCORRECTED clock offset between the two families.  MSI/Discharge "
+            "and every isat_decay_* / discharge_* field sit on the SIS trigger "
+            "grid; the interferometer sits on the LeCroy (p20/p29) and Rigol "
+            "(p40) digitizers.  Measured over the eight ES1 runs by comparing "
+            "the 10 % rise of the discharge current with the 10 % rise of the "
+            "p29 line density, the interferometer clock runs LATE by +0.26 to "
+            "+0.46 ms (run-by-run range; median about +0.42 ms).  NO alignment "
+            "is applied: interf_decay_time_ms is the raw interferometer clock "
+            "and isat_decay_time_ms is the raw SIS clock.  A consumer putting "
+            "the two on one axis must carry this as a systematic."
         ),
         discharge_time_ms=discharge["time_ms"],
         discharge_current_mean_a=discharge["current_mean_a"],
