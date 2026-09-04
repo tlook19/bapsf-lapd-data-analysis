@@ -12,6 +12,10 @@ Mach is computed from area-normalized ion-saturation current:
 
   M = ln[(I_upstream / A_upstream) / (I_downstream / A_downstream)] / K
 
+The two faces are paired by (port, z), and both must come from the SAME run:
+a run-id mismatch means one source product was built without the effective-
+rotation overrides in ``bapsf_lapd.corrections``, and the script refuses.
+
 Velocity is ``M * C_s`` in km/s, where ``C_s`` is computed from filled T_e.
 The script uses ``isat_a_raw`` so the Mach ratio is controlled only by the
 probe-area calibration TOML, not by any plotting/density scale factor baked into
@@ -206,6 +210,19 @@ def _process_rotation(
             down_run = down_entries[location_key]
             up_run_id = str(up_run.attrs["run_id"])
             down_run_id = str(down_run.attrs["run_id"])
+            if up_run_id != down_run_id:
+                port, z_cm = location_key
+                raise ValueError(
+                    "Upstream and downstream faces come from different runs: "
+                    f"upstream run {up_run_id} ({upstream_hdf.filename}) vs "
+                    f"downstream run {down_run_id} ({downstream_hdf.filename}) "
+                    f"at experiment set {es_id}, port {port}, z = {z_cm:g} cm, "
+                    f"rotation {rotation_deg} deg. The two faces of a Mach pair "
+                    "must be the same run; a mismatch means one source product "
+                    "was built without the effective-rotation overrides in "
+                    "bapsf_lapd.corrections. Rebuild the offending product "
+                    "before recomputing Mach."
+                )
 
             probe = _probe_id(up_run_id)
             calib = calibration[probe]
@@ -218,8 +235,7 @@ def _process_rotation(
                 downstream_area_m2=calib[downstream_area_key.replace("cm2", "m2")],
                 current_factor=probe_a_factor if probe == "A" else 1.0,
             )
-            pair_note = "" if up_run_id == down_run_id else f" downstream={down_run_id}"
-            print(f"  ES {es_id} run {up_run_id} rot={rotation_deg} port={up_run.attrs['port']}{pair_note}")
+            print(f"  ES {es_id} run {up_run_id} rot={rotation_deg} port={up_run.attrs['port']}")
             out_run = out_set.create_group(up_run_id)
             for key in (
                 "run_id",
