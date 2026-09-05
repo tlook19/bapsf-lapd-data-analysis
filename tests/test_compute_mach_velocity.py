@@ -1,0 +1,177 @@
+"""Rail-mask exclusion in the Mach/velocity computation."""
+
+import h5py
+import numpy as np
+import pytest
+
+from compute_mach_velocity import (
+    MACH_K,
+    RAIL_MASK_DATASET,
+    X_CM,
+    _compute_run,
+    _face_rail_mask,
+    _rail_rule,
+)
+
+
+N_X = X_CM.size
+N_WINDOWS = 4
+Z_CM = 789.55
+RULE_TEXT = "cell excluded when it contains any railed raw sample"
+
+
+def _write_face(group, current_a, *, rail_mask=None, rule=None):
+    """One probe face of a dead-time profile product."""
+    group.create_dataset("isat_a_raw", data=current_a)
+    group.create_dataset("isat_a_raw_std", data=np.full_like(current_a, 1e-4))
+    group.create_dataset(
+        "inter_sweep_time_s", data=np.linspace(1e-3, 4e-3, N_WINDOWS)
+    )
+    group.attrs["run_id"] = "43"
+    group.attrs["z_cm"] = Z_CM
+    if rail_mask is not None:
+        group.create_dataset(RAIL_MASK_DATASET, data=rail_mask)
+    if rule is not None:
+        group.file.attrs["rail_mask_rule"] = rule
+
+
+def _make_inputs(tmp_path, *, upstream_mask=None, downstream_mask=None, rule=None):
+    """A minimal upstream/downstream pair plus the filled-T_e grid they need."""
+    rng = np.random.default_rng(20260904)
+    upstream_a = 0.05 + 0.01 * rng.random((N_X, N_WINDOWS))
+    downstream_a = 0.02 + 0.01 * rng.random((N_X, N_WINDOWS))
+
+    up_path = tmp_path / "upstream.hdf5"
+    down_path = tmp_path / "downstream.hdf5"
+    te_path = tmp_path / "te.hdf5"
+
+    with h5py.File(up_path, "w") as f:
+        _write_face(f.create_group("run"), upstream_a, rail_mask=upstream_mask, rule=rule)
+    with h5py.File(down_path, "w") as f:
+        _write_face(f.create_group("run"), downstream_a, rail_mask=downstream_mask)
+    with h5py.File(te_path, "w") as f:
+        grp = f.create_group("experiment_sets/1")
+        grp.create_dataset("x_cm", data=X_CM)
+        grp.create_dataset("z_cm", data=np.array([Z_CM]))
+        grp.create_dataset("cycle_time_ms", data=np.linspace(0.0, 20.0, 8))
+        grp.create_dataset("te_filled", data=np.full((1, N_X, 8), 4.0))
+
+    return up_path, down_path, te_path
+
+
+def _run(tmp_path, **kwargs):
+    up_path, down_path, te_path = _make_inputs(tmp_path, **kwargs)
+    with (
+        h5py.File(up_path, "r") as up,
+        h5py.File(down_path, "r") as down,
+        h5py.File(te_path, "r") as te,
+    ):
+        return _compute_run(
+            up["run"],
+            down["run"],
+            te,
+            "1",
+            upstream_area_m2=2.0e-6,
+            downstream_area_m2=1.0e-6,
+            current_factor=1.0,
+        )
+
+
+MASKED_DATASETS = (
+    "mach",
+    "mach_std",
+    "velocity_km_s",
+    "velocity_km_s_std",
+    "upstream_current_density_a_m2",
+    "downstream_current_density_a_m2",
+)
+
+
+def test_no_mask_excludes_nothing_and_is_recorded(tmp_path):
+    results, prov = _run(tmp_path)
+
+    assert prov["rail_cells_excluded"] == 0
+    assert prov["rail_cells_kept"] == N_X * N_WINDOWS
+    assert prov["rail_mask_upstream_present"] is False
+    assert prov["rail_mask_downstream_present"] is False
+    # A product predating the marking is recorded as unmasked, not as clean.
+    assert "predates the rail-mask marking" in prov["rail_exclusion_rule"]
+    assert not results["rail_excluded_cells"].any()
+    for name in MASKED_DATASETS:
+        assert np.isfinite(results[name]).all()
+
+
+def test_upstream_mask_drops_those_cells_on_both_faces(tmp_path):
+    mask = np.zeros((N_X, N_WINDOWS), dtype=bool)
+    mask[10, 1] = True
+    mask[25, :2] = True
+
+    masked = _run(tmp_path, upstream_mask=mask, rule=RULE_TEXT)[0]
+    unmasked = _run(tmp_path)[0]
+
+    for name in MASKED_DATASETS:
+        assert np.isnan(masked[name][mask]).all(), name
+        # Both faces lose the cell, so a survivor is still a true pair; and the
+        # surviving cells are untouched, bit for bit.
+        assert np.array_equal(masked[name][~mask], unmasked[name][~mask]), name
+
+    assert np.array_equal(masked["rail_excluded_cells"], mask)
+
+
+def test_downstream_mask_also_excludes(tmp_path):
+    mask = np.zeros((N_X, N_WINDOWS), dtype=bool)
+    mask[3, 2] = True
+
+    results, prov = _run(tmp_path, downstream_mask=mask)
+
+    assert prov["rail_mask_upstream_present"] is False
+    assert prov["rail_mask_downstream_present"] is True
+    assert prov["rail_cells_excluded"] == 1
+    assert np.isnan(results["mach"][3, 2])
+
+
+def test_masks_from_both_faces_are_unioned(tmp_path):
+    up_mask = np.zeros((N_X, N_WINDOWS), dtype=bool)
+    up_mask[5, 0] = True
+    down_mask = np.zeros((N_X, N_WINDOWS), dtype=bool)
+    down_mask[7, 3] = True
+
+    results, prov = _run(tmp_path, upstream_mask=up_mask, downstream_mask=down_mask)
+
+    assert prov["rail_cells_excluded"] == 2
+    assert prov["rail_cells_excluded_upstream"] == 1
+    assert prov["rail_cells_excluded_downstream"] == 1
+    assert np.isnan(results["mach"][5, 0])
+    assert np.isnan(results["mach"][7, 3])
+    assert np.isfinite(results["mach"][5, 3])
+
+
+def test_rule_is_read_from_the_product_that_carries_the_mask(tmp_path):
+    mask = np.zeros((N_X, N_WINDOWS), dtype=bool)
+    mask[0, 0] = True
+    _, prov = _run(tmp_path, upstream_mask=mask, rule=RULE_TEXT)
+    assert prov["rail_exclusion_rule"] == RULE_TEXT
+
+
+def test_unmasked_mach_still_matches_the_closed_form(tmp_path):
+    results, _ = _run(tmp_path)
+    expected = np.log(
+        results["upstream_current_density_a_m2"]
+        / results["downstream_current_density_a_m2"]
+    ) / MACH_K
+    assert np.allclose(results["mach"], expected, rtol=0, atol=0)
+
+
+def test_wrong_shaped_mask_is_refused(tmp_path):
+    up_path, _, _ = _make_inputs(
+        tmp_path, upstream_mask=np.zeros((N_X, N_WINDOWS), dtype=bool)
+    )
+    with h5py.File(up_path, "r") as f:
+        with pytest.raises(ValueError, match="per \\(position, dead-time window\\)"):
+            _face_rail_mask(f["run"], (N_X, N_WINDOWS + 1))
+
+
+def test_rule_falls_back_when_no_product_states_one(tmp_path):
+    up_path, down_path, _ = _make_inputs(tmp_path)
+    with h5py.File(up_path, "r") as up, h5py.File(down_path, "r") as down:
+        assert "predates the rail-mask marking" in _rail_rule(up["run"], down["run"])
