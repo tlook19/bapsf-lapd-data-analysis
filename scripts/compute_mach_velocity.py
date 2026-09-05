@@ -12,10 +12,22 @@ Mach is computed from area-normalized ion-saturation current:
 
   M = ln[(I_upstream / A_upstream) / (I_downstream / A_downstream)] / K
 
+The two faces are paired by (port, z), and both must come from the SAME run:
+a run-id mismatch means one source product was built without the effective-
+rotation overrides in ``bapsf_lapd.corrections``, and the script refuses.
+
 Velocity is ``M * C_s`` in km/s, where ``C_s`` is computed from filled T_e.
 The script uses ``isat_a_raw`` so the Mach ratio is controlled only by the
 probe-area calibration TOML, not by any plotting/density scale factor baked into
 ``isat_a``.
+
+Railed cells are excluded.  A source product may carry a per-(position,
+dead-time window) ``rail_mask`` marking the cells whose raw samples hit a
+digitizer rail; such a cell carries no measurement, only the converter limit.
+A cell masked on EITHER face is dropped from the pair's Mach and velocity
+statistics on BOTH faces, so the surviving cells are still true pairs.  Products
+built before the marking existed carry no mask, are treated as unmasked, and say
+so in the output attrs -- the absence of a mask is recorded, never assumed clean.
 
 Usage
 -----
@@ -45,6 +57,13 @@ ISAT_ROT0_HDF5 = Path("processed/isat_profiles.hdf5")
 ISAT_ROT180_HDF5 = Path("processed/isat_rot180_deadtime_profiles.hdf5")
 ISWEEP_ROT180_HDF5 = Path("processed/isweep_rot180_deadtime_profiles.hdf5")
 HDF5_OUTPUT = Path("processed/mach_velocity.hdf5")
+
+RAIL_MASK_DATASET = "rail_mask"
+RAIL_RULE_ATTR = "rail_mask_rule"
+NO_MASK_NOTE = (
+    "source product carries no {dataset!r} dataset; it predates the rail-mask "
+    "marking and is treated as unmasked"
+)
 
 M_I_AMU = 4.003
 MACH_K = 1.66
@@ -100,6 +119,35 @@ def _interp_filled_te_to_deadtime(
         np.interp(dead_time_ms, te_time_ms, te_z[xi, :])
         for xi in range(te_z.shape[0])
     ])
+
+
+def _face_rail_mask(grp: h5py.Group, shape: tuple[int, ...]) -> np.ndarray | None:
+    """Per-cell rail mask for one probe face, or None if the product has none.
+
+    True marks a (position, dead-time window) cell whose raw samples reached a
+    digitizer rail.  Returns None -- not an all-False mask -- when the dataset is
+    absent, so the caller can record that the product predates the marking
+    rather than reporting it as measured-clean.
+    """
+    if RAIL_MASK_DATASET not in grp:
+        return None
+    mask = np.asarray(grp[RAIL_MASK_DATASET][()], dtype=bool)
+    if mask.shape != shape:
+        raise ValueError(
+            f"{RAIL_MASK_DATASET!r} in {grp.name} has shape {mask.shape}, but the "
+            f"face's current array has shape {shape}; the mask must be per "
+            "(position, dead-time window) cell of the same product"
+        )
+    return mask
+
+
+def _rail_rule(*grps: h5py.Group) -> str:
+    """The exclusion rule as stated by whichever source product carries a mask."""
+    for grp in grps:
+        for holder in (grp, grp.file):
+            if RAIL_RULE_ATTR in holder.attrs:
+                return str(holder.attrs[RAIL_RULE_ATTR])
+    return NO_MASK_NOTE.format(dataset=RAIL_MASK_DATASET)
 
 
 def _require_inputs(paths: list[Path]) -> None:
@@ -158,7 +206,45 @@ def _compute_run(
         velocity_km_s = mach * cs_m_s / 1000.0
         velocity_km_s_std = mach_std * cs_m_s / 1000.0
 
+    upstream_mask = _face_rail_mask(upstream_grp, upstream.shape)
+    downstream_mask = _face_rail_mask(downstream_grp, downstream.shape)
+    excluded = np.zeros(upstream.shape, dtype=bool)
+    for face_mask in (upstream_mask, downstream_mask):
+        if face_mask is not None:
+            excluded |= face_mask
+    # A cell railed on EITHER face is dropped on BOTH, so every surviving cell is
+    # still a pair of simultaneous face measurements.  The area-normalized face
+    # currents go too, not just the ratio: they are what the ratio is built from,
+    # and leaving them live would let a consumer rebuild the railed Mach number
+    # from a product that had marked the cell unusable.  The as-recorded face
+    # currents (``isat_*_a``) are kept intact as the faithful copy of the source
+    # products, with ``rail_excluded_cells`` marking which of them are railed.
+    if excluded.any():
+        upstream_j = np.where(excluded, np.nan, upstream_j)
+        downstream_j = np.where(excluded, np.nan, downstream_j)
+        mach = np.where(excluded, np.nan, mach)
+        mach_std = np.where(excluded, np.nan, mach_std)
+        velocity_km_s = np.where(excluded, np.nan, velocity_km_s)
+        velocity_km_s_std = np.where(excluded, np.nan, velocity_km_s_std)
+
+    provenance = {
+        "rail_cells_excluded": int(excluded.sum()),
+        "rail_cells_kept": int(excluded.size - excluded.sum()),
+        "rail_cells_total": int(excluded.size),
+        "rail_exclusion_rule": _rail_rule(upstream_grp, downstream_grp),
+        "rail_mask_source_dataset": RAIL_MASK_DATASET,
+        "rail_mask_upstream_present": upstream_mask is not None,
+        "rail_mask_downstream_present": downstream_mask is not None,
+        "rail_cells_excluded_upstream": (
+            int(upstream_mask.sum()) if upstream_mask is not None else 0
+        ),
+        "rail_cells_excluded_downstream": (
+            int(downstream_mask.sum()) if downstream_mask is not None else 0
+        ),
+    }
+
     return {
+        "rail_excluded_cells": excluded,
         "inter_sweep_time_s": time_s,
         "isat_upstream_a": upstream,
         "isat_upstream_a_std": upstream_std,
@@ -171,7 +257,7 @@ def _compute_run(
         "mach_std": mach_std,
         "velocity_km_s": velocity_km_s,
         "velocity_km_s_std": velocity_km_s_std,
-    }
+    }, provenance
 
 
 def _process_rotation(
@@ -206,10 +292,23 @@ def _process_rotation(
             down_run = down_entries[location_key]
             up_run_id = str(up_run.attrs["run_id"])
             down_run_id = str(down_run.attrs["run_id"])
+            if up_run_id != down_run_id:
+                port, z_cm = location_key
+                raise ValueError(
+                    "Upstream and downstream faces come from different runs: "
+                    f"upstream run {up_run_id} ({upstream_hdf.filename}) vs "
+                    f"downstream run {down_run_id} ({downstream_hdf.filename}) "
+                    f"at experiment set {es_id}, port {port}, z = {z_cm:g} cm, "
+                    f"rotation {rotation_deg} deg. The two faces of a Mach pair "
+                    "must be the same run; a mismatch means one source product "
+                    "was built without the effective-rotation overrides in "
+                    "bapsf_lapd.corrections. Rebuild the offending product "
+                    "before recomputing Mach."
+                )
 
             probe = _probe_id(up_run_id)
             calib = calibration[probe]
-            results = _compute_run(
+            results, provenance = _compute_run(
                 up_run,
                 down_run,
                 te_hdf,
@@ -218,8 +317,16 @@ def _process_rotation(
                 downstream_area_m2=calib[downstream_area_key.replace("cm2", "m2")],
                 current_factor=probe_a_factor if probe == "A" else 1.0,
             )
-            pair_note = "" if up_run_id == down_run_id else f" downstream={down_run_id}"
-            print(f"  ES {es_id} run {up_run_id} rot={rotation_deg} port={up_run.attrs['port']}{pair_note}")
+            excluded = provenance["rail_cells_excluded"]
+            rail_note = (
+                f" rail-excluded {excluded}/{provenance['rail_cells_total']} cells"
+                if excluded
+                else ""
+            )
+            print(
+                f"  ES {es_id} run {up_run_id} rot={rotation_deg} "
+                f"port={up_run.attrs['port']}{rail_note}"
+            )
             out_run = out_set.create_group(up_run_id)
             for key in (
                 "run_id",
@@ -247,6 +354,8 @@ def _process_rotation(
             out_run.attrs["mach_area_normalization"] = (
                 "(I_upstream / A_upstream) / (I_downstream / A_downstream)"
             )
+            for key, value in provenance.items():
+                out_run.attrs[key] = value
             for key, value in results.items():
                 out_run.create_dataset(key, data=value)
 
