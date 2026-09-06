@@ -113,7 +113,7 @@ import numpy as np
 from scipy.ndimage import uniform_filter1d
 
 from bapsf_lapd import ChannelKind, LapdDataset
-from bapsf_lapd.config import z_from_port
+from bapsf_lapd.config import PORT_MAP_DEFAULT, PORT_MAPS, z_from_port
 from bapsf_lapd.filtering import butterworth_lowpass
 from plot_core_density_temperature_timeseries import (
     DENSITY_SCALE_M3,
@@ -804,6 +804,7 @@ def _isat_decay_geomean(
 def _interferometer_decay_stats(
     dataset: LapdDataset,
     experiment_set_id: int,
+    port_map: str = PORT_MAP_DEFAULT,
 ) -> dict[str, np.ndarray]:
     """Return the shot-averaged interferometer line density for the three chords.
 
@@ -894,7 +895,8 @@ def _interferometer_decay_stats(
         "sem_cm2": np.stack(sem, axis=0) * PLASMA_DIAMETER_CM,
         "port": np.asarray(INTERFEROMETER_PORTS, dtype=np.int16),
         "z_cm": np.asarray(
-            [z_from_port(port) for port in INTERFEROMETER_PORTS], dtype=np.float64
+            [z_from_port(port, port_map) for port in INTERFEROMETER_PORTS],
+            dtype=np.float64,
         ),
         "n_shots": np.asarray(chord_n, dtype=np.int32),
         "run_id": np.asarray([run_ids for _ in INTERFEROMETER_PORTS]),
@@ -1176,6 +1178,7 @@ def export_overlay(
     window_refits_path: Path = WINDOW_REFITS_HDF5,
     rot0_isat_profile_path: Path = ROT0_ISAT_PROFILE_HDF5,
     raw_discharge_ensemble: bool = False,
+    port_map: str = PORT_MAP_DEFAULT,
 ) -> Path:
     experiment_set_key = str(experiment_set_id)
     with h5py.File(density_path, "r") as density_hdf, h5py.File(te_path, "r") as te_hdf:
@@ -1249,7 +1252,11 @@ def export_overlay(
         isat_decay_dn,
         face_areas_cm2,
     )
-    interf_decay = _interferometer_decay_stats(dataset, experiment_set_id)
+    interf_decay = _interferometer_decay_stats(
+        dataset,
+        experiment_set_id,
+        port_map,
+    )
     discharge = _discharge_stats(
         dataset,
         experiment_set_id,
@@ -1764,6 +1771,16 @@ def main() -> None:
              "statistics and each shot's half-peak crossing time; off by "
              "default, and off leaves every exported field unchanged",
     )
+    parser.add_argument(
+        "--port-map",
+        choices=PORT_MAPS,
+        default=PORT_MAP_DEFAULT,
+        help="axial port ladder for the z values this exporter derives itself, "
+             "i.e. the interferometer chord positions.  The probe-port z grid "
+             "comes from the upstream products, which bake in the ladder they "
+             "were built under, so a coherent product on a non-default ladder "
+             "needs those rebuilt first",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     output = args.output or Path(
@@ -1780,6 +1797,7 @@ def main() -> None:
         args.window_refits,
         args.rot0_isat_profiles,
         args.raw_discharge_ensemble,
+        args.port_map,
     )
 
 

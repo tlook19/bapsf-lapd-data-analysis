@@ -7,8 +7,24 @@ from enum import StrEnum
 from pathlib import Path
 
 
+#: The NOMINAL axial port ladder: the position of port 2 and the port pitch as
+#: the device is nominally specified.  Every stored product was built under it.
 PORT_2_Z_CM = 182.5
 PORT_SPACING_CM = 31.95
+
+#: The CAD axial port ladder: the position of port 1 and the port pitch read
+#: off the machine drawing.  It is the same ladder shape with a slightly wider
+#: pitch, so it puts every port further from the cathode than the nominal
+#: ladder does, by an offset that grows with port number.
+PORT_1_Z_CM_CAD = 150.67
+PORT_SPACING_CM_CAD = 32.00
+
+#: Ladder used when a caller names none.  A stored product carries the ladder
+#: it was built under baked into its own z values, so moving this default is a
+#: rebuild of the products that hold z, never a read-time reinterpretation of
+#: the ones already written.
+PORT_MAP_DEFAULT = "nominal"
+PORT_MAPS = ("nominal", "cad")
 
 
 class ChannelKind(StrEnum):
@@ -247,9 +263,22 @@ def default_channels(
     }
 
 
-def z_from_port(port: int) -> float:
-    """Return nominal distance from cathode for a LAPD port number."""
-    return PORT_2_Z_CM + (port - 2) * PORT_SPACING_CM
+def z_from_port(port: int, port_map: str = PORT_MAP_DEFAULT) -> float:
+    """Return the distance from cathode of a LAPD port number, in cm.
+
+    ``port_map`` selects the ladder: ``"nominal"`` anchors on ``PORT_2_Z_CM``
+    with the ``PORT_SPACING_CM`` pitch, ``"cad"`` on ``PORT_1_Z_CM_CAD`` with
+    the ``PORT_SPACING_CM_CAD`` pitch.  Any other name raises ``ValueError``
+    rather than falling back to a default, so a misspelled selector cannot
+    quietly return the ladder the caller did not ask for.
+    """
+    if port_map == "nominal":
+        return PORT_2_Z_CM + (port - 2) * PORT_SPACING_CM
+    if port_map == "cad":
+        return PORT_1_Z_CM_CAD + (port - 1) * PORT_SPACING_CM_CAD
+    raise ValueError(
+        f"unknown port map {port_map!r}; expected one of {PORT_MAPS}"
+    )
 
 
 def default_run_config(
