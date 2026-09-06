@@ -19,6 +19,7 @@ The NPZ product is self-contained and uses simulation-facing units:
 * the per-port, per-sample record of where the filled T_e product's core-mean
   monotonic-z clamp acted, so a consumer can see which T_e samples are a
   neighbouring port's value rather than their own;
+* the axial port ladder the product was exported on (``port_map``);
 * all time axes in ms relative to the experimental SIS trigger.
 
 Probe-A density SEM includes the propagated area-calibration uncertainty.
@@ -151,6 +152,29 @@ ROT0_ISAT_PROFILE_HDF5 = Path("processed/isat_profiles.hdf5")
 ZERO_OFFSETS = Path("processed/trace_zero_offsets.toml")
 WINDOW_REFITS_HDF5 = Path("processed/sweep_window_refits.hdf5")
 PORTS = np.array([11, 21, 29, 41, 50], dtype=np.int16)
+
+#: Why this exporter will not write a product on a non-default port ladder.
+#: Only the interferometer chord positions are computed here; the probe-port z
+#: grid arrives already baked into the upstream products, so exporting on a
+#: ladder those products were not built under would write a mixed-ladder
+#: product -- and this product is scored, with nothing in it to say so.
+PORT_MAP_REFUSAL = (
+    "refusing to export on port_map={port_map!r}: only the interferometer "
+    "chord positions are derived here, while the probe-port z grid is copied "
+    "from the upstream products, which bake in the ladder they were built "
+    "under. Exporting now would write a mixed-ladder product -- chords on the "
+    "requested ladder, probe ports on the one the inputs carry. Adopting a "
+    "ladder is a rebuild of those inputs first, in order: (1) the "
+    "shot-averaged Langmuir product, then the review-flag pass that appends "
+    "to it; (2) the four dead-time and line-scan profile products, then the "
+    "two rot-180 annotators over the rebuilt rot-180 pair; (3) the filled "
+    "T_e product and its ES3 p11/p29 variant, whose own sources transcribe "
+    "the ladder and must be edited before they are re-run; (4) the "
+    "probe-area calibration, which chooses its T_e row by z; (5) the "
+    "density, density-Mach, Mach-velocity and ES3 scaled products. Only then "
+    "does this exporter have inputs on the requested ladder, and only then "
+    "does the refusal here come out."
+)
 X_MIN_CM = -10.0
 X_MAX_CM = 10.0
 DISCHARGE_SMOOTHING_SAMPLES = 9
@@ -1180,6 +1204,8 @@ def export_overlay(
     raw_discharge_ensemble: bool = False,
     port_map: str = PORT_MAP_DEFAULT,
 ) -> Path:
+    if port_map != PORT_MAP_DEFAULT:
+        raise ValueError(PORT_MAP_REFUSAL.format(port_map=port_map))
     experiment_set_key = str(experiment_set_id)
     with h5py.File(density_path, "r") as density_hdf, h5py.File(te_path, "r") as te_hdf:
         density = _load_density_stats(
@@ -1743,6 +1769,7 @@ def export_overlay(
             "density_total_sem_cm3, which is a radial-scatter SEM plus the "
             "Probe-A area calibration."
         ),
+        port_map=np.array(port_map),
         **discharge_raw_fields,
     )
     print(output_path)
@@ -1775,11 +1802,12 @@ def main() -> None:
         "--port-map",
         choices=PORT_MAPS,
         default=PORT_MAP_DEFAULT,
-        help="axial port ladder for the z values this exporter derives itself, "
-             "i.e. the interferometer chord positions.  The probe-port z grid "
-             "comes from the upstream products, which bake in the ladder they "
-             "were built under, so a coherent product on a non-default ladder "
-             "needs those rebuilt first",
+        help="axial port ladder to export on.  Anything but the default is "
+             "REFUSED, with the rebuild the adoption needs spelled out: the "
+             "probe-port z grid is copied from the upstream products, so "
+             "exporting on a ladder they were not built under would write a "
+             "mixed-ladder product.  The ladder actually used is stamped into "
+             "the product as port_map",
     )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()

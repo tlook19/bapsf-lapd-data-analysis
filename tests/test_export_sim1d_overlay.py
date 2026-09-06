@@ -21,6 +21,7 @@ from scripts.export_es1_sim1d_overlay import (
     _subtract_background,
     _te_trust_records,
     _te_window_spread_frac,
+    export_overlay,
     REQUIRED_TE_RECORDS,
 )
 from scripts.plot_core_density_temperature_timeseries import _nan_core_stats
@@ -674,6 +675,31 @@ def test_interferometer_refuses_a_chord_that_stops_short_of_the_shared_grid(tmp_
 
     with pytest.raises(ValueError, match="does not cover the shared grid"):
         _interferometer_decay_stats(dataset, 1)
+
+
+def test_export_refuses_a_non_default_port_ladder_and_names_the_rebuild(tmp_path):
+    missing = tmp_path / "not-read.hdf5"
+
+    with pytest.raises(ValueError, match="refusing to export on port_map") as excinfo:
+        export_overlay(
+            missing,
+            missing,
+            missing,
+            missing,
+            missing,
+            tmp_path / "out.npz",
+            port_map="cad",
+        )
+
+    # The refusal has to name the prerequisite, not just say no: the probe-port
+    # z grid is copied from products built on the other ladder, so adopting one
+    # is a rebuild of those inputs.  It also has to fire before anything is
+    # read, which is why none of the paths above exists and none is created.
+    message = str(excinfo.value)
+    assert "rebuild" in message
+    assert "probe-port z grid is copied" in message
+    assert not (tmp_path / "out.npz").exists()
+
 
 
 # ---------------------------------------------------------------------------
