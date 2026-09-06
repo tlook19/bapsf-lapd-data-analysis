@@ -56,7 +56,8 @@ the steep part of the spread is made of.  ``--raw-discharge-ensemble`` ADDS the
 same statistics taken on the unsmoothed shots, plus each shot's crossing time
 through ONE common current level, as a separate ``discharge_current_raw_*`` /
 ``discharge_raw_t_half_*`` family.  The level is half the ensemble MEDIAN
-plateau current, so the crossing times differ only in when each shot got there
+plateau current, taken over the scoring plateau window, so the crossing times
+differ only in when each shot got there
 and not in how large it grew; ES1 needs that, because run 05 runs a plateau
 about 60 % above the pack and a per-shot half-peak level would report it as
 breaking down late for a purely amplitude reason.  No existing field changes,
@@ -183,10 +184,10 @@ X_MIN_CM = -10.0
 X_MAX_CM = 10.0
 DISCHARGE_SMOOTHING_SAMPLES = 9
 
-#: Window whose per-shot mean current defines that shot's plateau amplitude,
-#: in ms on the trigger-referenced grid.  It sits inside the flat part of the
-#: discharge and clear of the record end, and is used only to set the ONE
-#: crossing level the raw-ensemble timing statistic is referred to.
+#: The SCORING PLATEAU WINDOW, in ms on the trigger-referenced grid: the same
+#: 15.0-19.5 ms the transport comparison scores the drive plateau over.  It is
+#: inherited from that convention rather than chosen here, and is used only to
+#: set the ONE crossing level the raw-ensemble timing statistic is referred to.
 RAW_PLATEAU_WINDOW_MS = (15.0, 19.5)
 DENSITY_SCALE_CM3 = DENSITY_SCALE_M3 * 1.0e-6
 M3_TO_CM3 = 1.0e-6  # the flux-tube fields work on raw n_e_m3, not the scaled grid
@@ -1072,10 +1073,12 @@ def _te_trust_records(
 
 
 def _plateau_current_a(current: np.ndarray, time_ms: np.ndarray) -> np.ndarray:
-    """Per-shot plateau current, the mean over ``RAW_PLATEAU_WINDOW_MS``, in A.
+    """Per-shot plateau current, in A: the mean over the scoring plateau window.
 
-    This is an AMPLITUDE, not a timing quantity: it is what the shots differ in
-    when one of them runs a hotter discharge than the rest.
+    The window is ``RAW_PLATEAU_WINDOW_MS``, inherited from the scoring
+    convention rather than chosen here.  What this returns is an AMPLITUDE, not
+    a timing quantity: it is what the shots differ in when one of them runs a
+    hotter discharge than the rest.
     """
     window = (
         (time_ms >= RAW_PLATEAU_WINDOW_MS[0])
@@ -1211,16 +1214,18 @@ def _discharge_stats(
         raw_time_ms = reference_time_s * 1000.0
         plateau_a = _plateau_current_a(current_raw_all, raw_time_ms)
         t_half_level_a = 0.5 * float(np.median(plateau_a))
-        t_half_max_ms = _t_half_level_ms(current_raw_all, raw_time_ms, t_half_level_a)
+        t_half_level_ms = _t_half_level_ms(
+            current_raw_all, raw_time_ms, t_half_level_a
+        )
         raw = {
             "current_mean_a": np.mean(current_raw_all, axis=0),
             "current_sd_a": current_raw_std,
             "current_sem_a": current_raw_std / np.sqrt(n_traces),
             "t_half_level_a": np.asarray(t_half_level_a),
-            "t_half_max_ms": t_half_max_ms,
-            "t_half_max_run_id": np.asarray(raw_run_ids),
-            "t_half_max_mean_ms": np.asarray(np.mean(t_half_max_ms)),
-            "t_half_max_sd_ms": np.asarray(np.std(t_half_max_ms, ddof=1)),
+            "t_half_level_ms": t_half_level_ms,
+            "t_half_level_run_id": np.asarray(raw_run_ids),
+            "t_half_level_mean_ms": np.asarray(np.mean(t_half_level_ms)),
+            "t_half_level_sd_ms": np.asarray(np.std(t_half_level_ms, ddof=1)),
         }
 
     return {
@@ -1380,10 +1385,10 @@ def export_overlay(
             "discharge_current_raw_sd_a": raw["current_sd_a"],
             "discharge_current_raw_sem_a": raw["current_sem_a"],
             "discharge_raw_t_half_level_a": raw["t_half_level_a"],
-            "discharge_raw_t_half_max_ms": raw["t_half_max_ms"],
-            "discharge_raw_t_half_max_run_id": raw["t_half_max_run_id"],
-            "discharge_raw_t_half_max_mean_ms": raw["t_half_max_mean_ms"],
-            "discharge_raw_t_half_max_sd_ms": raw["t_half_max_sd_ms"],
+            "discharge_raw_t_half_level_ms": raw["t_half_level_ms"],
+            "discharge_raw_t_half_level_run_id": raw["t_half_level_run_id"],
+            "discharge_raw_t_half_level_mean_ms": raw["t_half_level_mean_ms"],
+            "discharge_raw_t_half_level_sd_ms": raw["t_half_level_sd_ms"],
             "discharge_raw_ensemble_definition": np.array(
                 "ADDITIVE, opt-in family: the SAME shots and the SAME "
                 "trigger-referenced grid as discharge_time_ms and the "
@@ -1395,13 +1400,15 @@ def export_overlay(
                 "same statistic after each shot has been averaged over "
                 "discharge_smoothing_samples samples, which rounds every "
                 "shot's own breakdown knee and therefore reads LOW where the "
-                "trace is steep.  discharge_raw_t_half_max_ms is one time per "
-                "shot: the first upward crossing of discharge_raw_t_half_"
+                "trace is steep.  discharge_raw_t_half_level_ms is one time "
+                "per shot: the first upward crossing of discharge_raw_t_half_"
                 "level_a, linearly interpolated between the bracketing "
-                "samples, with discharge_raw_t_half_max_run_id naming the run "
-                "each shot came from.  That level is ONE current common to "
-                "every shot -- half the MEDIAN of the per-shot plateau means "
-                "over 15.0-19.5 ms -- so the times are amplitude-independent "
+                "samples, with discharge_raw_t_half_level_run_id naming the "
+                "run each shot came from.  That level is ONE current common "
+                "to every shot -- half the MEDIAN of the per-shot plateau "
+                "means over the SCORING PLATEAU WINDOW, 15.0-19.5 ms, the "
+                "window the transport comparison already scores the drive "
+                "plateau over -- so the times are amplitude-independent "
                 "by construction and differ only in WHEN each shot got there; "
                 "their mean and ddof=1 sd are the breakdown-timing jitter of "
                 "the ensemble, measured rather than inferred from the width "
