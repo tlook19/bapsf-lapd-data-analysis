@@ -53,11 +53,15 @@ discharge dispersion is the spread of smoothed shots and reads low wherever the
 trace is steep: the moving average rounds each shot's own breakdown knee before
 the ensemble ever sees it, and the shot-to-shot breakdown-timing jitter is what
 the steep part of the spread is made of.  ``--raw-discharge-ensemble`` ADDS the
-same statistics taken on the unsmoothed shots, plus each shot's own half-peak
-crossing time, as a separate ``discharge_current_raw_*`` /
-``discharge_raw_t_half_max_*`` family.  No existing field changes, and the
-family is ABSENT unless the flag is passed, so a product that lacks these names
-was exported without it rather than with it and zeroed.
+same statistics taken on the unsmoothed shots, plus each shot's crossing time
+through ONE common current level, as a separate ``discharge_current_raw_*`` /
+``discharge_raw_t_half_*`` family.  The level is half the ensemble MEDIAN
+plateau current, so the crossing times differ only in when each shot got there
+and not in how large it grew; ES1 needs that, because run 05 runs a plateau
+about 60 % above the pack and a per-shot half-peak level would report it as
+breaking down late for a purely amplitude reason.  No existing field changes,
+and the family is ABSENT unless the flag is passed, so a product that lacks
+these names was exported without it rather than with it and zeroed.
 
 Two radial-averaging conventions
 --------------------------------
@@ -178,6 +182,12 @@ PORT_MAP_REFUSAL = (
 X_MIN_CM = -10.0
 X_MAX_CM = 10.0
 DISCHARGE_SMOOTHING_SAMPLES = 9
+
+#: Window whose per-shot mean current defines that shot's plateau amplitude,
+#: in ms on the trigger-referenced grid.  It sits inside the flat part of the
+#: discharge and clear of the record end, and is used only to set the ONE
+#: crossing level the raw-ensemble timing statistic is referred to.
+RAW_PLATEAU_WINDOW_MS = (15.0, 19.5)
 DENSITY_SCALE_CM3 = DENSITY_SCALE_M3 * 1.0e-6
 M3_TO_CM3 = 1.0e-6  # the flux-tube fields work on raw n_e_m3, not the scaled grid
 ISAT_DECAY_STOP_S = 47.5e-3
@@ -1061,24 +1071,56 @@ def _te_trust_records(
     }
 
 
-def _t_half_max_ms(current: np.ndarray, time_ms: np.ndarray) -> np.ndarray:
-    """Per-shot time of the first upward half-peak crossing, in ms.
+def _plateau_current_a(current: np.ndarray, time_ms: np.ndarray) -> np.ndarray:
+    """Per-shot plateau current, the mean over ``RAW_PLATEAU_WINDOW_MS``, in A.
+
+    This is an AMPLITUDE, not a timing quantity: it is what the shots differ in
+    when one of them runs a hotter discharge than the rest.
+    """
+    window = (
+        (time_ms >= RAW_PLATEAU_WINDOW_MS[0])
+        & (time_ms <= RAW_PLATEAU_WINDOW_MS[1])
+    )
+    return np.mean(current[:, window], axis=1)
+
+
+def _t_half_level_ms(
+    current: np.ndarray,
+    time_ms: np.ndarray,
+    level_a: float,
+) -> np.ndarray:
+    """Per-shot time of the first upward crossing of ``level_a``, in ms.
 
     ``current`` is the ``(n_traces, n_samples)`` ensemble on the ``time_ms``
-    grid.  Each shot is referred to its OWN peak, so the crossing time measures
-    when that shot broke down and not how large it grew, and the spread of the
-    returned times is the breakdown-timing jitter.  The crossing is linearly
-    interpolated between the two samples bracketing it, which is what makes the
-    estimate finer than the sample pitch; a shot whose first sample already
-    sits at half its peak is placed at the first sample.
+    grid and ``level_a`` is ONE current common to every shot, so the returned
+    times differ only in WHEN each shot got there.  Referring each shot to its
+    own peak instead would make the level a function of that shot's plateau
+    amplitude, and a shot running a higher plateau would then be reported as
+    breaking down late purely because its threshold was higher; with a common
+    level the statistic is amplitude-independent by construction.
+
+    The crossing is linearly interpolated between the two samples bracketing
+    it, which is what makes the estimate finer than the sample pitch; a shot
+    already above the level at the first sample is placed at the first sample.
+    Raises ``ValueError`` if any shot never reaches the level, since that shot
+    has no crossing to report and must not be silently placed at the record
+    start.
     """
-    half = 0.5 * np.max(current, axis=1)
+    reached = current >= level_a
+    if not reached.any(axis=1).all():
+        missing = np.flatnonzero(~reached.any(axis=1))
+        raise ValueError(
+            f"discharge shots {missing.tolist()} never reach the common "
+            f"crossing level {level_a:g} A and have no crossing time"
+        )
     rows = np.arange(current.shape[0])
-    idx = np.argmax(current >= half[:, None], axis=1)
+    idx = np.argmax(reached, axis=1)
     prev = np.maximum(idx - 1, 0)
     y0 = current[rows, prev]
     rise = current[rows, idx] - y0
-    frac = np.where(rise > 0.0, (half - y0) / np.where(rise > 0.0, rise, 1.0), 0.0)
+    frac = np.where(
+        rise > 0.0, (level_a - y0) / np.where(rise > 0.0, rise, 1.0), 0.0
+    )
     return time_ms[prev] + frac * (time_ms[idx] - time_ms[prev])
 
 
@@ -1111,8 +1153,9 @@ def _discharge_stats(
     the statistics are taken, so both measures describe smoothed shots.
 
     With ``raw_ensemble`` the same two measures are additionally taken on the
-    UNSMOOTHED shots, together with each shot's half-peak crossing time, and
-    returned under the ``"raw"`` key.  Nothing else in the result changes.
+    UNSMOOTHED shots, together with each shot's crossing time through one
+    common current level -- half the ensemble MEDIAN plateau -- and returned
+    under the ``"raw"`` key.  Nothing else in the result changes.
     """
     currents = []
     currents_raw = []
@@ -1165,11 +1208,15 @@ def _discharge_stats(
     if raw_ensemble:
         current_raw_all = np.concatenate(currents_raw, axis=0)
         current_raw_std = np.std(current_raw_all, axis=0, ddof=1)
-        t_half_max_ms = _t_half_max_ms(current_raw_all, reference_time_s * 1000.0)
+        raw_time_ms = reference_time_s * 1000.0
+        plateau_a = _plateau_current_a(current_raw_all, raw_time_ms)
+        t_half_level_a = 0.5 * float(np.median(plateau_a))
+        t_half_max_ms = _t_half_level_ms(current_raw_all, raw_time_ms, t_half_level_a)
         raw = {
             "current_mean_a": np.mean(current_raw_all, axis=0),
             "current_sd_a": current_raw_std,
             "current_sem_a": current_raw_std / np.sqrt(n_traces),
+            "t_half_level_a": np.asarray(t_half_level_a),
             "t_half_max_ms": t_half_max_ms,
             "t_half_max_run_id": np.asarray(raw_run_ids),
             "t_half_max_mean_ms": np.asarray(np.mean(t_half_max_ms)),
@@ -1332,6 +1379,7 @@ def export_overlay(
             "discharge_current_raw_mean_a": raw["current_mean_a"],
             "discharge_current_raw_sd_a": raw["current_sd_a"],
             "discharge_current_raw_sem_a": raw["current_sem_a"],
+            "discharge_raw_t_half_level_a": raw["t_half_level_a"],
             "discharge_raw_t_half_max_ms": raw["t_half_max_ms"],
             "discharge_raw_t_half_max_run_id": raw["t_half_max_run_id"],
             "discharge_raw_t_half_max_mean_ms": raw["t_half_max_mean_ms"],
@@ -1348,14 +1396,22 @@ def export_overlay(
                 "discharge_smoothing_samples samples, which rounds every "
                 "shot's own breakdown knee and therefore reads LOW where the "
                 "trace is steep.  discharge_raw_t_half_max_ms is one time per "
-                "shot: the first upward crossing of half THAT shot's peak "
-                "current, linearly interpolated between the bracketing "
+                "shot: the first upward crossing of discharge_raw_t_half_"
+                "level_a, linearly interpolated between the bracketing "
                 "samples, with discharge_raw_t_half_max_run_id naming the run "
-                "each shot came from; its mean and ddof=1 sd are the "
-                "breakdown-timing jitter of the ensemble, measured rather "
-                "than inferred from the width of the current spread.  Nothing "
-                "in the smoothed family is changed or superseded by these "
-                "fields."
+                "each shot came from.  That level is ONE current common to "
+                "every shot -- half the MEDIAN of the per-shot plateau means "
+                "over 15.0-19.5 ms -- so the times are amplitude-independent "
+                "by construction and differ only in WHEN each shot got there; "
+                "their mean and ddof=1 sd are the breakdown-timing jitter of "
+                "the ensemble, measured rather than inferred from the width "
+                "of a current spread.  A per-shot level referred to each "
+                "shot's own peak would NOT be that statistic: at ES1 run 05 "
+                "runs a plateau about 60 % above the rest of the pack, an "
+                "amplitude outlier, and its own-peak threshold would place "
+                "its crossings late and inflate the exported sd by nearly an "
+                "order of magnitude.  Nothing in the smoothed family is "
+                "changed or superseded by these fields."
             ),
         }
     output_path.parent.mkdir(parents=True, exist_ok=True)
