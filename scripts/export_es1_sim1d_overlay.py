@@ -47,6 +47,17 @@ so it carries the machine's breakdown-timing jitter.  Raw cathode-anode
 voltage is negative, so the exported overlay voltage is multiplied by -1;
 dispersion is sign-invariant and is exported unnegated.
 
+That smoothing is applied per shot and BEFORE pooling, so the exported
+discharge dispersion is the spread of smoothed shots and reads low wherever the
+trace is steep: the moving average rounds each shot's own breakdown knee before
+the ensemble ever sees it, and the shot-to-shot breakdown-timing jitter is what
+the steep part of the spread is made of.  ``--raw-discharge-ensemble`` ADDS the
+same statistics taken on the unsmoothed shots, plus each shot's own half-peak
+crossing time, as a separate ``discharge_current_raw_*`` /
+``discharge_raw_t_half_max_*`` family.  No existing field changes, and the
+family is ABSENT unless the flag is passed, so a product that lacks these names
+was exported without it rather than with it and zeroed.
+
 Two radial-averaging conventions
 --------------------------------
 The overlay carries the measured radial average in BOTH conventions, because
@@ -1024,9 +1035,31 @@ def _te_trust_records(
     }
 
 
+def _t_half_max_ms(current: np.ndarray, time_ms: np.ndarray) -> np.ndarray:
+    """Per-shot time of the first upward half-peak crossing, in ms.
+
+    ``current`` is the ``(n_traces, n_samples)`` ensemble on the ``time_ms``
+    grid.  Each shot is referred to its OWN peak, so the crossing time measures
+    when that shot broke down and not how large it grew, and the spread of the
+    returned times is the breakdown-timing jitter.  The crossing is linearly
+    interpolated between the two samples bracketing it, which is what makes the
+    estimate finer than the sample pitch; a shot whose first sample already
+    sits at half its peak is placed at the first sample.
+    """
+    half = 0.5 * np.max(current, axis=1)
+    rows = np.arange(current.shape[0])
+    idx = np.argmax(current >= half[:, None], axis=1)
+    prev = np.maximum(idx - 1, 0)
+    y0 = current[rows, prev]
+    rise = current[rows, idx] - y0
+    frac = np.where(rise > 0.0, (half - y0) / np.where(rise > 0.0, rise, 1.0), 0.0)
+    return time_ms[prev] + frac * (time_ms[idx] - time_ms[prev])
+
+
 def _discharge_stats(
     dataset: LapdDataset,
     experiment_set_id: int,
+    raw_ensemble: bool = False,
 ) -> dict[str, np.ndarray | int]:
     """Return the offset-corrected experiment-set discharge current and voltage.
 
@@ -1050,8 +1083,14 @@ def _discharge_stats(
     and dominates them wherever the trace is steep.  Each single trace is
     smoothed by the ``DISCHARGE_SMOOTHING_SAMPLES`` moving average before
     the statistics are taken, so both measures describe smoothed shots.
+
+    With ``raw_ensemble`` the same two measures are additionally taken on the
+    UNSMOOTHED shots, together with each shot's half-peak crossing time, and
+    returned under the ``"raw"`` key.  Nothing else in the result changes.
     """
     currents = []
+    currents_raw = []
+    raw_run_ids = []
     voltages_raw = []
     zero_offsets_a = []
     run_ids = []
@@ -1068,6 +1107,9 @@ def _discharge_stats(
             raise ValueError(f"Discharge time grid differs for run {run_id}")
         zero_offsets_a.append(zero_offset_a)
         run_ids.append(run_id)
+        if raw_ensemble:
+            currents_raw.append(current)
+            raw_run_ids.extend([run_id] * current.shape[0])
         currents.append(
             uniform_filter1d(
                 current,
@@ -1092,6 +1134,22 @@ def _discharge_stats(
     n_traces = current_all.shape[0]
     current_std = np.std(current_all, axis=0, ddof=1)
     voltage_std = np.std(voltage_all_raw, axis=0, ddof=1)
+
+    raw: dict[str, np.ndarray] = {}
+    if raw_ensemble:
+        current_raw_all = np.concatenate(currents_raw, axis=0)
+        current_raw_std = np.std(current_raw_all, axis=0, ddof=1)
+        t_half_max_ms = _t_half_max_ms(current_raw_all, reference_time_s * 1000.0)
+        raw = {
+            "current_mean_a": np.mean(current_raw_all, axis=0),
+            "current_sd_a": current_raw_std,
+            "current_sem_a": current_raw_std / np.sqrt(n_traces),
+            "t_half_max_ms": t_half_max_ms,
+            "t_half_max_run_id": np.asarray(raw_run_ids),
+            "t_half_max_mean_ms": np.asarray(np.mean(t_half_max_ms)),
+            "t_half_max_sd_ms": np.asarray(np.std(t_half_max_ms, ddof=1)),
+        }
+
     return {
         "time_ms": reference_time_s * 1000.0,
         "current_mean_a": np.mean(current_all, axis=0),
@@ -1103,6 +1161,7 @@ def _discharge_stats(
         "n_traces": n_traces,
         "zero_offset_a": np.asarray(zero_offsets_a, dtype=np.float64),
         "zero_offset_run_id": np.asarray(run_ids),
+        "raw": raw,
     }
 
 
@@ -1116,6 +1175,7 @@ def export_overlay(
     experiment_set_id: int = 1,
     window_refits_path: Path = WINDOW_REFITS_HDF5,
     rot0_isat_profile_path: Path = ROT0_ISAT_PROFILE_HDF5,
+    raw_discharge_ensemble: bool = False,
 ) -> Path:
     experiment_set_key = str(experiment_set_id)
     with h5py.File(density_path, "r") as density_hdf, h5py.File(te_path, "r") as te_hdf:
@@ -1190,7 +1250,11 @@ def export_overlay(
         face_areas_cm2,
     )
     interf_decay = _interferometer_decay_stats(dataset, experiment_set_id)
-    discharge = _discharge_stats(dataset, experiment_set_id)
+    discharge = _discharge_stats(
+        dataset,
+        experiment_set_id,
+        raw_ensemble=raw_discharge_ensemble,
+    )
     te_window_spread = _te_window_spread_frac(
         window_refits_path,
         experiment_set_id,
@@ -1228,6 +1292,39 @@ def export_overlay(
         upstream_scans["x_cm"],
         geomean_scans["sem"],
     )
+    discharge_raw_fields: dict[str, np.ndarray] = {}
+    if raw_discharge_ensemble:
+        raw = discharge["raw"]
+        discharge_raw_fields = {
+            "discharge_current_raw_mean_a": raw["current_mean_a"],
+            "discharge_current_raw_sd_a": raw["current_sd_a"],
+            "discharge_current_raw_sem_a": raw["current_sem_a"],
+            "discharge_raw_t_half_max_ms": raw["t_half_max_ms"],
+            "discharge_raw_t_half_max_run_id": raw["t_half_max_run_id"],
+            "discharge_raw_t_half_max_mean_ms": raw["t_half_max_mean_ms"],
+            "discharge_raw_t_half_max_sd_ms": raw["t_half_max_sd_ms"],
+            "discharge_raw_ensemble_definition": np.array(
+                "ADDITIVE, opt-in family: the SAME shots and the SAME "
+                "trigger-referenced grid as discharge_time_ms and the "
+                "discharge_current_* fields, pooled WITHOUT the per-shot "
+                "moving average those apply first.  discharge_current_raw_sd_a "
+                "is the ddof=1 shot envelope of the unsmoothed shots and "
+                "discharge_current_raw_sem_a that divided by "
+                "sqrt(discharge_n_traces); the smoothed family's sd is the "
+                "same statistic after each shot has been averaged over "
+                "discharge_smoothing_samples samples, which rounds every "
+                "shot's own breakdown knee and therefore reads LOW where the "
+                "trace is steep.  discharge_raw_t_half_max_ms is one time per "
+                "shot: the first upward crossing of half THAT shot's peak "
+                "current, linearly interpolated between the bracketing "
+                "samples, with discharge_raw_t_half_max_run_id naming the run "
+                "each shot came from; its mean and ddof=1 sd are the "
+                "breakdown-timing jitter of the ensemble, measured rather "
+                "than inferred from the width of the current spread.  Nothing "
+                "in the smoothed family is changed or superseded by these "
+                "fields."
+            ),
+        }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
@@ -1639,6 +1736,7 @@ def export_overlay(
             "density_total_sem_cm3, which is a radial-scatter SEM plus the "
             "Probe-A area calibration."
         ),
+        **discharge_raw_fields,
     )
     print(output_path)
     return output_path
@@ -1659,6 +1757,13 @@ def main() -> None:
     parser.add_argument("--window-refits", type=Path, default=WINDOW_REFITS_HDF5)
     parser.add_argument("--manifest", type=Path, default=MANIFEST)
     parser.add_argument("--experiment-set", type=int, choices=(1, 2, 3, 4), default=1)
+    parser.add_argument(
+        "--raw-discharge-ensemble",
+        action="store_true",
+        help="additionally export the unsmoothed per-shot discharge-current "
+             "statistics and each shot's half-peak crossing time; off by "
+             "default, and off leaves every exported field unchanged",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     output = args.output or Path(
@@ -1674,6 +1779,7 @@ def main() -> None:
         args.experiment_set,
         args.window_refits,
         args.rot0_isat_profiles,
+        args.raw_discharge_ensemble,
     )
 
 
