@@ -57,12 +57,16 @@ same statistics taken on the unsmoothed shots, plus each shot's crossing time
 through ONE common current level, as a separate ``discharge_current_raw_*`` /
 ``discharge_raw_t_half_*`` family.  The level is half the ensemble MEDIAN
 plateau current, taken over the scoring plateau window, so the crossing times
-differ only in when each shot got there
-and not in how large it grew; ES1 needs that, because run 05 runs a plateau
-about 60 % above the pack and a per-shot half-peak level would report it as
-breaking down late for a purely amplitude reason.  No existing field changes,
-and the family is ABSENT unless the flag is passed, so a product that lacks
-these names was exported without it rather than with it and zeroed.
+differ only in when each shot got there and not in what the trace did later.
+ES1 needs that: both run-05 shots carry a narrow current spike at the same
+sample, t = 20.000 ms, reaching 4.95 and 4.07 kA against a pack peak median of
+3.04 kA, while their plateau is normal -- within 2 % of the pack median over
+the scoring window, which ends 0.5 ms before the spike.  A level set from each
+shot's OWN peak reads that spike as the shot's amplitude and puts run 05's
+threshold near the top of its rise, which walked its crossings out and inflated
+the ensemble sd nearly tenfold; the common level clears it.  No existing field
+changes, and the family is ABSENT unless the flag is passed, so a product that
+lacks these names was exported without it rather than with it and zeroed.
 
 Two radial-averaging conventions
 --------------------------------
@@ -1413,12 +1417,19 @@ def export_overlay(
                 "their mean and ddof=1 sd are the breakdown-timing jitter of "
                 "the ensemble, measured rather than inferred from the width "
                 "of a current spread.  A per-shot level referred to each "
-                "shot's own peak would NOT be that statistic: at ES1 run 05 "
-                "runs a plateau about 60 % above the rest of the pack, an "
-                "amplitude outlier, and its own-peak threshold would place "
-                "its crossings late and inflate the exported sd by nearly an "
-                "order of magnitude.  Nothing in the smoothed family is "
-                "changed or superseded by these fields."
+                "shot's own peak would NOT be that statistic, and ES1 shows "
+                "why: both run-05 shots carry a narrow current spike at the "
+                "SAME sample, t = 20.000 ms, reaching 4.95 and 4.07 kA "
+                "against a pack peak median of 3.04 kA -- a fixed-time "
+                "excursion, not a hot discharge, since their plateau is "
+                "normal, within 2 % of the pack median over the scoring "
+                "window, which ends 0.5 ms before the spike.  An own-peak "
+                "level reads that spike as the shot's amplitude and sets "
+                "run 05's threshold near the top of its rise, which walks "
+                "its crossings out and inflates the exported sd by nearly an "
+                "order of magnitude; the common level is below the spike and "
+                "the plateau window excludes it.  Nothing in the smoothed "
+                "family is changed or superseded by these fields."
             ),
         }
     output_path.parent.mkdir(parents=True, exist_ok=True)

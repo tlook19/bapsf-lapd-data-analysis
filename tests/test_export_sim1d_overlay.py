@@ -701,7 +701,6 @@ def test_export_refuses_a_non_default_port_ladder_and_names_the_rebuild(tmp_path
     assert not (tmp_path / "out.npz").exists()
 
 
-
 # ---------------------------------------------------------------------------
 # The exported product, when a regenerated one is on disk
 # ---------------------------------------------------------------------------
