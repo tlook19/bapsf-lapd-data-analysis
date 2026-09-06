@@ -20,12 +20,12 @@ both Langmuir current channels:
 
 Dead-time windows use the same CLIP_S = 10 us as scripts/plot_isat_profiles.py.
 """
+import argparse
 import sys
 from pathlib import Path
 import numpy as np
 
-REPO = Path(sys.argv[1])
-sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from bapsf_lapd import LapdDataset, ChannelKind, effective_rotation_deg
 from bapsf_lapd.density import inter_sweep_sample_slices
 
@@ -88,8 +88,20 @@ def screen(run, kind):
     )
 
 
-def main():
-    ds = LapdDataset.from_manifest(REPO / "config/may2026_run_manifest.toml")
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "repo_root",
+        type=Path,
+        help="repository root holding config/may2026_run_manifest.toml "
+             "and the raw run directory it names",
+    )
+    args = parser.parse_args(argv)
+
+    ds = LapdDataset.from_manifest(args.repo_root / "config/may2026_run_manifest.toml")
     print(f"plateau window {PLATEAU_MS[0]}-{PLATEAU_MS[1]} ms; CLIP_S={CLIP_S:g} s; "
           f"uint16 rails {RAIL_LO}/{RAIL_HI}")
     print(f"{'run':>4} {'set':>3} {'port':>4} {'rec':>4} {'chan':>8} "
