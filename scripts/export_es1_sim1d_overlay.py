@@ -19,6 +19,7 @@ The NPZ product is self-contained and uses simulation-facing units:
 * the per-port, per-sample record of where the filled T_e product's core-mean
   monotonic-z clamp acted, so a consumer can see which T_e samples are a
   neighbouring port's value rather than their own;
+* the axial port ladder the product was exported on (``port_map``);
 * all time axes in ms relative to the experimental SIS trigger.
 
 Probe-A density SEM includes the propagated area-calibration uncertainty.
@@ -46,6 +47,26 @@ taken on the shared trigger-referenced time grid without per-shot alignment,
 so it carries the machine's breakdown-timing jitter.  Raw cathode-anode
 voltage is negative, so the exported overlay voltage is multiplied by -1;
 dispersion is sign-invariant and is exported unnegated.
+
+That smoothing is applied per shot and BEFORE pooling, so the exported
+discharge dispersion is the spread of smoothed shots and reads low wherever the
+trace is steep: the moving average rounds each shot's own breakdown knee before
+the ensemble ever sees it, and the shot-to-shot breakdown-timing jitter is what
+the steep part of the spread is made of.  ``--raw-discharge-ensemble`` ADDS the
+same statistics taken on the unsmoothed shots, plus each shot's crossing time
+through ONE common current level, as a separate ``discharge_current_raw_*`` /
+``discharge_raw_t_half_*`` family.  The level is half the ensemble MEDIAN
+plateau current, taken over the scoring plateau window, so the crossing times
+differ only in when each shot got there and not in what the trace did later.
+ES1 needs that: both run-05 shots carry a narrow current spike at the same
+sample, t = 20.000 ms, reaching 4.95 and 4.07 kA against a pack peak median of
+3.04 kA, while their plateau is normal -- within 2 % of the pack median over
+the scoring window, which ends 0.5 ms before the spike.  A level set from each
+shot's OWN peak reads that spike as the shot's amplitude and puts run 05's
+threshold near the top of its rise, which walked its crossings out and inflated
+the ensemble sd nearly tenfold; the common level clears it.  No existing field
+changes, and the family is ABSENT unless the flag is passed, so a product that
+lacks these names was exported without it rather than with it and zeroed.
 
 Two radial-averaging conventions
 --------------------------------
@@ -102,7 +123,7 @@ import numpy as np
 from scipy.ndimage import uniform_filter1d
 
 from bapsf_lapd import ChannelKind, LapdDataset
-from bapsf_lapd.config import z_from_port
+from bapsf_lapd.config import PORT_MAP_DEFAULT, PORT_MAPS, z_from_port
 from bapsf_lapd.filtering import butterworth_lowpass
 from plot_core_density_temperature_timeseries import (
     DENSITY_SCALE_M3,
@@ -140,9 +161,38 @@ ROT0_ISAT_PROFILE_HDF5 = Path("processed/isat_profiles.hdf5")
 ZERO_OFFSETS = Path("processed/trace_zero_offsets.toml")
 WINDOW_REFITS_HDF5 = Path("processed/sweep_window_refits.hdf5")
 PORTS = np.array([11, 21, 29, 41, 50], dtype=np.int16)
+
+#: Why this exporter will not write a product on a non-default port ladder.
+#: Only the interferometer chord positions are computed here; the probe-port z
+#: grid arrives already baked into the upstream products, so exporting on a
+#: ladder those products were not built under would write a mixed-ladder
+#: product -- and this product is scored, with nothing in it to say so.
+PORT_MAP_REFUSAL = (
+    "refusing to export on port_map={port_map!r}: only the interferometer "
+    "chord positions are derived here, while the probe-port z grid is copied "
+    "from the upstream products, which bake in the ladder they were built "
+    "under. Exporting now would write a mixed-ladder product -- chords on the "
+    "requested ladder, probe ports on the one the inputs carry. Adopting a "
+    "ladder is a rebuild of those inputs first, in order: (1) the "
+    "shot-averaged Langmuir product, then the review-flag pass that appends "
+    "to it; (2) the four dead-time and line-scan profile products, then the "
+    "two rot-180 annotators over the rebuilt rot-180 pair; (3) the filled "
+    "T_e product and its ES3 p11/p29 variant, whose own sources transcribe "
+    "the ladder and must be edited before they are re-run; (4) the "
+    "probe-area calibration, which chooses its T_e row by z; (5) the "
+    "density, density-Mach, Mach-velocity and ES3 scaled products. Only then "
+    "does this exporter have inputs on the requested ladder, and only then "
+    "does the refusal here come out."
+)
 X_MIN_CM = -10.0
 X_MAX_CM = 10.0
 DISCHARGE_SMOOTHING_SAMPLES = 9
+
+#: The SCORING PLATEAU WINDOW, in ms on the trigger-referenced grid: the same
+#: 15.0-19.5 ms the transport comparison scores the drive plateau over.  It is
+#: inherited from that convention rather than chosen here, and is used only to
+#: set the ONE crossing level the raw-ensemble timing statistic is referred to.
+RAW_PLATEAU_WINDOW_MS = (15.0, 19.5)
 DENSITY_SCALE_CM3 = DENSITY_SCALE_M3 * 1.0e-6
 M3_TO_CM3 = 1.0e-6  # the flux-tube fields work on raw n_e_m3, not the scaled grid
 ISAT_DECAY_STOP_S = 47.5e-3
@@ -793,6 +843,7 @@ def _isat_decay_geomean(
 def _interferometer_decay_stats(
     dataset: LapdDataset,
     experiment_set_id: int,
+    port_map: str = PORT_MAP_DEFAULT,
 ) -> dict[str, np.ndarray]:
     """Return the shot-averaged interferometer line density for the three chords.
 
@@ -883,7 +934,8 @@ def _interferometer_decay_stats(
         "sem_cm2": np.stack(sem, axis=0) * PLASMA_DIAMETER_CM,
         "port": np.asarray(INTERFEROMETER_PORTS, dtype=np.int16),
         "z_cm": np.asarray(
-            [z_from_port(port) for port in INTERFEROMETER_PORTS], dtype=np.float64
+            [z_from_port(port, port_map) for port in INTERFEROMETER_PORTS],
+            dtype=np.float64,
         ),
         "n_shots": np.asarray(chord_n, dtype=np.int32),
         "run_id": np.asarray([run_ids for _ in INTERFEROMETER_PORTS]),
@@ -1024,9 +1076,65 @@ def _te_trust_records(
     }
 
 
+def _plateau_current_a(current: np.ndarray, time_ms: np.ndarray) -> np.ndarray:
+    """Per-shot plateau current, in A: the mean over the scoring plateau window.
+
+    The window is ``RAW_PLATEAU_WINDOW_MS``, inherited from the scoring
+    convention rather than chosen here.  What this returns is an AMPLITUDE, not
+    a timing quantity: it is what the shots differ in when one of them runs a
+    hotter discharge than the rest.
+    """
+    window = (
+        (time_ms >= RAW_PLATEAU_WINDOW_MS[0])
+        & (time_ms <= RAW_PLATEAU_WINDOW_MS[1])
+    )
+    return np.mean(current[:, window], axis=1)
+
+
+def _t_half_level_ms(
+    current: np.ndarray,
+    time_ms: np.ndarray,
+    level_a: float,
+) -> np.ndarray:
+    """Per-shot time of the first upward crossing of ``level_a``, in ms.
+
+    ``current`` is the ``(n_traces, n_samples)`` ensemble on the ``time_ms``
+    grid and ``level_a`` is ONE current common to every shot, so the returned
+    times differ only in WHEN each shot got there.  Referring each shot to its
+    own peak instead would make the level a function of that shot's plateau
+    amplitude, and a shot running a higher plateau would then be reported as
+    breaking down late purely because its threshold was higher; with a common
+    level the statistic is amplitude-independent by construction.
+
+    The crossing is linearly interpolated between the two samples bracketing
+    it, which is what makes the estimate finer than the sample pitch; a shot
+    already above the level at the first sample is placed at the first sample.
+    Raises ``ValueError`` if any shot never reaches the level, since that shot
+    has no crossing to report and must not be silently placed at the record
+    start.
+    """
+    reached = current >= level_a
+    if not reached.any(axis=1).all():
+        missing = np.flatnonzero(~reached.any(axis=1))
+        raise ValueError(
+            f"discharge shots {missing.tolist()} never reach the common "
+            f"crossing level {level_a:g} A and have no crossing time"
+        )
+    rows = np.arange(current.shape[0])
+    idx = np.argmax(reached, axis=1)
+    prev = np.maximum(idx - 1, 0)
+    y0 = current[rows, prev]
+    rise = current[rows, idx] - y0
+    frac = np.where(
+        rise > 0.0, (level_a - y0) / np.where(rise > 0.0, rise, 1.0), 0.0
+    )
+    return time_ms[prev] + frac * (time_ms[idx] - time_ms[prev])
+
+
 def _discharge_stats(
     dataset: LapdDataset,
     experiment_set_id: int,
+    raw_ensemble: bool = False,
 ) -> dict[str, np.ndarray | int]:
     """Return the offset-corrected experiment-set discharge current and voltage.
 
@@ -1050,8 +1158,15 @@ def _discharge_stats(
     and dominates them wherever the trace is steep.  Each single trace is
     smoothed by the ``DISCHARGE_SMOOTHING_SAMPLES`` moving average before
     the statistics are taken, so both measures describe smoothed shots.
+
+    With ``raw_ensemble`` the same two measures are additionally taken on the
+    UNSMOOTHED shots, together with each shot's crossing time through one
+    common current level -- half the ensemble MEDIAN plateau -- and returned
+    under the ``"raw"`` key.  Nothing else in the result changes.
     """
     currents = []
+    currents_raw = []
+    raw_run_ids = []
     voltages_raw = []
     zero_offsets_a = []
     run_ids = []
@@ -1068,6 +1183,9 @@ def _discharge_stats(
             raise ValueError(f"Discharge time grid differs for run {run_id}")
         zero_offsets_a.append(zero_offset_a)
         run_ids.append(run_id)
+        if raw_ensemble:
+            currents_raw.append(current)
+            raw_run_ids.extend([run_id] * current.shape[0])
         currents.append(
             uniform_filter1d(
                 current,
@@ -1092,6 +1210,28 @@ def _discharge_stats(
     n_traces = current_all.shape[0]
     current_std = np.std(current_all, axis=0, ddof=1)
     voltage_std = np.std(voltage_all_raw, axis=0, ddof=1)
+
+    raw: dict[str, np.ndarray] = {}
+    if raw_ensemble:
+        current_raw_all = np.concatenate(currents_raw, axis=0)
+        current_raw_std = np.std(current_raw_all, axis=0, ddof=1)
+        raw_time_ms = reference_time_s * 1000.0
+        plateau_a = _plateau_current_a(current_raw_all, raw_time_ms)
+        t_half_level_a = 0.5 * float(np.median(plateau_a))
+        t_half_level_ms = _t_half_level_ms(
+            current_raw_all, raw_time_ms, t_half_level_a
+        )
+        raw = {
+            "current_mean_a": np.mean(current_raw_all, axis=0),
+            "current_sd_a": current_raw_std,
+            "current_sem_a": current_raw_std / np.sqrt(n_traces),
+            "t_half_level_a": np.asarray(t_half_level_a),
+            "t_half_level_ms": t_half_level_ms,
+            "t_half_level_run_id": np.asarray(raw_run_ids),
+            "t_half_level_mean_ms": np.asarray(np.mean(t_half_level_ms)),
+            "t_half_level_sd_ms": np.asarray(np.std(t_half_level_ms, ddof=1)),
+        }
+
     return {
         "time_ms": reference_time_s * 1000.0,
         "current_mean_a": np.mean(current_all, axis=0),
@@ -1103,6 +1243,7 @@ def _discharge_stats(
         "n_traces": n_traces,
         "zero_offset_a": np.asarray(zero_offsets_a, dtype=np.float64),
         "zero_offset_run_id": np.asarray(run_ids),
+        "raw": raw,
     }
 
 
@@ -1116,7 +1257,11 @@ def export_overlay(
     experiment_set_id: int = 1,
     window_refits_path: Path = WINDOW_REFITS_HDF5,
     rot0_isat_profile_path: Path = ROT0_ISAT_PROFILE_HDF5,
+    raw_discharge_ensemble: bool = False,
+    port_map: str = PORT_MAP_DEFAULT,
 ) -> Path:
+    if port_map != PORT_MAP_DEFAULT:
+        raise ValueError(PORT_MAP_REFUSAL.format(port_map=port_map))
     experiment_set_key = str(experiment_set_id)
     with h5py.File(density_path, "r") as density_hdf, h5py.File(te_path, "r") as te_hdf:
         density = _load_density_stats(
@@ -1189,8 +1334,16 @@ def export_overlay(
         isat_decay_dn,
         face_areas_cm2,
     )
-    interf_decay = _interferometer_decay_stats(dataset, experiment_set_id)
-    discharge = _discharge_stats(dataset, experiment_set_id)
+    interf_decay = _interferometer_decay_stats(
+        dataset,
+        experiment_set_id,
+        port_map,
+    )
+    discharge = _discharge_stats(
+        dataset,
+        experiment_set_id,
+        raw_ensemble=raw_discharge_ensemble,
+    )
     te_window_spread = _te_window_spread_frac(
         window_refits_path,
         experiment_set_id,
@@ -1228,6 +1381,57 @@ def export_overlay(
         upstream_scans["x_cm"],
         geomean_scans["sem"],
     )
+    discharge_raw_fields: dict[str, np.ndarray] = {}
+    if raw_discharge_ensemble:
+        raw = discharge["raw"]
+        discharge_raw_fields = {
+            "discharge_current_raw_mean_a": raw["current_mean_a"],
+            "discharge_current_raw_sd_a": raw["current_sd_a"],
+            "discharge_current_raw_sem_a": raw["current_sem_a"],
+            "discharge_raw_t_half_level_a": raw["t_half_level_a"],
+            "discharge_raw_t_half_level_ms": raw["t_half_level_ms"],
+            "discharge_raw_t_half_level_run_id": raw["t_half_level_run_id"],
+            "discharge_raw_t_half_level_mean_ms": raw["t_half_level_mean_ms"],
+            "discharge_raw_t_half_level_sd_ms": raw["t_half_level_sd_ms"],
+            "discharge_raw_ensemble_definition": np.array(
+                "ADDITIVE, opt-in family: the SAME shots and the SAME "
+                "trigger-referenced grid as discharge_time_ms and the "
+                "discharge_current_* fields, pooled WITHOUT the per-shot "
+                "moving average those apply first.  discharge_current_raw_sd_a "
+                "is the ddof=1 shot envelope of the unsmoothed shots and "
+                "discharge_current_raw_sem_a that divided by "
+                "sqrt(discharge_n_traces); the smoothed family's sd is the "
+                "same statistic after each shot has been averaged over "
+                "discharge_smoothing_samples samples, which rounds every "
+                "shot's own breakdown knee and therefore reads LOW where the "
+                "trace is steep.  discharge_raw_t_half_level_ms is one time "
+                "per shot: the first upward crossing of discharge_raw_t_half_"
+                "level_a, linearly interpolated between the bracketing "
+                "samples, with discharge_raw_t_half_level_run_id naming the "
+                "run each shot came from.  That level is ONE current common "
+                "to every shot -- half the MEDIAN of the per-shot plateau "
+                "means over the SCORING PLATEAU WINDOW, 15.0-19.5 ms, the "
+                "window the transport comparison already scores the drive "
+                "plateau over -- so the times are amplitude-independent "
+                "by construction and differ only in WHEN each shot got there; "
+                "their mean and ddof=1 sd are the breakdown-timing jitter of "
+                "the ensemble, measured rather than inferred from the width "
+                "of a current spread.  A per-shot level referred to each "
+                "shot's own peak would NOT be that statistic, and ES1 shows "
+                "why: both run-05 shots carry a narrow current spike at the "
+                "SAME sample, t = 20.000 ms, reaching 4.95 and 4.07 kA "
+                "against a pack peak median of 3.04 kA -- a fixed-time "
+                "excursion, not a hot discharge, since their plateau is "
+                "normal, within 2 % of the pack median over the scoring "
+                "window, which ends 0.5 ms before the spike.  An own-peak "
+                "level reads that spike as the shot's amplitude and sets "
+                "run 05's threshold near the top of its rise, which walks "
+                "its crossings out and inflates the exported sd by nearly an "
+                "order of magnitude; the common level is below the spike and "
+                "the plateau window excludes it.  Nothing in the smoothed "
+                "family is changed or superseded by these fields."
+            ),
+        }
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
@@ -1639,6 +1843,8 @@ def export_overlay(
             "density_total_sem_cm3, which is a radial-scatter SEM plus the "
             "Probe-A area calibration."
         ),
+        port_map=np.array(port_map),
+        **discharge_raw_fields,
     )
     print(output_path)
     return output_path
@@ -1659,6 +1865,24 @@ def main() -> None:
     parser.add_argument("--window-refits", type=Path, default=WINDOW_REFITS_HDF5)
     parser.add_argument("--manifest", type=Path, default=MANIFEST)
     parser.add_argument("--experiment-set", type=int, choices=(1, 2, 3, 4), default=1)
+    parser.add_argument(
+        "--raw-discharge-ensemble",
+        action="store_true",
+        help="additionally export the unsmoothed per-shot discharge-current "
+             "statistics and each shot's half-peak crossing time; off by "
+             "default, and off leaves every exported field unchanged",
+    )
+    parser.add_argument(
+        "--port-map",
+        choices=PORT_MAPS,
+        default=PORT_MAP_DEFAULT,
+        help="axial port ladder to export on.  Anything but the default is "
+             "REFUSED, with the rebuild the adoption needs spelled out: the "
+             "probe-port z grid is copied from the upstream products, so "
+             "exporting on a ladder they were not built under would write a "
+             "mixed-ladder product.  The ladder actually used is stamped into "
+             "the product as port_map",
+    )
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     output = args.output or Path(
@@ -1674,6 +1898,8 @@ def main() -> None:
         args.experiment_set,
         args.window_refits,
         args.rot0_isat_profiles,
+        args.raw_discharge_ensemble,
+        args.port_map,
     )
 
 

@@ -12,6 +12,7 @@ from bapsf_lapd import (
     effective_rotation_deg,
     load_run_manifest,
 )
+from bapsf_lapd.config import PORT_MAP_DEFAULT, z_from_port
 
 
 def test_default_run_config_maps_experiment_set_and_sweep_resistor():
@@ -173,3 +174,31 @@ def test_manifest_moving_photodiode_port_patterns():
     for run_id in dataset.run_ids():
         pattern = set0_pattern if run_id.startswith("0") else other_set_pattern
         assert dataset.config(run_id).channel("moving_photodiode").port == pattern[run_id[1]]
+
+
+def test_port_maps_carry_both_ladders_and_the_default_is_the_nominal_one():
+    nominal = {11: 470.05, 21: 789.55, 29: 1045.15, 41: 1428.55, 50: 1716.10}
+    cad = {11: 470.67, 21: 790.67, 29: 1046.67, 41: 1430.67, 50: 1718.67}
+    interferometer_nominal = {20: 757.60, 29: 1045.15, 40: 1396.60}
+    interferometer_cad = {20: 758.67, 29: 1046.67, 40: 1398.67}
+
+    for port, z_cm in (nominal | interferometer_nominal).items():
+        assert z_from_port(port) == pytest.approx(z_cm)
+        assert z_from_port(port, "nominal") == pytest.approx(z_cm)
+        assert z_from_port(port) == z_from_port(port, PORT_MAP_DEFAULT)
+
+    for port, z_cm in (cad | interferometer_cad).items():
+        assert z_from_port(port, "cad") == pytest.approx(z_cm)
+
+    # The CAD ladder is anchored one port lower and is the wider of the two, so
+    # it moves every measurement port downstream by an offset that grows with
+    # port number.  Nothing reads it unless it is asked for by name.
+    offsets = [z_from_port(port, "cad") - z_from_port(port) for port in nominal]
+    assert offsets == sorted(offsets)
+    assert offsets[0] == pytest.approx(0.62)
+    assert offsets[-1] == pytest.approx(2.57)
+
+
+def test_unknown_port_map_is_refused():
+    with pytest.raises(ValueError, match="unknown port map"):
+        z_from_port(21, "CAD")

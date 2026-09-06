@@ -46,6 +46,7 @@ takes minutes.
 
 Usage:  python annotate_rail_mask.py <repo-root> <product.hdf5> <summary.json>
 """
+import argparse
 import json
 import sys
 from pathlib import Path
@@ -53,10 +54,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 
-REPO = Path(sys.argv[1])
-PRODUCT = Path(sys.argv[2])
-JSON_OUT = Path(sys.argv[3])
-sys.path.insert(0, str(REPO / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from bapsf_lapd import LapdDataset, ChannelKind          # noqa: E402
 from bapsf_lapd.density import inter_sweep_sample_slices  # noqa: E402
@@ -139,11 +137,33 @@ def screen_cells(run, kind):
     )
 
 
-def main():
-    ds = LapdDataset.from_manifest(REPO / "config/may2026_run_manifest.toml")
+def main(argv=None):
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "repo_root",
+        type=Path,
+        help="repository root holding config/may2026_run_manifest.toml "
+             "and the raw run directory it names",
+    )
+    parser.add_argument(
+        "product",
+        type=Path,
+        help="the dead-time profile product to annotate in place",
+    )
+    parser.add_argument(
+        "summary_json",
+        type=Path,
+        help="path for the JSON summary sidecar",
+    )
+    args = parser.parse_args(argv)
+
+    ds = LapdDataset.from_manifest(args.repo_root / "config/may2026_run_manifest.toml")
     summary = {}
 
-    with h5py.File(PRODUCT, "r+") as hf:
+    with h5py.File(args.product, "r+") as hf:
         hf.attrs["saturation_screen_method"] = METHOD
         hf.attrs["saturation_screen_rail_codes"] = f"{RAIL_LO},{RAIL_HI}"
         hf.attrs["saturation_screen_clip_s"] = CLIP_S
@@ -220,11 +240,11 @@ def main():
             "the mask."
         )
 
-    JSON_OUT.write_text(json.dumps(summary, indent=2, default=str))
-    print(f"\nannotated {PRODUCT}")
+    args.summary_json.write_text(json.dumps(summary, indent=2, default=str))
+    print(f"\nannotated {args.product}")
     print("railed on this face:", excluded_runs or "none")
     print("railed on the opposite face:", opposite_runs or "none")
-    print(f"wrote {JSON_OUT}")
+    print(f"wrote {args.summary_json}")
 
 
 if __name__ == "__main__":
