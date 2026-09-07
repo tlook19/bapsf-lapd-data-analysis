@@ -123,6 +123,7 @@ import numpy as np
 from scipy.ndimage import uniform_filter1d
 
 from bapsf_lapd import ChannelKind, LapdDataset
+from bapsf_lapd.annotations import refuse_artifacts_in_window
 from bapsf_lapd.config import PORT_MAP_DEFAULT, PORT_MAPS, z_from_port
 from bapsf_lapd.filtering import butterworth_lowpass
 from plot_core_density_temperature_timeseries import (
@@ -1076,18 +1077,21 @@ def _te_trust_records(
     }
 
 
-def _plateau_current_a(current: np.ndarray, time_ms: np.ndarray) -> np.ndarray:
+def _plateau_current_a(
+    current: np.ndarray,
+    time_ms: np.ndarray,
+    window_ms: tuple[float, float] = RAW_PLATEAU_WINDOW_MS,
+) -> np.ndarray:
     """Per-shot plateau current, in A: the mean over the scoring plateau window.
 
-    The window is ``RAW_PLATEAU_WINDOW_MS``, inherited from the scoring
-    convention rather than chosen here.  What this returns is an AMPLITUDE, not
-    a timing quantity: it is what the shots differ in when one of them runs a
-    hotter discharge than the rest.
+    The window defaults to ``RAW_PLATEAU_WINDOW_MS``, inherited from the
+    scoring convention rather than chosen here; it is a parameter only so a
+    caller can state the window it is actually averaging over, which is what
+    the artifact guard in ``_discharge_stats`` checks.  What this returns is an
+    AMPLITUDE, not a timing quantity: it is what the shots differ in when one
+    of them runs a hotter discharge than the rest.
     """
-    window = (
-        (time_ms >= RAW_PLATEAU_WINDOW_MS[0])
-        & (time_ms <= RAW_PLATEAU_WINDOW_MS[1])
-    )
+    window = (time_ms >= window_ms[0]) & (time_ms <= window_ms[1])
     return np.mean(current[:, window], axis=1)
 
 
@@ -1135,6 +1139,8 @@ def _discharge_stats(
     dataset: LapdDataset,
     experiment_set_id: int,
     raw_ensemble: bool = False,
+    plateau_window_ms: tuple[float, float] = RAW_PLATEAU_WINDOW_MS,
+    run_artifacts=None,
 ) -> dict[str, np.ndarray | int]:
     """Return the offset-corrected experiment-set discharge current and voltage.
 
@@ -1163,6 +1169,15 @@ def _discharge_stats(
     UNSMOOTHED shots, together with each shot's crossing time through one
     common current level -- half the ensemble MEDIAN plateau -- and returned
     under the ``"raw"`` key.  Nothing else in the result changes.
+
+    Before that plateau is taken, ``plateau_window_ms`` is checked against the
+    declared run artifacts in ``config/may2026_run_artifacts.toml`` and the
+    whole statistic is REFUSED if the window covers one.  ES1 run 05 carries a
+    one-sample discharge-current excursion at t = 20.000 ms, 0.5 ms past the
+    end of the default window, so the default passes; a window widened past it
+    would otherwise average a discharge-termination switching transient into
+    the drive plateau without saying so.  ``run_artifacts`` overrides the
+    registry for tests and offline callers.
     """
     currents = []
     currents_raw = []
@@ -1216,7 +1231,17 @@ def _discharge_stats(
         current_raw_all = np.concatenate(currents_raw, axis=0)
         current_raw_std = np.std(current_raw_all, axis=0, ddof=1)
         raw_time_ms = reference_time_s * 1000.0
-        plateau_a = _plateau_current_a(current_raw_all, raw_time_ms)
+        refuse_artifacts_in_window(
+            raw_run_ids,
+            plateau_window_ms,
+            "the raw discharge ensemble's plateau current, and the common "
+            "crossing level derived from it",
+            channel="discharge_current",
+            artifacts=run_artifacts,
+        )
+        plateau_a = _plateau_current_a(
+            current_raw_all, raw_time_ms, plateau_window_ms
+        )
         t_half_level_a = 0.5 * float(np.median(plateau_a))
         t_half_level_ms = _t_half_level_ms(
             current_raw_all, raw_time_ms, t_half_level_a

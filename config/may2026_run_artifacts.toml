@@ -1,0 +1,26 @@
+# Declared per-run signal artifacts for the May 2026 LAPD dataset.
+#
+# An artifact is a stretch of a run's record that the instrument produced
+# and the plasma did not.  Declaring one FLAGS it; nothing here excludes a
+# sample, a shot or a run.  What the declaration buys is the window guard in
+# bapsf_lapd.annotations: a consumer computing a plateau or a timing
+# statistic over a window refuses when its window covers an annotated
+# sample, instead of averaging across it.
+#
+# sample_index and time_ms name the same sample on that channel's own
+# acquisition grid; time_ms is what the guard compares a window against.
+# peak_amplitude_a carries one entry per stored shot, offset-corrected the
+# way the analysis reads the channel.
+#
+# Written by scripts/annotate_discharge_artifacts.py, which MEASURES each
+# entry from the raw record; the write is additive, so re-running it leaves
+# every other run's block byte-identical.
+
+[[runs.05.artifacts]]
+kind = "termination_spike"
+channel = "discharge_current"
+sample_index = 1012
+time_ms = 19.999999494757503
+peak_amplitude_a = [4950.67598556607, 4065.915487519195]
+description = "one-sample discharge-current excursion to ~4-5 kA immediately followed by the discharge fall-off; a deterministic discharge-termination switching transient, FLAGGED not excluded"
+detection_rule = "one-sample discharge-current excursion: the maximum sample of the offset-corrected record, lying after the scoring plateau window, with both immediate neighbours below 0.85 of it, at the same sample index in every stored shot of the run"

@@ -12,8 +12,10 @@ import sys
 import pytest
 
 SCRIPT_MODULES = [
+    "scripts.annotate_discharge_artifacts",
     "scripts.annotate_rail_mask",
     "scripts.annotate_saturation_attrs",
+    "scripts.compare_run_annotations",
     "scripts.screen_rot180_saturation",
 ]
 
