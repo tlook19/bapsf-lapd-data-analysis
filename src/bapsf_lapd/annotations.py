@@ -45,6 +45,12 @@ class RunArtifact:
     two clocks.  ``peak_amplitude_a`` carries the artifact's amplitude in one
     entry per stored shot, in the channel's own units, offset-corrected the way
     the analysis reads that channel.
+
+    ``detection_rule`` is the criterion the annotator applied to find this
+    artifact, carried on the record rather than left in the annotator's source.
+    It is required, not optional: an entry that says an artifact is present
+    without saying what test found it cannot be re-measured or argued with, and
+    the loader refuses one.
     """
 
     run_id: str
@@ -54,6 +60,7 @@ class RunArtifact:
     time_ms: float
     peak_amplitude_a: tuple[float, ...]
     description: str
+    detection_rule: str
 
     @property
     def label(self) -> str:
@@ -62,6 +69,19 @@ class RunArtifact:
             f"run {self.run_id} {self.channel} {self.kind} at sample "
             f"{self.sample_index} (t = {self.time_ms:.6g} ms)"
         )
+
+
+#: Every field a registry entry must carry; ``run_id`` comes from the block's
+#: own key rather than from the entry, so it is not among them.
+_REQUIRED_FIELDS = (
+    "kind",
+    "channel",
+    "sample_index",
+    "time_ms",
+    "peak_amplitude_a",
+    "description",
+    "detection_rule",
+)
 
 
 def load_run_artifacts(
@@ -73,6 +93,11 @@ def load_run_artifacts(
     fell back to "no annotations" on a missing file would compute over an
     artifact silently, which is exactly the failure the registry exists to
     prevent, so the absence is an error rather than an empty result.
+
+    Raises ``KeyError`` naming the run and the missing field if an entry is
+    short of any field ``RunArtifact`` declares, ``detection_rule`` included.
+    Every field is load-bearing -- a partially-filled entry would flag a window
+    with an artifact nobody can re-measure -- so none of them is optional.
     """
     path = Path(path)
     with open(path, "rb") as stream:
@@ -81,7 +106,14 @@ def load_run_artifacts(
     registry: dict[str, tuple[RunArtifact, ...]] = {}
     for run_id, block in sorted(data.get("runs", {}).items()):
         records = []
-        for entry in block.get("artifacts", ()):
+        for position, entry in enumerate(block.get("artifacts", ())):
+            missing = [name for name in _REQUIRED_FIELDS if name not in entry]
+            if missing:
+                raise KeyError(
+                    f"run {run_id} artifact {position} in {path} is missing "
+                    f"{', '.join(missing)}; every field of a declared artifact "
+                    f"is required"
+                )
             records.append(
                 RunArtifact(
                     run_id=str(run_id),
@@ -93,6 +125,7 @@ def load_run_artifacts(
                         float(value) for value in entry["peak_amplitude_a"]
                     ),
                     description=str(entry["description"]),
+                    detection_rule=str(entry["detection_rule"]),
                 )
             )
         if records:

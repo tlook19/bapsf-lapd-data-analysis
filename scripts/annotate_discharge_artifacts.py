@@ -29,6 +29,16 @@ part of the detection rule rather than an observation about the result:
 The numbers written are the ones this pass measured, not a transcribed copy;
 run it again and it re-measures.
 
+LIMITATION OF THE DETERMINISM CLAUSE.  "Same sample index in every stored
+shot" is a screen for determinism, not a measurement of one, and it can
+UNDER-declare: an artifact that fires in only some shots of a run fails it and
+goes unannotated.  With two stored shots per run it is weak evidence on its
+own -- agreement between two draws is cheap -- so it is the AMPLITUDE clause
+that carries the decision here, and the sample-index agreement is corroboration
+rather than the finding.  The scoring plateau window the rule refers to is
+imported from the exporter, so the window this rule means and the window the
+guard checks are one object rather than two copies that can drift apart.
+
 THE RULING IS FLAG, NOT EXCLUDE.  Nothing here drops a sample or a shot.  What
 the annotation buys is the guard in ``bapsf_lapd.annotations``: a consumer
 computing a plateau or a timing statistic over a window refuses when its window
@@ -58,17 +68,20 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from bapsf_lapd import LapdDataset  # noqa: E402
-
-#: The scoring plateau window, in ms.  The excursion must lie AFTER it for the
-#: run to be summarised as "plateau normal, artifact past the window"; the same
-#: window is what the exporter's raw discharge ensemble averages over.
-PLATEAU_MS = (15.0, 19.5)
+from export_es1_sim1d_overlay import RAW_PLATEAU_WINDOW_MS  # noqa: E402
 
 #: Both immediate neighbours of a one-sample excursion must sit below this
-#: fraction of it.  Run 05's neighbours read ~0.61 and ~0.49 of the peak; a
-#: genuine plasma current maximum has neighbours within a percent or two.
+#: fraction of it.  The clause is tested per shot on max(left, right) / peak.
+#: Measured over ES1 (8 runs, 16 shots): run 05 reads 0.609 (shot 0) and 0.727
+#: (shot 1, the binding value); every other shot reads 0.894 to 0.997, the best
+#: failing case being 0.894.  0.85 sits in the gap 0.727 <-> 0.894.  The
+#: amplitude separation runs the same way -- run 05's peak is 1.651 and 1.373
+#: times its own plateau, against at most 1.114 everywhere else.  A
+#: single-neighbour form of this test would NOT separate them: single
+#: neighbours away from run 05 fall as low as 0.813.
 SPIKE_NEIGHBOUR_MAX_FRACTION = 0.85
 
 KIND = "termination_spike"
@@ -111,7 +124,7 @@ def measure_spike(run) -> dict:
             f"run {run.config.run_id}: the record maximum is at an endpoint "
             f"(sample {index}) and has no neighbours to judge"
         )
-    if time_ms[index] <= PLATEAU_MS[1]:
+    if time_ms[index] <= RAW_PLATEAU_WINDOW_MS[1]:
         raise ValueError(
             f"run {run.config.run_id}: the record maximum at t = "
             f"{time_ms[index]:.6g} ms is inside or before the scoring plateau "
@@ -128,7 +141,7 @@ def measure_spike(run) -> dict:
             f"below {SPIKE_NEIGHBOUR_MAX_FRACTION:g}"
         )
 
-    window = (time_ms >= PLATEAU_MS[0]) & (time_ms <= PLATEAU_MS[1])
+    window = (time_ms >= RAW_PLATEAU_WINDOW_MS[0]) & (time_ms <= RAW_PLATEAU_WINDOW_MS[1])
     return {
         "run_id": run.config.run_id,
         "experiment_set_id": int(run.config.experiment_set.id),

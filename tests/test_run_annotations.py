@@ -56,11 +56,59 @@ def test_the_annotated_sample_index_and_time_name_the_same_sample():
     )
 
 
+def test_the_registry_carries_the_rule_that_found_each_artifact():
+    (artifact,) = load_run_artifacts(RUN_ARTIFACTS_TOML)["05"]
+
+    # The criterion rides the record, so the entry can be re-measured and
+    # argued with without reading the annotator's source.
+    assert "one-sample" in artifact.detection_rule
+    assert "same sample index in every stored shot" in artifact.detection_rule
+
+
 def test_a_missing_registry_is_an_error_not_an_empty_result():
     # A consumer that read "no annotations" off a missing file would compute
     # over an artifact silently, which is the failure the registry prevents.
     with pytest.raises(FileNotFoundError):
         load_run_artifacts(Path("config/there_is_no_such_registry.toml"))
+
+
+REQUIRED_ENTRY_FIELDS = (
+    "kind",
+    "channel",
+    "sample_index",
+    "time_ms",
+    "peak_amplitude_a",
+    "description",
+    "detection_rule",
+)
+
+
+@pytest.mark.parametrize("dropped", REQUIRED_ENTRY_FIELDS)
+def test_the_loader_refuses_an_entry_missing_any_required_field(tmp_path, dropped):
+    # An entry short of a field would declare an artifact nobody can
+    # re-measure; detection_rule is in this list, so a block written without a
+    # rule cannot load clean.
+    lines = [
+        "[[runs.05.artifacts]]",
+        'kind = "termination_spike"',
+        'channel = "discharge_current"',
+        "sample_index = 1012",
+        "time_ms = 20.0",
+        "peak_amplitude_a = [4950.7, 4065.9]",
+        'description = "a one-sample excursion"',
+        'detection_rule = "a stated rule"',
+    ]
+    kept = [line for line in lines if not line.startswith(f"{dropped} =")]
+    assert len(kept) == len(lines) - 1
+    registry = tmp_path / "run_artifacts.toml"
+    registry.write_text("\n".join(kept) + "\n")
+
+    with pytest.raises(KeyError) as excinfo:
+        load_run_artifacts(registry)
+
+    message = str(excinfo.value)
+    assert dropped in message
+    assert "05" in message
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +125,7 @@ def _artifact(time_ms=RUN05_TIME_MS, channel="discharge_current"):
                 time_ms=time_ms,
                 peak_amplitude_a=(4950.7, 4065.9),
                 description="a one-sample excursion",
+                detection_rule="a stated rule",
             ),
         )
     }
