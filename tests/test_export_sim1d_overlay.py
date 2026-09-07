@@ -9,16 +9,20 @@ from scripts.export_es1_sim1d_overlay import (
     FLUX_TUBE_RADIUS_CM,
     PLASMA_DIAMETER_CM,
     PORTS,
+    RAW_PLATEAU_WINDOW_MS,
     X_MAX_CM,
     X_MIN_CM,
     _despike_profile,
+    _discharge_stats,
     _flux_tube_profile_stats,
     _flow_symmetrized_profiles,
     _flux_tube_weights,
     _interferometer_decay_stats,
     _isat_decay_geomean,
+    _plateau_current_a,
     _rot0_isat_profiles,
     _subtract_background,
+    _t_half_level_ms,
     _te_trust_records,
     _te_window_spread_frac,
     export_overlay,
@@ -793,3 +797,158 @@ def test_the_two_faces_reject_different_shots():
     assert upstream.shape == downstream.shape
     assert not np.array_equal(upstream, downstream)
     assert "REJECT" in str(overlay["isat_decay_face_convention"])
+
+
+# ---------------------------------------------------------------------------
+# The raw discharge ensemble (the --raw-discharge-ensemble opt-in)
+# ---------------------------------------------------------------------------
+RAW_DT_MS = 0.05
+RAW_TIME_MS = np.arange(0.0, 25.0, RAW_DT_MS)
+RAW_RISE_START_MS = 2.0
+RAW_RISE_STOP_MS = 4.0
+RAW_FALL_MS = 20.5
+
+
+def _ramp_shot(plateau_a, time_ms=RAW_TIME_MS):
+    """A synthetic discharge shot: zero, a linear rise, a flat plateau, a fall.
+
+    The rise is linear between ``RAW_RISE_START_MS`` and ``RAW_RISE_STOP_MS``
+    so a level crossing inside it has a closed-form time, and the plateau is
+    flat over the whole scoring window so its mean is exactly ``plateau_a``.
+    """
+    frac = np.clip(
+        (time_ms - RAW_RISE_START_MS) / (RAW_RISE_STOP_MS - RAW_RISE_START_MS),
+        0.0,
+        1.0,
+    )
+    return np.where(time_ms >= RAW_FALL_MS, 0.0, plateau_a * frac)
+
+
+class _DischargeStubRun:
+    """The two attributes ``_discharge_stats`` reads off a run."""
+
+    def __init__(self, current, time_ms):
+        self._current = np.asarray(current, dtype=np.float64)
+        self._time_s = np.asarray(time_ms, dtype=np.float64) / 1000.0
+
+    def discharge_traces(self):
+        # The voltage is smoothed and averaged but plays no part in the raw
+        # current ensemble under test.
+        return self._current, -np.full_like(self._current, 100.0), self._time_s
+
+    def discharge_zero_offset_stats(self):
+        return type("_Offsets", (), {"offset_a": 0.0})()
+
+
+class _DischargeStubDataset:
+    """The two lookups ``_discharge_stats`` makes on a dataset."""
+
+    def __init__(self, runs):
+        self._runs = runs
+
+    def experiment_set_run_ids(self, experiment_set_id):
+        return list(self._runs)
+
+    def run(self, run_id):
+        return self._runs[run_id]
+
+
+def test_the_plateau_helper_is_the_per_shot_mean_over_the_scoring_window():
+    window = (
+        (RAW_TIME_MS >= RAW_PLATEAU_WINDOW_MS[0])
+        & (RAW_TIME_MS <= RAW_PLATEAU_WINDOW_MS[1])
+    )
+    # In-window samples that average to a known plateau without being
+    # constant, so a helper that read one sample instead of the mean fails;
+    # out-of-window samples far away, so a helper that ignored the window
+    # fails too.
+    current = np.full((2, RAW_TIME_MS.size), -9000.0)
+    n_in = int(window.sum())
+    swing = (np.arange(n_in, dtype=np.float64) - (n_in - 1) / 2.0) * 10.0
+    assert np.sum(swing) == 0.0
+    current[0, window] = 3000.0 + swing
+    current[1, window] = 2500.0 + 2.0 * swing
+
+    plateau = _plateau_current_a(current, RAW_TIME_MS)
+
+    assert plateau.shape == (2,)
+    assert plateau[0] == pytest.approx(3000.0)
+    assert plateau[1] == pytest.approx(2500.0)
+    assert plateau[0] == pytest.approx(np.mean(current[0, window]))
+
+
+def test_the_scoring_plateau_window_is_the_inherited_beta_plateau():
+    # RAW_PLATEAU_WINDOW_MS is not chosen in this repo: it is the drive-plateau
+    # window the transport comparison scores over, whose own constant is named
+    # BETA_PLATEAU_MS and reads (15.0, 19.5) ms.  Asserted as a literal rather
+    # than imported, because the two repositories are not installed together
+    # and a silent drift on either side has to show up here as a failure.
+    assert RAW_PLATEAU_WINDOW_MS == (15.0, 19.5)
+
+
+def test_the_common_crossing_level_is_half_the_ensemble_median_plateau():
+    runs = {
+        "01": np.array([_ramp_shot(3000.0), _ramp_shot(3400.0)]),
+        "02": np.array([_ramp_shot(2600.0)]),
+    }
+    dataset = _DischargeStubDataset({k: _DischargeStubRun(v, RAW_TIME_MS) for k, v in runs.items()})
+
+    stats = _discharge_stats(dataset, 1, raw_ensemble=True)
+
+    plateaus = np.array([3000.0, 3400.0, 2600.0])
+    assert stats["raw"]["t_half_level_a"] == pytest.approx(
+        0.5 * float(np.median(plateaus))
+    )
+    # Not half of any single shot's own plateau -- one level for the ensemble.
+    assert stats["raw"]["t_half_level_a"] == pytest.approx(1500.0)
+    assert stats["raw"]["t_half_level_run_id"].tolist() == ["01", "01", "02"]
+
+
+def test_a_shot_that_never_reaches_the_level_raises_and_names_that_shot():
+    current = np.array([_ramp_shot(3000.0), _ramp_shot(3000.0), _ramp_shot(3000.0)])
+    current[1] *= 0.1  # this shot tops out at 300 A, far below the level
+
+    with pytest.raises(ValueError) as excinfo:
+        _t_half_level_ms(current, RAW_TIME_MS, 1500.0)
+
+    message = str(excinfo.value)
+    assert "[1]" in message
+    assert "never reach" in message
+    assert "1500" in message
+
+
+def test_a_spike_after_the_window_does_not_move_the_level_or_the_crossings():
+    clean = {
+        "01": np.array([_ramp_shot(3000.0), _ramp_shot(2900.0)]),
+        "02": np.array([_ramp_shot(3100.0)]),
+    }
+    spiked = {k: v.copy() for k, v in clean.items()}
+    spike_sample = int(np.argmin(np.abs(RAW_TIME_MS - 20.0)))
+    assert RAW_PLATEAU_WINDOW_MS[1] < RAW_TIME_MS[spike_sample] < RAW_FALL_MS
+    # Run 05's shape: one sample at ~5 kA against a normal 3 kA plateau.
+    spiked["01"][0, spike_sample] = 4950.0
+    spiked["02"][0, spike_sample] = 4070.0
+
+    clean_stats = _discharge_stats(
+        _DischargeStubDataset({k: _DischargeStubRun(v, RAW_TIME_MS) for k, v in clean.items()}),
+        1,
+        raw_ensemble=True,
+    )
+    spiked_stats = _discharge_stats(
+        _DischargeStubDataset({k: _DischargeStubRun(v, RAW_TIME_MS) for k, v in spiked.items()}),
+        1,
+        raw_ensemble=True,
+    )
+
+    assert spiked_stats["raw"]["t_half_level_a"] == clean_stats["raw"]["t_half_level_a"]
+    assert np.array_equal(
+        spiked_stats["raw"]["t_half_level_ms"], clean_stats["raw"]["t_half_level_ms"]
+    )
+    assert spiked_stats["raw"]["t_half_level_sd_ms"] == clean_stats["raw"][
+        "t_half_level_sd_ms"
+    ]
+    # The spike is a real difference between the two ensembles; it just does
+    # not reach the amplitude the timing statistic is referred to.
+    assert not np.array_equal(
+        spiked_stats["raw"]["current_mean_a"], clean_stats["raw"]["current_mean_a"]
+    )
