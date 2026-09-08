@@ -257,7 +257,7 @@ def _port_summary(record: dict) -> dict:
         "criterion_dln": CRITERION_DLN,
         "passes_criterion": bool(median < CRITERION_DLN),
         "x0_control_passes_criterion": bool(x0 < CRITERION_DLN),
-        "adopted_2026_08_20z": bool(
+        "trust_to_aperture_adopted": bool(
             (int(record["sid"]), int(record["port"])) in ADOPTED_SET_PORTS
         ),
     }

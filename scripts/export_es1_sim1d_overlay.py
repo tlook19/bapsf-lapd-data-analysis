@@ -98,7 +98,7 @@ The Mach probe has two planar faces on opposite sides of the body.  At rot-0
 the ``i_sweep`` channel collects on the UPSTREAM face and the ``isat`` channel
 on the DOWNSTREAM one; at rot-180 the assignment reverses.  A downstream face
 sits in the probe body's own flow shadow, so it under-reads, and on 2026-08-18
-the upstream face was RULED the Isat truth channel.
+the upstream face was the Isat truth channel.
 
 ``isat_ftavg_upstream_a`` is therefore the correction-bearing field: it comes
 from the ``i_sweep`` product, which is also the chain behind ``n_e_m3`` and
@@ -462,7 +462,7 @@ def _rot0_isat_profiles(
     same layout and differ only in which electrical channel filled them:
 
     * ``ISAT_PROFILE_HDF5`` -- the ``i_sweep`` channel, the UPSTREAM face at
-      rot-0 and the ruled Isat truth channel;
+      rot-0 and the Isat truth channel;
     * ``ROT0_ISAT_PROFILE_HDF5`` -- the ``isat`` channel, the DOWNSTREAM face.
 
     The per-run source channel is exported with the fields rather than assumed,
@@ -1831,7 +1831,7 @@ def export_overlay(
         isat_ftavg_upstream_source_channel=upstream_scans["source_channel"],
         isat_ftavg_upstream_face=np.array(
             "UPSTREAM probe face at rot-0 ('i_sweep' channel; per-port channel "
-            "is in isat_ftavg_upstream_source_channel).  RULED the Isat truth "
+            "is in isat_ftavg_upstream_source_channel).  Was the Isat truth "
             "channel 2026-08-18 because the opposite face collects in the "
             "probe body's flow shadow and under-reads.  This is the same face "
             "as the density chain behind density_ftavg_cm3 and as "
