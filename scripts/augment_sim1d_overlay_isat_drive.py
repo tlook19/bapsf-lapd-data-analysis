@@ -9,9 +9,9 @@ at ``decay_start_s`` (~20 ms), after the last sweep cycle, whereas the
 same channel sits at ion-saturation bias in the inter-sweep dead-time
 cells throughout the drive.  Exporting those cells at x = 0 makes the
 area guard exact and within-shot — drive and afterglow share the
-channel, the zero offset and the shot ensemble, so every per-port
-constant cancels in g_shot = ln r(drive) − ln r(afterglow), per rung,
-with no ladder needed.  Input may be
+channel, the zero offset and the runs, so every per-port constant
+cancels in g_shot = ln r(drive) − ln r(afterglow), per rung, with no
+ladder needed.  Input may be
 schema v2 (es1 vintage), v3 (adds the isat_decay source-channel
 metadata; es2/es3 vintage — v3 was already taken by that export, so the
 drive family is SCHEMA v4), v5 (adds
@@ -37,7 +37,7 @@ each family's presence stays readable from the
 version alone; an augmented version is never itself an accepted input,
 which is what makes a second augmentation fail the gate.
 The consumer is
-``bapsf-transport/cablp/scripts/compare_sim1d_es1.py --beta-collapse``
+``bapsf-transport/scripts/score/compare_sim1d_es1.py --beta-collapse``
 (within-shot area guard + model-free sweep-chain consistency).
 
 Source: ``processed/isweep_deadtime_profiles.hdf5`` ``isat_a_raw`` at
@@ -49,12 +49,12 @@ hence the channel/wiring, incl. the run 31/33 special cases resolved by
 the per-run attrs) that feed the decay trace.
 
 Deliberate deviation from the field contract this family was specified
-under, and logged: the
-profile pipeline rejects high-current shots PER CELL (sigma=3.0,
-ratio=1.5, keep >= 10 of 20), which is not the decay trace's fixed
-pre-afterglow shot ensemble.  ``isat_drive_same_ensemble_as_decay`` is
-therefore stored as False and the drive/decay seam continuity gate is
-the empirical commensurability arbiter.
+under: the profile pipeline rejects high-current shots PER CELL
+(sigma=3.0, ratio=1.5, keep >= 10 of 20), which is not the decay
+trace's fixed pre-afterglow shot ensemble.
+``isat_drive_same_ensemble_as_decay`` is therefore stored as False and
+the drive/decay seam continuity gate is the empirical commensurability
+arbiter.
 
 Usage::
 
