@@ -152,7 +152,7 @@ MANIFEST = Path("config/may2026_run_manifest.toml")
 DENSITY_HDF5 = Path("processed/density_profiles_isweep.hdf5")
 TE_HDF5 = Path("processed/te_filled.hdf5")
 #: Dead-time line-scan profiles from the ``i_sweep`` channel: the UPSTREAM
-#: probe face at rot-0, ruled the Isat truth channel 2026-08-18.  Feeds both
+#: probe face at rot-0, and the Isat truth channel.  Feeds both
 #: the x=0 decay trace and the ``isat_ftavg_upstream_*`` flux-tube family.
 ISAT_PROFILE_HDF5 = Path("processed/isweep_deadtime_profiles.hdf5")
 #: The same scans from the ``isat`` channel: the DOWNSTREAM face at rot-0,
@@ -1591,7 +1591,7 @@ def export_overlay(
             "grid, at the same ports and the same runs (isat_decay_port, "
             "isat_decay_run_id apply to both).  isat_decay_mean_a / "
             "isat_decay_sem_a are the UPSTREAM face at rot-0 -- the 'i_sweep' "
-            "channel, ruled the Isat truth channel 2026-08-18 -- and "
+            "channel, which is the Isat truth channel -- and "
             "isat_decay_dn_mean_a / isat_decay_dn_sem_a are the DOWNSTREAM "
             "face, the 'isat' channel, which collects in the probe body's flow "
             "shadow and under-reads.  Both are raw currents in A with no "
@@ -1773,7 +1773,7 @@ def export_overlay(
             "isat_ftavg_n_despiked."
         ),
         ftavg_face_ruling=np.array(
-            "RULED 2026-08-18: at rot-0 the i_sweep channel collects on the "
+            "At rot-0 the i_sweep channel collects on the "
             "UPSTREAM probe face and is the Isat truth channel; the isat "
             "channel is the DOWNSTREAM face and under-reads because it sits "
             "in the probe body's flow shadow (the assignment reverses at "
@@ -1784,9 +1784,9 @@ def export_overlay(
             "rot-0 primary and as the face the 2026-08-18 paper read used.  "
             "The two faces' flux-tube corrections run in OPPOSITE directions "
             "with z and must never be ratioed against each other.  "
-            "ADJUDICATED 2026-08-18, three estimators with three roles: "
+            "Three estimators with three roles: "
             "isat_ftavg_* is the downstream face, SHADOWED, biased low; "
-            "isat_ftavg_upstream_* is the ruled truth channel and the "
+            "isat_ftavg_upstream_* is the truth channel and the "
             "flow-ENHANCED conjugate of it, biased the other way; "
             "isat_ftavg_geomean_* is the flow-CANCELLED central estimator "
             "built from both, and is the one whose C(z) came out z-flat."

@@ -1,11 +1,10 @@
-"""Varied-window re-fits of the raw Langmuir I-V sweeps (§7i protocol).
+"""Varied-window re-fits of the raw Langmuir I-V sweeps.
 
-Executes the pre-registered fit-window sensitivity test from
-CATHODE_IDRIVEN_PLAN.md §7i (2026-07-22): for each (experiment set 1-3,
-port, plateau cycle, shot) at x = 0, re-fit the SAME raw I-V sweep over a
-5 x 5 family of electron-retarding fit windows and report the Te(window)
-sensitivity surface. The decision rule compares the window-family spread
-against the beta-hat-implied Te shifts from the transport-side
+Executes the pre-registered fit-window sensitivity test: for each
+(experiment set 1-3, port, plateau cycle, shot) at x = 0, re-fit the SAME
+raw I-V sweep over a 5 x 5 family of electron-retarding fit windows and
+report the Te(window) sensitivity surface. The decision rule compares the
+window-family spread against the beta-hat-implied Te shifts from the transport-side
 beta-collapse tables: window spread >= implied shift -> the sweep analysis
 CAN carry the residual; window-stable Te with spread << implied shift ->
 model Te error convicted.
@@ -66,9 +65,8 @@ SWEEPS_H5 = ROOT / "processed" / "langmuir_sweeps.hdf5"
 P_LOW = (3.0, 8.0, 15.0, 25.0, 35.0)
 F_HIGH = (0.05, 0.10, 0.15, 0.30, 0.50)
 
-# beta-hat reference scales from the transport-side tables
-# (CATHODE_IDRIVEN_PLAN.md §5b BETA-COLLAPSE entries, 2026-07-22): per-rung
-# centered mean ln(beta-hat) for the 2z reference family, and the es3
+# beta-hat reference scales from the transport-side beta-collapse tables:
+# per-rung centered mean ln(beta-hat) for the 2z reference family, and the es3
 # far-port within-shot offsets. Hypothesis-test references, not data.
 LN_BETA_RUNG = {1: 0.255, 2: 0.106, 3: -0.482}
 LN_BETA_ES3_FAR = {41: 0.72, 50: 1.31}
@@ -232,7 +230,12 @@ def main():
         f.attrs["p_low"] = P_LOW
         f.attrs["f_high"] = F_HIGH
         f.attrs["plateau_ms"] = args.plateau_ms
-        f.attrs["protocol"] = "CATHODE_IDRIVEN_PLAN.md §7i (2026-07-22)"
+        f.attrs["protocol"] = (
+            "fit-window sensitivity: each raw I-V sweep at x = 0 re-fit over "
+            "the 5 x 5 family of electron-retarding windows recorded in the "
+            "p_low / f_high attrs, ion branch held at pipeline defaults; "
+            "T_e(window) sensitivity tables only, no data corrections"
+        )
         for (sid, port), (r, dln_win, ln_ref, verdict) in out.items():
             g = f.create_group(f"set{sid}/port{port}")
             g.attrs.update(
