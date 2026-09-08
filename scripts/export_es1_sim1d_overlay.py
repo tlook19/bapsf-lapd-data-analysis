@@ -1831,8 +1831,8 @@ def export_overlay(
         isat_ftavg_upstream_source_channel=upstream_scans["source_channel"],
         isat_ftavg_upstream_face=np.array(
             "UPSTREAM probe face at rot-0 ('i_sweep' channel; per-port channel "
-            "is in isat_ftavg_upstream_source_channel).  Was the Isat truth "
-            "channel 2026-08-18 because the opposite face collects in the "
+            "is in isat_ftavg_upstream_source_channel).  Is the Isat truth "
+            "channel because the opposite face collects in the "
             "probe body's flow shadow and under-reads.  This is the same face "
             "as the density chain behind density_ftavg_cm3 and as "
             "isat_decay_*/isat_drive_*, so this family is the "
