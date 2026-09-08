@@ -97,8 +97,8 @@ Which probe face the Isat flux-tube average comes from
 The Mach probe has two planar faces on opposite sides of the body.  At rot-0
 the ``i_sweep`` channel collects on the UPSTREAM face and the ``isat`` channel
 on the DOWNSTREAM one; at rot-180 the assignment reverses.  A downstream face
-sits in the probe body's own flow shadow, so it under-reads, and on 2026-08-18
-the upstream face was RULED the Isat truth channel.
+sits in the probe body's own flow shadow, so it under-reads, and the upstream
+face is the Isat truth channel.
 
 ``isat_ftavg_upstream_a`` is therefore the correction-bearing field: it comes
 from the ``i_sweep`` product, which is also the chain behind ``n_e_m3`` and
@@ -106,7 +106,7 @@ behind ``isat_decay_*`` / ``isat_drive_*``, so it pairs with the density and
 core-band fields without a face change anywhere.
 
 ``isat_ftavg_a`` is the downstream ``isat`` face, kept because it is the
-effective-width ledger's rot-0 primary and the face the 2026-08-18 paper read
+effective-width ledger's rot-0 primary and the face the paper read
 used.  It carries the shadowing caveat in ``isat_ftavg_face`` and the two
 faces must not be ratioed against each other -- their flux-tube corrections
 run in opposite directions with z.
@@ -529,7 +529,7 @@ def _rot0_isat_profiles(
     same layout and differ only in which electrical channel filled them:
 
     * ``ISAT_PROFILE_HDF5`` -- the ``i_sweep`` channel, the UPSTREAM face at
-      rot-0 and the ruled Isat truth channel;
+      rot-0 and the Isat truth channel;
     * ``ROT0_ISAT_PROFILE_HDF5`` -- the ``isat`` channel, the DOWNSTREAM face.
 
     The per-run source channel is exported with the fields rather than assumed,
@@ -1858,7 +1858,7 @@ def export_overlay(
             "correction-bearing family and is the face the density chain and "
             "the isat_decay_*/isat_drive_* families already use; isat_ftavg_* "
             "is the downstream face, retained as the effective-width ledger's "
-            "rot-0 primary and as the face the 2026-08-18 paper read used.  "
+            "rot-0 primary and as the face the paper read used.  "
             "The two faces' flux-tube corrections run in OPPOSITE directions "
             "with z and must never be ratioed against each other.  "
             "Three estimators with three roles: "
@@ -1908,8 +1908,8 @@ def export_overlay(
         isat_ftavg_upstream_source_channel=upstream_scans["source_channel"],
         isat_ftavg_upstream_face=np.array(
             "UPSTREAM probe face at rot-0 ('i_sweep' channel; per-port channel "
-            "is in isat_ftavg_upstream_source_channel).  RULED the Isat truth "
-            "channel 2026-08-18 because the opposite face collects in the "
+            "is in isat_ftavg_upstream_source_channel).  Is the Isat truth "
+            "channel because the opposite face collects in the "
             "probe body's flow shadow and under-reads.  This is the same face "
             "as the density chain behind density_ftavg_cm3 and as "
             "isat_decay_*/isat_drive_*, so this family is the "
@@ -1930,10 +1930,10 @@ def export_overlay(
             "DOWNSTREAM probe face at rot-0 ('isat' channel; per-port channel "
             "is in isat_ftavg_source_channel).  CAVEAT: this face collects in "
             "the probe body's flow shadow and under-reads, which is why the "
-            "2026-08-18 ruling put the truth channel on the upstream face -- "
+            "truth channel is the upstream face -- "
             "use isat_ftavg_upstream_* for a correction.  Retained because it "
             "is the effective-width ledger's rot-0 primary and the face the "
-            "2026-08-18 paper read measured.  It is NOT the face behind "
+            "paper read measured.  It is NOT the face behind "
             "isat_decay_*, isat_drive_* or the density chain, and its "
             "flux-tube correction runs the opposite way with z."
         ),

@@ -18,7 +18,7 @@ drive family is SCHEMA v4), v5 (adds
 the per-port ``te_window_spread_frac``), v7 (adds
 the discharge shot-to-shot standard deviations), v9 (adds the
 flux-tube-averaged density and downstream-face Isat targets), v11
-(adds the ruled upstream-face Isat target), v13 (adds the
+(adds the upstream-face Isat target), v13 (adds the
 flow-symmetrized geomean target), v15 (adds the per-port
 ``te_core_mean_clamped`` record), v17 (adds the per-port trust model and
 the semi-quantitative T_e records, and splits ``te_sem_ev`` into a radial
