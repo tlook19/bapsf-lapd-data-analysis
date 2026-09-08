@@ -18,18 +18,20 @@ The Mach number uses K in the denominator (Chung convention)::
 
 where currents are area-normalised (I / A_p).
 
-Shadow offset
--------------
-``MACH_SHADOW_OFFSET`` is the apparent Mach number at M_true = 0 caused by
-the probe body geometrically shadowing the downstream face along B.  It is
-**not** applied to the recorded M_measured; store it for post-hoc correction::
+Mach error model
+----------------
+Three declared systematics accompany a recorded Mach number.  None of them is
+applied to the stored values — each is a disclosed bracket or magnitude:
 
-    M_true = M_measured − sign(M_measured) × MACH_SHADOW_OFFSET
+* ``MACH_K_BRACKET`` — K is bracketed, not pinned; ``MACH_K`` is a convention
+  inside it.
+* ``MACH_FACE_ASYMMETRY_M_RMS`` and ``MACH_FACE_ASYMMETRY_M_RANGE`` — the
+  measured rot-0 / rot-180 disagreement between the two probe faces.
+* ``MACH_SHADOW_BRACKET_M`` — a one-sided, per-point bracket on the
+  probe-body wake, subtractive and unknown within the bracket.
 
-Geometry: 2 × (1 × 4 mm²) planes per face, body cross-section ~12 mm²,
-area ratio A_body / A_face ≈ 3/2.  At B = 1.4 kG with He-4 and
-T_i ~ 1–2 eV, ρ_i ~ 1.5–2 mm ≈ body half-width (2 mm), so the strongly-
-magnetised limit used here somewhat overestimates the correction.
+The earlier strongly-magnetised area-ratio offset was retired as
+regime-inconsistent at this probe's magnetisation and is not applied.
 """
 
 from __future__ import annotations
@@ -52,17 +54,101 @@ _AMU_TO_KG = 1.66053906660e-27  # 1 amu in kg
 _HALF_BOHM = math.exp(-0.5)   # exp(-1/2), Bohm-limit prefactor in Isat formula
 
 # ---------------------------------------------------------------------------
-# Mach probe calibration constants
+# Mach probe calibration constants and error model
 # ---------------------------------------------------------------------------
 
-#: Mach probe calibration constant (Chung et al.).
-#: Formula: ``M = ln(I_upstream / I_downstream) / MACH_K``
+#: Mach probe calibration constant (Chung convention), dimensionless.
+#: Formula: ``M = ln(I_upstream / I_downstream) / MACH_K``.  This value is a
+#: CONVENTION chosen inside ``MACH_K_BRACKET``, not a cited constant; it is the
+#: value every Mach number in the processed products was computed with.  Read
+#: directly by the two pipeline estimators, which record it as the ``mach_K``
+#: attribute of the products they write.
 MACH_K: float = 1.66
 
-#: Shadow-correction offset (strongly-magnetised area-ratio limit).
-#: ``ln(A_body / A_face) / MACH_K = ln(3/2) / 1.66 ≈ 0.244``
-#: **Not applied** to recorded M_measured; see module docstring.
-MACH_SHADOW_OFFSET: float = math.log(1.5) / MACH_K   # ≈ 0.244
+#: Bracket on the Mach calibration constant K for this probe's magnetisation
+#: class, dimensionless ``(low, high)``.  K is not pinned to a single value at
+#: intermediate magnetisation (probe radius comparable to the ion gyroradius),
+#: so the spread across this bracket IS the calibration systematic on every
+#: recorded Mach number.  A reading scales as ``1 / K``, so the low end gives
+#: the largest |M| and the high end the smallest.  ``MACH_K`` lies inside it.
+#: Consumed by any error budget that quotes a Mach number; the estimators never
+#: read it and no correction is applied.
+MACH_K_BRACKET: tuple[float, float] = (1.34, 1.74)
+
+#: RMS face-asymmetry systematic of a Mach reading, dimensionless M, unsigned.
+#: The probe's two faces do not collect identically, so rotating the probe by
+#: 180° at the same port exchanges them: the rot-0 / rot-180 pair MEAN is the
+#: area-free estimator and half their difference is the systematic.  Measured
+#: by the rotation-pair read of the processed Mach product (plateau window
+#: 14–19 ms, x = 0, K = ``MACH_K``) over the nine valid ES1–ES3 port pairs.
+#: ES4 pairs are EXCLUDED from the statistic: run 43 railed, and the ES4 p41
+#: pair is an anomaly in ln R.  Being a magnitude it is carried as ±RMS about a
+#: reading.  Consumed by any error budget that quotes a Mach number; no
+#: correction is applied.
+MACH_FACE_ASYMMETRY_M_RMS: float = 0.082
+
+#: Full spread of the same nine face-asymmetry half-differences, dimensionless
+#: M as ``(smallest |half-difference|, largest |half-difference|)``; both
+#: entries are non-negative and ordered.  Same read, window and ES4 exclusion
+#: as ``MACH_FACE_ASYMMETRY_M_RMS``.  Consumed by an error budget wanting the
+#: observed worst case rather than the RMS; no correction is applied.
+MACH_FACE_ASYMMETRY_M_RANGE: tuple[float, float] = (0.005, 0.146)
+
+
+@dataclass(frozen=True)
+class MachShadowBracket:
+    """One-sided bracket on the probe-body wake bias of a Mach reading.
+
+    The probe body depletes the flow reaching the face behind it, so a measured
+    Mach number OVER-reads and the correction is SUBTRACTIVE::
+
+        M_true = M_measured − delta,   delta ∈ [bohm, broadened]
+
+    ``delta`` is unknown within the bracket.  All three members are
+    dimensionless M and non-negative, ordered ``bohm ≤ classical ≤
+    broadened``, and the cross-field transport that refills the wake is what
+    selects among them: ``classical`` (classical cross-field diffusion) is the
+    BASE case, ``bohm`` the optimistic corner (fastest refill, smallest bias)
+    and ``broadened`` the pessimistic corner (an FLR-broadened wake).  No
+    correction is applied anywhere in this package — the bracket is disclosed,
+    never subtracted.
+    """
+
+    bohm: float
+    classical: float
+    broadened: float
+
+
+#: Probe-wake bracket per measurement point, keyed by ``(experiment set id,
+#: port)`` and valued by ``MachShadowBracket`` (dimensionless M, subtractive).
+#: Populated ONLY where the wake bias has been estimated — ES1 at ports 21, 29
+#: and 50.  No values exist for ports 11 and 41, nor anywhere in ES2–ES4, and
+#: an unpopulated point is a REFUSAL rather than a default: read it through
+#: ``mach_shadow_bracket_m``.  No correction is applied anywhere.
+MACH_SHADOW_BRACKET_M: dict[tuple[int, int], MachShadowBracket] = {
+    (1, 21): MachShadowBracket(bohm=0.01, classical=0.08, broadened=0.23),
+    (1, 29): MachShadowBracket(bohm=0.01, classical=0.08, broadened=0.23),
+    (1, 50): MachShadowBracket(bohm=0.05, classical=0.23, broadened=0.67),
+}
+
+
+def mach_shadow_bracket_m(experiment_set: int, port: int) -> MachShadowBracket:
+    """Return the probe-wake bracket for one (experiment set, port) point.
+
+    Raises ``KeyError`` naming the requested point when no wake bias has been
+    estimated there.  There is deliberately no default: a missing bracket is a
+    gap in the error model, not a zero bias.
+    """
+    try:
+        return MACH_SHADOW_BRACKET_M[(experiment_set, port)]
+    except KeyError:
+        populated = ", ".join(
+            f"ES{es} p{port_id}" for es, port_id in sorted(MACH_SHADOW_BRACKET_M)
+        )
+        raise KeyError(
+            f"no Mach probe-wake bracket for experiment set {experiment_set} "
+            f"port {port}; the bracket is populated only for {populated}"
+        ) from None
 
 
 @dataclass(frozen=True)
