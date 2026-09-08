@@ -116,12 +116,11 @@ PROTOCOL = (
     "adjusted afterwards."
 )
 ADJUDICATION = (
-    "Adjudicated 2026-08-20 (CAMPAIGN_LOG 2026-08-20z), ratified 2026-08-20aa: "
-    "trust-to-aperture ADOPTED at eight set-ports (ES1 and ES2, p11/p21/p29/"
-    "p41); REFUSED at both p50s and at ES3 entirely.  Any in-band cell with "
-    f"dln_te_window >= {CRITERION_DLN:g} is marked semi-quantitative and keeps "
-    "its measured value; a port whose x = 0 control fails the criterion has its "
-    "whole core marked the same way."
+    "Trust-to-aperture is ADOPTED at eight set-ports (ES1 and ES2, p11/p21/"
+    "p29/p41) and REFUSED at both p50s and at ES3 entirely.  Any in-band cell "
+    f"with dln_te_window >= {CRITERION_DLN:g} is marked semi-quantitative and "
+    "keeps its measured value; a port whose x = 0 control fails the criterion "
+    "has its whole core marked the same way."
 )
 LINEAGE = (
     "Grown from scripts/refit_sweep_windows.py (the x = 0 product, 2026-07-22), "
@@ -130,8 +129,8 @@ LINEAGE = (
     "archived here so the filled T_e product can condition on it."
 )
 
-#: The eight set-ports the 2026-08-20z ruling adopted, recorded per port group
-#: so the product carries the verdict it was used to reach.
+#: The eight set-ports at which trust-to-aperture is adopted, recorded per port
+#: group so the product carries the verdict it was used to reach.
 ADOPTED_SET_PORTS = frozenset(
     {(1, 11), (1, 21), (1, 29), (1, 41), (2, 11), (2, 21), (2, 29), (2, 41)}
 )
