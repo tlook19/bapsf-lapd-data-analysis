@@ -12,6 +12,7 @@ from scripts.export_es1_sim1d_overlay import (
     RAW_PLATEAU_WINDOW_MS,
     X_MAX_CM,
     X_MIN_CM,
+    _check_density_convention_pair,
     _despike_profile,
     _discharge_stats,
     _flux_tube_profile_stats,
@@ -195,6 +196,61 @@ def test_legacy_core_band_mean_stays_an_unweighted_line_cut_mean():
     band = (X_CM >= X_MIN_CM) & (X_CM <= X_MAX_CM)
     assert mean[0, 0] == pytest.approx(float(np.mean(values[0, band, 0])))
     assert count[0, 0] == int(band.sum())
+
+
+def _convention_pair(mean, ftavg):
+    """One port row of the two density conventions, on a 3-sample time base."""
+    return (
+        np.array([mean], dtype=np.float64),
+        np.array([ftavg], dtype=np.float64),
+        np.array([29], dtype=np.int16),
+        np.array([0.5, 1.5, 2.5], dtype=np.float64),
+    )
+
+
+def test_a_zero_core_band_mean_under_a_finite_flux_tube_average_is_refused():
+    # The density grid holds strictly positive cells or NaN, so a zero
+    # core-band mean means the grid has begun carrying zero-filled cells --
+    # and the flux-tube row's error is transferred from that mean.
+    args = _convention_pair([4.0, 0.0, 6.0], [3.0, 5.0, 5.5])
+
+    with pytest.raises(ValueError, match="finite flux-tube average") as excinfo:
+        _check_density_convention_pair(*args)
+
+    message = str(excinfo.value)
+    assert "port 29" in message
+    assert "t = 1.5 ms" in message
+    assert "density_total_sem_cm3 / density_mean_cm3" in message
+
+
+def test_a_non_finite_core_band_mean_under_a_finite_flux_tube_average_is_refused():
+    args = _convention_pair([4.0, np.nan, 6.0], [3.0, 5.0, 5.5])
+
+    with pytest.raises(ValueError, match="zero or non-finite") as excinfo:
+        _check_density_convention_pair(*args)
+
+    assert "t = 1.5 ms" in str(excinfo.value)
+
+
+def test_an_unusable_core_band_mean_passes_when_the_flux_tube_side_is_nan():
+    # The other direction: the guard judges the PAIR, so a sample the
+    # flux-tube reduction already refused is not a defect, and neither is a
+    # fully usable one.  Nothing here raises.
+    _check_density_convention_pair(*_convention_pair([4.0, 5.0, 6.0], [3.0, 4.0, 5.0]))
+    _check_density_convention_pair(*_convention_pair([4.0, 0.0, 6.0], [3.0, np.nan, 5.0]))
+    _check_density_convention_pair(
+        *_convention_pair([4.0, np.nan, 6.0], [3.0, np.nan, 5.0])
+    )
+
+
+def test_the_two_conventions_must_share_one_port_sample_grid():
+    with pytest.raises(ValueError, match="same \\(port, sample\\) grid"):
+        _check_density_convention_pair(
+            np.zeros((5, 40)),
+            np.zeros((5, 20)),
+            PORTS,
+            np.arange(40, dtype=np.float64),
+        )
 
 
 def _write_line_scans(path, runs, *, rotation_deg=0.0, n_t=4):
