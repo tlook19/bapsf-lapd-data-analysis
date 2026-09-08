@@ -49,6 +49,14 @@ secondary and is NOT run here). The inverted density moves as
 dln n = -1/2 dln Te by construction at fixed ion line, so only Te is
 tabulated. No data corrections anywhere: outputs are sensitivity tables.
 
+This product is PLATFORM-SPECIFIC at the 1e-9 level: the fits contract
+floating-point expressions the way the host ISA does, so a rebuild on another
+architecture reproduces these tables only to about that, and a difference at
+that scale is expected rather than a defect. Consumers compare the window
+products at WINDOW_METRIC_RTOL in scripts/fit_te_spatial.py, which is looser
+than the drift by several orders and tighter than any change of definition
+could hide under.
+
 Usage:
     MPLCONFIGDIR=.matplotlib ./.venv/bin/python scripts/refit_sweep_windows.py
         [--plateau-ms 10 19.5] [--output processed/sweep_window_refits.hdf5]
