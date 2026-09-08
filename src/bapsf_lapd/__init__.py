@@ -38,8 +38,12 @@ from bapsf_lapd.quality import (
     evaluate_langmuir_quality,
 )
 from bapsf_lapd.density import (
+    MACH_FACE_ASYMMETRY_M_RANGE,
+    MACH_FACE_ASYMMETRY_M_RMS,
     MACH_K,
-    MACH_SHADOW_OFFSET,
+    MACH_K_BRACKET,
+    MACH_SHADOW_BRACKET_M,
+    MachShadowBracket,
     ProbeAAreaCalibration,
     apply_probe_a_area_factor,
     calibrate_probe_area_m2,
@@ -48,6 +52,7 @@ from bapsf_lapd.density import (
     inter_sweep_sample_slices,
     ion_sound_speed_m_s,
     load_probe_a_area_calibration,
+    mach_shadow_bracket_m,
 )
 from bapsf_lapd.reader import (
     DischargeOffsetStats,
@@ -85,8 +90,12 @@ __all__ = [
     "butterworth_lowpass",
     "analyze_langmuir_sweep",
     "select_best_te_ev",
+    "MACH_FACE_ASYMMETRY_M_RANGE",
+    "MACH_FACE_ASYMMETRY_M_RMS",
     "MACH_K",
-    "MACH_SHADOW_OFFSET",
+    "MACH_K_BRACKET",
+    "MACH_SHADOW_BRACKET_M",
+    "MachShadowBracket",
     "ProbeAAreaCalibration",
     "apply_probe_a_area_factor",
     "calibrate_probe_area_m2",
@@ -105,4 +114,5 @@ __all__ = [
     "ion_sound_speed_m_s",
     "load_probe_a_area_calibration",
     "load_run_manifest",
+    "mach_shadow_bracket_m",
 ]

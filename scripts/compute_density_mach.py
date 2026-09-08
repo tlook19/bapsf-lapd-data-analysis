@@ -38,8 +38,11 @@ probe B.  Mach numbers are not computed for probe A.
 Constants (edit at top of file)
 --------------------------------
 M_I_AMU = 4.003    He-4 ion mass
-MACH_K  = 1.66     Chung et al.; M = ln(I_u/I_d) / MACH_K
-# Shadow offset ≈ 0.244 stored in density.MACH_SHADOW_OFFSET; not applied here.
+MACH_K  = 1.66     Chung convention; M = ln(I_u/I_d) / MACH_K
+
+The Mach error model (K bracket, face asymmetry, probe-wake bracket) is
+declared in bapsf_lapd.density.  None of it is applied here: this script
+records M_measured.
 
 HDF5 output layout
 ------------------
@@ -114,11 +117,13 @@ HDF5_OUTPUT = Path("processed/density_mach.hdf5")
 # He-4 ion mass (amu).  Must match calibrate_probe_areas.py.
 M_I_AMU = 4.003
 
-# Mach probe calibration constant (Chung et al.).
+# Mach probe calibration constant (Chung convention).
 # Formula: M = ln(I_upstream / I_downstream) / MACH_K
-# Shadow offset ln(3/2)/1.66 ≈ 0.244 is stored in density.MACH_SHADOW_OFFSET but
-# NOT applied here — record M_measured and apply post-hoc for high-flow cases.
-# TODO: empirical shadow correction for 1.4 kG B-field (intermediate ρ_i regime).
+# The value is a convention inside density.MACH_K_BRACKET, and the recorded
+# Mach numbers carry it as the mach_K attribute.  The three systematics that
+# accompany a reading — the K bracket, density.MACH_FACE_ASYMMETRY_M_RMS and
+# the per-point density.MACH_SHADOW_BRACKET_M — are disclosed there and are
+# NOT applied here; this script records M_measured.
 MACH_K = 1.66
 
 # Edge clip at both ends of each dead-time window to avoid ramp transients.
