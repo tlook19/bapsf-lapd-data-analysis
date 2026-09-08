@@ -1,9 +1,11 @@
 """Varied-window re-fits of the raw Langmuir I-V sweeps.
 
 Executes the pre-registered fit-window sensitivity test: for each
-(experiment set 1-3, port, plateau cycle, shot) at x = 0, re-fit the SAME
+(experiment set, port, plateau cycle, shot) at x = 0, re-fit the SAME
 raw I-V sweep over a 5 x 5 family of electron-retarding fit windows and
-report the Te(window) sensitivity surface. The decision rule compares the
+report the Te(window) sensitivity surface. The sets covered are the
+EXPERIMENT_SETS constant below, and the list is recorded in the product's
+experiment_sets attr. The decision rule compares the
 window-family spread against the beta-hat-implied Te shifts from the transport-side
 beta-collapse tables: window spread >= implied shift -> the sweep analysis
 CAN carry the residual; window-stable Te with spread << implied shift ->
@@ -20,6 +22,26 @@ amplitude fraction of the electron-saturation level):
     upper bound  f_high in {0.05, 0.10, 0.15, 0.30, 0.50}  (fraction of
                  max electron current; the pipeline's amplitude fallback
                  uses 0.15)
+
+Experiment set 4 is covered on the same window family and the same
+protocol. Its rot-0 runs are 41 (port 11), 42 (port 21), 44 (port 29),
+46 (port 41) and 48 (port 50); the rot-180 runs 43, 45 and 47 are excluded
+by the rot-0 filter, as in every other set. Runs 42-48 belong to the
++/-20 V / 3 ohm circuit configuration whose CURRENT scale is being
+reconciled separately. That reconciliation cannot move this table: the
+tabulated quantity is the log-slope of the electron-retarding branch,
+Te = 1 / (d ln(I_e) / dV), so multiplying the measured current by a
+uniform scale shifts ln(I_e) by an additive constant and leaves the slope
+-- and hence every Te(window) entry and the ln(max/min) spread built from
+it -- unchanged. Run 41 (port 11), the set-4 row the Te record consumes,
+is outside that circuit question in any case.
+
+Set 4 has no rung in the transport-side beta-collapse tables, so it has no
+ln(beta-hat) reference scale: its ln_beta_ref is NaN and its verdict reads
+"no beta-hat reference". The decision rule is undefined without a
+reference; the window spread itself is still measured and recorded, and it
+is that spread -- not the verdict -- that the downstream x = 0 core control
+consumes.
 
 The ion-branch fit is held FIXED across window variants (the family
 targets the retarding fit; ion-branch variation is the pre-registered
@@ -65,6 +87,11 @@ SWEEPS_H5 = ROOT / "processed" / "langmuir_sweeps.hdf5"
 P_LOW = (3.0, 8.0, 15.0, 25.0, 35.0)
 F_HIGH = (0.05, 0.10, 0.15, 0.30, 0.50)
 
+#: The experiment sets re-fitted, in the order they are walked.  Recorded in
+#: the product's experiment_sets attr so a consumer reads the coverage off the
+#: file rather than inferring it from which groups happen to be present.
+EXPERIMENT_SETS = (1, 2, 3, 4)
+
 # beta-hat reference scales from the transport-side beta-collapse tables:
 # per-rung centered mean ln(beta-hat) for the 2z reference family, and the es3
 # far-port within-shot offsets. Hypothesis-test references, not data.
@@ -72,8 +99,12 @@ LN_BETA_RUNG = {1: 0.255, 2: 0.106, 3: -0.482}
 LN_BETA_ES3_FAR = {41: 0.72, 50: 1.31}
 
 
-def rot0_runs(sets=(1, 2, 3)):
-    """Yield (set_id, run_id, port) for rot-0 runs from the processed file."""
+def rot0_runs(sets=EXPERIMENT_SETS):
+    """Yield (set_id, run_id, port) for rot-0 runs from the processed file.
+
+    Walks every rot-0 run the processed source holds for each id in *sets*, in
+    set then run order.  A set the source does not carry contributes nothing.
+    """
     with h5py.File(SWEEPS_H5, "r") as f:
         for sid in sorted(f["experiment_sets"], key=int):
             if int(sid) not in sets:
@@ -211,11 +242,15 @@ def main():
         g = r["te_grid"]
         te_min, te_max = np.nanmin(g), np.nanmax(g)
         dln_win = float(np.log(te_max / te_min)) if te_min > 0 else np.nan
-        ln_ref = abs(LN_BETA_RUNG[sid])
+        ln_ref = (
+            abs(LN_BETA_RUNG[sid]) if sid in LN_BETA_RUNG else float("nan")
+        )
         if sid == 3 and port in LN_BETA_ES3_FAR:
             ln_ref = LN_BETA_ES3_FAR[port]
         if not np.isfinite(dln_win):
             verdict = "insufficient windows"
+        elif not np.isfinite(ln_ref):
+            verdict = "no beta-hat reference"
         elif dln_win >= ln_ref:
             verdict = "sweep CAN carry residual"
         elif dln_win < 0.5 * ln_ref:
@@ -230,6 +265,7 @@ def main():
         f.attrs["p_low"] = P_LOW
         f.attrs["f_high"] = F_HIGH
         f.attrs["plateau_ms"] = args.plateau_ms
+        f.attrs["experiment_sets"] = np.asarray(EXPERIMENT_SETS, dtype=np.int64)
         f.attrs["protocol"] = (
             "fit-window sensitivity: each raw I-V sweep at x = 0 re-fit over "
             "the 5 x 5 family of electron-retarding windows recorded in the "
