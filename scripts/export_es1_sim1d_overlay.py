@@ -451,6 +451,73 @@ def _flux_tube_series(
     return out
 
 
+def _check_density_convention_pair(
+    density_mean_cm3: np.ndarray,
+    density_ftavg_cm3: np.ndarray,
+    ports: np.ndarray,
+    time_ms: np.ndarray,
+) -> None:
+    """Refuse a sample whose core-band density is unusable but flux-tube one is not.
+
+    The two exported density conventions come from two chains over the SAME
+    ``n_e_m3`` grid: ``density_mean_cm3`` is the unweighted core-band mean of
+    that grid, and ``density_ftavg_cm3`` is the despiked, background-subtracted,
+    centroid-folded flux-tube quadrature over the whole scan.  Every cell of the
+    grid is either strictly positive or NaN -- the density product maps a
+    non-positive or non-finite cell to NaN before it is written -- so the
+    core-band mean is itself either strictly positive or NaN, and a zero can
+    only come from a grid that has begun carrying zero-filled cells instead.
+
+    A core-band mean that is zero or non-finite while the flux-tube average of
+    the same profile is finite therefore means the two chains disagree about
+    whether that port and sample carries plasma at all: either the input grid is
+    zero-filled, or the core band is empty while the off-core cells still carry
+    signal.  Both are defects of the input product, not the sample-level
+    "unusable" condition the flux-tube fields already express as NaN (that one
+    fails on the flux-tube side, which here succeeded).
+
+    Emitting the pair anyway would ship a flux-tube value whose only exported
+    uncertainty cannot be formed: the overlay carries no SEM under the flux-tube
+    convention, so a consumer transfers the core-band FRACTIONAL error
+    ``density_total_sem_cm3 / density_mean_cm3`` onto it, which is NaN or a
+    division by zero exactly on these samples.  Raises ``ValueError`` naming the
+    offending port and time instead.
+    """
+    mean = np.asarray(density_mean_cm3, dtype=np.float64)
+    ftavg = np.asarray(density_ftavg_cm3, dtype=np.float64)
+    if mean.shape != ftavg.shape:
+        raise ValueError(
+            f"density_mean_cm3 shape {mean.shape} and density_ftavg_cm3 shape "
+            f"{ftavg.shape} differ; the two conventions must be reduced over "
+            "the same (port, sample) grid"
+        )
+    unusable = (~np.isfinite(mean)) | (mean == 0.0)
+    offending = unusable & np.isfinite(ftavg)
+    if not np.any(offending):
+        return
+    port_index, time_index = np.nonzero(offending)
+    shown = [
+        f"port {int(ports[zi])} at t = {float(time_ms[ti]):g} ms "
+        f"(density_mean_cm3 = {mean[zi, ti]:g}, "
+        f"density_ftavg_cm3 = {ftavg[zi, ti]:g})"
+        for zi, ti in zip(port_index[:5], time_index[:5])
+    ]
+    if port_index.size > len(shown):
+        shown.append(f"and {port_index.size - len(shown)} more")
+    raise ValueError(
+        f"{port_index.size} density sample(s) carry a finite flux-tube average "
+        "over a core-band mean that is zero or non-finite: "
+        + "; ".join(shown)
+        + ".  The core-band mean of the density grid is strictly positive "
+        "wherever it is defined and NaN otherwise, so this combination means "
+        "the input density product and the flux-tube reduction disagree about "
+        "whether the sample carries plasma.  The flux-tube row's uncertainty is "
+        "carried as the core-band fractional error "
+        "density_total_sem_cm3 / density_mean_cm3, which cannot be formed here; "
+        "rebuild the density product rather than exporting the pair."
+    )
+
+
 def _rot0_isat_profiles(
     path: Path,
     experiment_set_id: int,
@@ -1457,6 +1524,16 @@ def export_overlay(
                 "family is changed or superseded by these fields."
             ),
         }
+    density_mean_cm3 = density.mean * DENSITY_SCALE_CM3
+    density_ftavg_cm3 = density_ftavg["ftavg"] * M3_TO_CM3
+    # The two conventions are reduced independently; refuse the pair that
+    # a consumer cannot put an uncertainty on.  See the helper.
+    _check_density_convention_pair(
+        density_mean_cm3,
+        density_ftavg_cm3,
+        PORTS,
+        density.time_ms,
+    )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
@@ -1466,7 +1543,7 @@ def export_overlay(
         port=PORTS,
         z_cm=density.z_cm,
         density_time_ms=density.time_ms,
-        density_mean_cm3=density.mean * DENSITY_SCALE_CM3,
+        density_mean_cm3=density_mean_cm3,
         density_total_sem_cm3=_plot_uncertainty(density, "sem") * DENSITY_SCALE_CM3,
         density_radial_sem_cm3=density.sem * DENSITY_SCALE_CM3,
         density_core_count=density.count,
@@ -1791,7 +1868,7 @@ def export_overlay(
             "isat_ftavg_geomean_* is the flow-CANCELLED central estimator "
             "built from both, and is the one whose C(z) came out z-flat."
         ),
-        density_ftavg_cm3=density_ftavg["ftavg"] * M3_TO_CM3,
+        density_ftavg_cm3=density_ftavg_cm3,
         density_ftavg_core_cm3=density_ftavg["core"] * M3_TO_CM3,
         density_ftavg_centroid_cm=density_ftavg["centroid"],
         density_ftavg_n_despiked=density_ftavg["n_despiked"],
