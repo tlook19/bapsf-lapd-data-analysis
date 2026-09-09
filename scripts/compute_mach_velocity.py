@@ -21,13 +21,20 @@ The script uses ``isat_a_raw`` so the Mach ratio is controlled only by the
 probe-area calibration TOML, not by any plotting/density scale factor baked into
 ``isat_a``.
 
-Railed cells are excluded.  A source product may carry a per-(position,
-dead-time window) ``rail_mask`` marking the cells whose raw samples hit a
-digitizer rail; such a cell carries no measurement, only the converter limit.
-A cell masked on EITHER face is dropped from the pair's Mach and velocity
-statistics on BOTH faces, so the surviving cells are still true pairs.  Products
-built before the marking existed carry no mask, are treated as unmasked, and say
-so in the output attrs -- the absence of a mask is recorded, never assumed clean.
+Railed and state-masked cells are excluded.  A source product may carry two
+per-(position, dead-time window) masks: ``rail_mask``, marking the cells whose
+raw samples hit a digitizer rail, and ``state_mask``, marking the cells of a
+stretch over which the channel sat at a different level from the rest of its own
+run.  A railed cell carries no measurement, only the converter limit; a
+state-masked cell carries a level that is not comparable with the run's other
+cells.  The two masks STACK -- both are honoured, neither replaces the other --
+and a cell masked for either reason on EITHER face is dropped from the pair's
+Mach and velocity statistics on BOTH faces, so the surviving cells are still
+true pairs.  No masked value is corrected: the state mask's source records the
+measured level factor, and it is disclosed there, never divided out here.
+Products built before a marking existed carry that mask not at all, are treated
+as unmasked for it, and say so in the output attrs -- the absence of a mask is
+recorded, never assumed clean.
 
 Usage
 -----
@@ -60,9 +67,16 @@ HDF5_OUTPUT = Path("processed/mach_velocity.hdf5")
 
 RAIL_MASK_DATASET = "rail_mask"
 RAIL_RULE_ATTR = "rail_mask_rule"
+STATE_MASK_DATASET = "state_mask"
+STATE_RULE_ATTR = "state_mask_rule"
+STATE_FACTOR_ATTR = "state_factor"
 NO_MASK_NOTE = (
     "source product carries no {dataset!r} dataset; it predates the rail-mask "
     "marking and is treated as unmasked"
+)
+NO_STATE_MASK_NOTE = (
+    "source product carries no {dataset!r} dataset; no channel state is "
+    "registered for this run and it is treated as unmasked"
 )
 
 M_I_AMU = 4.003
@@ -121,33 +135,77 @@ def _interp_filled_te_to_deadtime(
     ])
 
 
-def _face_rail_mask(grp: h5py.Group, shape: tuple[int, ...]) -> np.ndarray | None:
-    """Per-cell rail mask for one probe face, or None if the product has none.
+def _face_mask(
+    grp: h5py.Group, shape: tuple[int, ...], dataset: str
+) -> np.ndarray | None:
+    """One face's per-cell exclusion mask, or None if the product has none.
 
-    True marks a (position, dead-time window) cell whose raw samples reached a
-    digitizer rail.  Returns None -- not an all-False mask -- when the dataset is
-    absent, so the caller can record that the product predates the marking
-    rather than reporting it as measured-clean.
+    True marks a (position, dead-time window) cell the source product excluded.
+    Returns None -- not an all-False mask -- when the dataset is absent, so the
+    caller can record that the product does not carry that marking rather than
+    reporting it as measured-clean.
     """
-    if RAIL_MASK_DATASET not in grp:
+    if dataset not in grp:
         return None
-    mask = np.asarray(grp[RAIL_MASK_DATASET][()], dtype=bool)
+    mask = np.asarray(grp[dataset][()], dtype=bool)
     if mask.shape != shape:
         raise ValueError(
-            f"{RAIL_MASK_DATASET!r} in {grp.name} has shape {mask.shape}, but the "
+            f"{dataset!r} in {grp.name} has shape {mask.shape}, but the "
             f"face's current array has shape {shape}; the mask must be per "
             "(position, dead-time window) cell of the same product"
         )
     return mask
 
 
-def _rail_rule(*grps: h5py.Group) -> str:
+def _face_rail_mask(grp: h5py.Group, shape: tuple[int, ...]) -> np.ndarray | None:
+    """The face's rail mask: cells whose raw samples reached a digitizer rail."""
+    return _face_mask(grp, shape, RAIL_MASK_DATASET)
+
+
+def _face_state_mask(grp: h5py.Group, shape: tuple[int, ...]) -> np.ndarray | None:
+    """The face's channel-state mask: cells recorded in a different level state."""
+    return _face_mask(grp, shape, STATE_MASK_DATASET)
+
+
+def _mask_rule(grps: tuple[h5py.Group, ...], attr: str, absent: str) -> str:
     """The exclusion rule as stated by whichever source product carries a mask."""
     for grp in grps:
         for holder in (grp, grp.file):
-            if RAIL_RULE_ATTR in holder.attrs:
-                return str(holder.attrs[RAIL_RULE_ATTR])
-    return NO_MASK_NOTE.format(dataset=RAIL_MASK_DATASET)
+            if attr in holder.attrs:
+                return str(holder.attrs[attr])
+    return absent
+
+
+def _rail_rule(*grps: h5py.Group) -> str:
+    """The rail exclusion rule as stated by the source products."""
+    return _mask_rule(
+        grps, RAIL_RULE_ATTR, NO_MASK_NOTE.format(dataset=RAIL_MASK_DATASET)
+    )
+
+
+def _state_rule(*grps: h5py.Group) -> str:
+    """The channel-state exclusion rule, or the absence note when no face has one.
+
+    Unlike the rail mask -- whose annotator writes a mask for every run, so a
+    file-level rule is true of every run in the file -- a state mask is written
+    only for the runs with a registered state.  The file-level rule is therefore
+    read only when a face of THIS pair actually carries the mask; otherwise the
+    pair would report a positive rule it is not subject to.
+    """
+    absent = NO_STATE_MASK_NOTE.format(dataset=STATE_MASK_DATASET)
+    if not any(STATE_MASK_DATASET in grp for grp in grps):
+        return absent
+    return _mask_rule(grps, STATE_RULE_ATTR, absent)
+
+
+def _state_factors(*grps: h5py.Group) -> str:
+    """The disclosed state factors of whichever faces carry one, never applied."""
+    seen = [
+        f"{str(grp.attrs['run_id'])}:{float(grp.attrs[STATE_FACTOR_ATTR]):g}"
+        for grp in grps
+        if STATE_FACTOR_ATTR in grp.attrs
+    ]
+    return ",".join(seen)
 
 
 def _require_inputs(paths: list[Path]) -> None:
@@ -208,17 +266,26 @@ def _compute_run(
 
     upstream_mask = _face_rail_mask(upstream_grp, upstream.shape)
     downstream_mask = _face_rail_mask(downstream_grp, downstream.shape)
-    excluded = np.zeros(upstream.shape, dtype=bool)
+    upstream_state = _face_state_mask(upstream_grp, upstream.shape)
+    downstream_state = _face_state_mask(downstream_grp, downstream.shape)
+    railed = np.zeros(upstream.shape, dtype=bool)
     for face_mask in (upstream_mask, downstream_mask):
         if face_mask is not None:
-            excluded |= face_mask
-    # A cell railed on EITHER face is dropped on BOTH, so every surviving cell is
-    # still a pair of simultaneous face measurements.  The area-normalized face
-    # currents go too, not just the ratio: they are what the ratio is built from,
-    # and leaving them live would let a consumer rebuild the railed Mach number
-    # from a product that had marked the cell unusable.  The as-recorded face
-    # currents (``isat_*_a``) are kept intact as the faithful copy of the source
-    # products, with ``rail_excluded_cells`` marking which of them are railed.
+            railed |= face_mask
+    state = np.zeros(upstream.shape, dtype=bool)
+    for face_mask in (upstream_state, downstream_state):
+        if face_mask is not None:
+            state |= face_mask
+    # The two masks stack: a cell excluded for EITHER reason on EITHER face is
+    # dropped on BOTH faces, so every surviving cell is still a pair of
+    # simultaneous face measurements.  The area-normalized face currents go too,
+    # not just the ratio: they are what the ratio is built from, and leaving them
+    # live would let a consumer rebuild the excluded Mach number from a product
+    # that had marked the cell unusable.  The as-recorded face currents
+    # (``isat_*_a``) are kept intact as the faithful copy of the source products,
+    # with ``rail_excluded_cells`` and ``state_excluded_cells`` marking which of
+    # them are railed and which sit in a masked channel state.
+    excluded = railed | state
     if excluded.any():
         upstream_j = np.where(excluded, np.nan, upstream_j)
         downstream_j = np.where(excluded, np.nan, downstream_j)
@@ -228,9 +295,9 @@ def _compute_run(
         velocity_km_s_std = np.where(excluded, np.nan, velocity_km_s_std)
 
     provenance = {
-        "rail_cells_excluded": int(excluded.sum()),
-        "rail_cells_kept": int(excluded.size - excluded.sum()),
-        "rail_cells_total": int(excluded.size),
+        "rail_cells_excluded": int(railed.sum()),
+        "rail_cells_kept": int(railed.size - railed.sum()),
+        "rail_cells_total": int(railed.size),
         "rail_exclusion_rule": _rail_rule(upstream_grp, downstream_grp),
         "rail_mask_source_dataset": RAIL_MASK_DATASET,
         "rail_mask_upstream_present": upstream_mask is not None,
@@ -241,10 +308,28 @@ def _compute_run(
         "rail_cells_excluded_downstream": (
             int(downstream_mask.sum()) if downstream_mask is not None else 0
         ),
+        "state_cells_excluded": int(state.sum()),
+        "state_exclusion_rule": _state_rule(upstream_grp, downstream_grp),
+        "state_mask_source_dataset": STATE_MASK_DATASET,
+        "state_mask_upstream_present": upstream_state is not None,
+        "state_mask_downstream_present": downstream_state is not None,
+        "state_cells_excluded_upstream": (
+            int(upstream_state.sum()) if upstream_state is not None else 0
+        ),
+        "state_cells_excluded_downstream": (
+            int(downstream_state.sum()) if downstream_state is not None else 0
+        ),
+        "state_factors_disclosed_not_applied": _state_factors(
+            upstream_grp, downstream_grp
+        ),
+        "cells_excluded_any_mask": int(excluded.sum()),
+        "cells_kept_any_mask": int(excluded.size - excluded.sum()),
     }
 
     return {
-        "rail_excluded_cells": excluded,
+        "rail_excluded_cells": railed,
+        "state_excluded_cells": state,
+        "excluded_cells": excluded,
         "inter_sweep_time_s": time_s,
         "isat_upstream_a": upstream,
         "isat_upstream_a_std": upstream_std,
@@ -317,15 +402,18 @@ def _process_rotation(
                 downstream_area_m2=calib[downstream_area_key.replace("cm2", "m2")],
                 current_factor=probe_a_factor if probe == "A" else 1.0,
             )
-            excluded = provenance["rail_cells_excluded"]
+            n_railed = provenance["rail_cells_excluded"]
+            n_state = provenance["state_cells_excluded"]
+            n_total = provenance["rail_cells_total"]
             rail_note = (
-                f" rail-excluded {excluded}/{provenance['rail_cells_total']} cells"
-                if excluded
-                else ""
+                f" rail-excluded {n_railed}/{n_total} cells" if n_railed else ""
+            )
+            state_note = (
+                f" state-excluded {n_state}/{n_total} cells" if n_state else ""
             )
             print(
                 f"  ES {es_id} run {up_run_id} rot={rotation_deg} "
-                f"port={up_run.attrs['port']}{rail_note}"
+                f"port={up_run.attrs['port']}{rail_note}{state_note}"
             )
             out_run = out_set.create_group(up_run_id)
             for key in (
