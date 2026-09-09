@@ -19,7 +19,9 @@ Rule (unchanged from the sibling product's own definition of "railed"): a raw
 uint16 SIS sample is railed at code 0 or 65535, and a cell is excluded when it
 contains ANY railed sample.  The sibling's run-level verdict is
 ``saturation_excluded = bool(rail_dead > 0)`` -- no fractional threshold -- so
-none is invented here.
+none is invented here.  The screen itself is
+``bapsf_lapd.rail_screen.screen_cells``, which the sibling annotator calls too:
+the rail attrs both products carry are the same numbers by construction.
 
 Cells are the (position, inter-sweep dead-time window) cells the product
 averages, using the same CLIP_S trim as scripts/plot_isat_profiles.py.  The
@@ -52,89 +54,25 @@ import sys
 from pathlib import Path
 
 import h5py
-import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from bapsf_lapd import LapdDataset, ChannelKind          # noqa: E402
-from bapsf_lapd.density import inter_sweep_sample_slices  # noqa: E402
-
-CLIP_S = 10e-6            # same trim as scripts/plot_isat_profiles.py
-RAIL_LO, RAIL_HI = 0, 65535
-PLATEAU_MS = (14.0, 19.0)
+from bapsf_lapd.rail_screen import (                     # noqa: E402
+    CLIP_S,
+    METHOD,
+    PLATEAU_MS,
+    RAIL_HI,
+    RAIL_LO,
+    inter_sweep_times_ms,   # re-exported: this module is the ISAT screen's entry point
+    screen_cells,
+)
 
 RULE = (
     "cell excluded when it contains any raw sample at a uint16 SIS converter "
     "rail (code 0 or 65535); cells are the (position, inter-sweep dead-time "
     "window) cells this product averages, CLIP_S-trimmed"
 )
-METHOD = (
-    "raw uint16 SIS codes; a sample is railed at code 0 or 65535. The SIS "
-    "per-shot header fields Min/Max/Clipped are identically zero for this "
-    "dataset and carry no information. Fractions are over the whole record, "
-    "over the CLIP_S-trimmed inter-sweep dead-time windows this product "
-    "averages, and over the 14-19 ms plateau cycles."
-)
-
-
-def inter_sweep_times_ms(sw):
-    return np.array([
-        sw.t0_s + k * sw.tau_cycle_s + 0.5 * (sw.tau_ramp_s + sw.tau_cycle_s)
-        for k in range(sw.n_cycles)
-    ]) * 1e3
-
-
-def screen_cells(run, kind):
-    """Per-(position, window) rail counts, plus the run-level totals."""
-    cfg = run.config
-    ch = cfg.channel(kind)
-    sw, acq = cfg.sweep, cfg.acquisition
-    n_pos = acq.n_positions
-    n_shots = acq.n_shots_per_position
-    n_cycles = sw.n_cycles
-
-    dead = inter_sweep_sample_slices(sw, acq, clip_s=CLIP_S)
-    dead_idx = np.concatenate([np.arange(s.start, s.stop) for s in dead])
-    seg = np.concatenate([
-        np.full(s.stop - s.start, k, dtype=np.int64) for k, s in enumerate(dead)
-    ])
-    per_window_samples = np.array([s.stop - s.start for s in dead], dtype=np.int64)
-
-    rail_counts = np.zeros((n_pos, n_cycles), dtype=np.int64)
-    n_all = rail_all = 0
-    code_lo, code_hi = RAIL_HI, RAIL_LO
-
-    with run.open() as h5:
-        data = h5[ch.hdf5_path]
-        for flat_shot in range(n_pos * n_shots):
-            pos = flat_shot // n_shots
-            raw = data[flat_shot, :]
-            n_all += raw.size
-            railed_all = (raw == RAIL_LO) | (raw == RAIL_HI)
-            rail_all += int(railed_all.sum())
-            code_lo = min(code_lo, int(raw.min()))
-            code_hi = max(code_hi, int(raw.max()))
-            sub = railed_all[dead_idx]
-            if sub.any():
-                rail_counts[pos] += np.bincount(seg[sub], minlength=n_cycles)
-
-    n_cell_samples = per_window_samples[None, :] * n_shots
-    rail_fraction = rail_counts / n_cell_samples
-    rail_mask = rail_counts > 0
-
-    t_ms = inter_sweep_times_ms(sw)
-    plat = (t_ms >= PLATEAU_MS[0]) & (t_ms <= PLATEAU_MS[1])
-    n_dead = int(np.broadcast_to(n_cell_samples, rail_counts.shape).sum())
-    rail_dead = int(rail_counts.sum())
-    n_plat = int(np.broadcast_to(n_cell_samples, rail_counts.shape)[:, plat].sum())
-    rail_plat = int(rail_counts[:, plat].sum())
-
-    return dict(
-        rail_fraction=rail_fraction, rail_mask=rail_mask, rail_counts=rail_counts,
-        n_cell_samples=n_cell_samples,
-        n_all=n_all, rail_all=rail_all, n_dead=n_dead, rail_dead=rail_dead,
-        n_plat=n_plat, rail_plat=rail_plat, code_lo=code_lo, code_hi=code_hi,
-    )
 
 
 def main(argv=None):

@@ -13,9 +13,12 @@ has no exclusion mechanism -- the current products exclude no run, and neither
 does the rebuild.  So the screen is carried as machine-readable provenance ON
 the product instead of silently dropping or silently keeping a run: every group
 gets its measured rail fractions and an explicit ``saturation_excluded``
-verdict.  The screen itself is scripts/screen_rot180_saturation.py; this
-re-runs the same measurement so the numbers written into the file are the ones
-this pass measured, not a transcribed copy.
+verdict.  The screen itself is ``bapsf_lapd.rail_screen.screen_cells``,
+reached through scripts/screen_rot180_saturation.py; this re-runs the same
+measurement so the numbers written into the file are the ones this pass
+measured, not a transcribed copy.  scripts/annotate_rail_mask.py calls that
+same function for the opposite face, so where the two products carry the same
+rail attr they carry the same number by construction.
 
 For the per-CELL mask on the opposite (ISAT) face, whose run-level verdict is
 too coarse, see scripts/annotate_rail_mask.py.
@@ -48,15 +51,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from bapsf_lapd import LapdDataset, ChannelKind, effective_rotation_deg
-from screen_rot180_saturation import screen, CLIP_S, PLATEAU_MS, RAIL_LO, RAIL_HI
-
-METHOD = (
-    "raw uint16 SIS codes; a sample is railed at code 0 or 65535. The SIS "
-    "per-shot header fields Min/Max/Clipped are identically zero for this "
-    "dataset and carry no information. Fractions are over the whole record, "
-    "over the CLIP_S-trimmed inter-sweep dead-time windows this product "
-    "averages, and over the 14-19 ms plateau cycles."
-)
+from bapsf_lapd.rail_screen import CLIP_S, METHOD, PLATEAU_MS, RAIL_LO, RAIL_HI
+from screen_rot180_saturation import screen
 
 
 def main(argv=None):
