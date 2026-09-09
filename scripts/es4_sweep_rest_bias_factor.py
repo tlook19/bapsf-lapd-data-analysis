@@ -91,6 +91,57 @@ much of each extrapolation is the data and how much is the form.  They are
 fitted shape parameters, not measurements of a floating potential or of a
 sheath scaling.
 
+Pinning the sheath reference to a measurement (``--pin-vf measured``)
+---------------------------------------------------------------------
+Because the fitted reference potential above is free to run far above the top
+of the ES4 ramp, the 3/4 form has no discrimination left: the reference
+absorbs whatever shape the branch demands, and the form is then fitting itself
+rather than the data.  The optional ``--pin-vf measured`` mode removes that
+freedom.  It anchors the sheath base to a potential this repository has
+already MEASURED on the very same run -- the shot-averaged plasma potential in
+``processed/langmuir_sweeps.hdf5``, averaged over the same plateau window and
+the same core cells the factor itself is measured on, one value per port and
+face -- and leaves only the amplitude and the power free:
+
+  |I_i| = A (V_p - V) ** p          V_p pinned, A and p free
+
+The pinned quantity is the PLASMA potential, not a floating potential.  The
+sheath-expansion form measures its potential drop from V_p; ``V_f`` is the
+name this script gives the form's own base parameter, and pinning it to a
+measured V_p is what makes the form testable.  The product carries THREE
+plasma-potential estimators -- ``vp_derivative_v`` (the knee of dI/dV),
+``vp_log_v`` and ``vp_exp_v``.  This mode pins to ``vp_derivative_v`` and
+prints all three beside it, so a reader can see how much of the answer is the
+choice of estimator.
+
+Holding the exponent at 3/4 as well leaves nothing free that can move the
+ratio: with V_p pinned and p = 3/4 the factor is
+
+  ((V_p - V_ES3) / (V_p - V_ES4)) ** 0.75
+
+and no measured current enters it at all.  That number is printed too, as
+``F_pinned(p=3/4)``, because it is the literal 3/4 form evaluated at a measured
+reference and it says how far the branch is from that form.  It is a printed
+diagnostic; the gate below is on the two-parameter pinned fit.
+
+Second pre-registered gate (pinned mode only)
+---------------------------------------------
+  F_pinned inside [F_direct, 1.15 * F_direct]
+      -> "inside -- the pinned fit supports the direct factor"
+  F_pinned outside it
+      -> "outside -- the direct factor stands alone", with the value
+  the pinned fit converges on no core cell of the pair
+      -> "REFUSED (no fit)"
+
+The pinned fit's RMS residual is printed against the FREE fit's, and the free
+fit is the control: it carries one more free parameter and can only do better,
+so a pinned residual close to it means the measured reference costs the branch
+nothing, while a materially worse one is itself the finding rather than a
+failure of the mode.
+
+The default invocation does not open the plasma-potential product, and its CSV
+and printed report are byte-for-byte what they were without this mode.
+
 The transfer is an ASSUMPTION
 -----------------------------
 Route (i) reads its ratio off a DIFFERENT plasma from the one the factor is
@@ -126,21 +177,26 @@ Inputs
 ------
   config/may2026_run_manifest.toml    sweep schedule, channels, calibration
   data/may2026/*.hdf5                 raw runs, opened read-only
+  processed/langmuir_sweeps.hdf5      shot-averaged plasma potential,
+                                      read ONLY under --pin-vf measured
 
-Both are read from the ``repo-root`` given on the command line, which is what
+All are read from the ``repo-root`` given on the command line, which is what
 lets this run from a worktree against a checkout that holds the raw data.
 
 Usage
 -----
   python scripts/es4_sweep_rest_bias_factor.py <repo-root> [--output out.csv]
+  python scripts/es4_sweep_rest_bias_factor.py <repo-root> --pin-vf measured
 """
 
 import argparse
 import csv
 import sys
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
 
+import h5py
 import numpy as np
 from scipy.optimize import curve_fit
 
@@ -190,6 +246,17 @@ FLYBACK_SETTLED_V = 0.5
 # not a member of the product chain.
 FORBIDDEN_OUTPUT_DIR = "processed"
 
+# --pin-vf measured only.  The shot-averaged Langmuir product, relative to the
+# repo-root given on the command line, and the plasma-potential estimators it
+# carries.  The pinned mode anchors the sheath base to the knee (dI/dV)
+# estimator and reports every estimator the product holds beside it.
+VP_PRODUCT_RELPATH = Path("processed/langmuir_sweeps.hdf5")
+VP_ESTIMATOR = "vp_derivative_v"
+VP_ESTIMATORS_REPORTED = ("vp_derivative_v", "vp_log_v", "vp_exp_v")
+
+# Half-width of the pinned gate, as a fraction above F_direct.
+PINNED_GATE_TOLERANCE = 0.15
+
 
 @dataclass(frozen=True)
 class PowerLawFit:
@@ -228,6 +295,7 @@ def fit_power_law(
     i_abs: np.ndarray,
     *,
     exponent: float | None = None,
+    v_float: float | None = None,
 ) -> PowerLawFit:
     """Least-squares fit of A (V_f - V)**p to one ion branch.
 
@@ -236,11 +304,50 @@ def fit_power_law(
     fitted shape parameter of the chosen form, not an independently measured
     floating potential, and a branch flatter than the form predicts will push
     it far outside the swept range.
+
+    ``v_float`` PINS that base potential instead of fitting it, which is what
+    the ``--pin-vf measured`` mode does with a measured plasma potential.  With
+    ``v_float`` pinned and ``exponent`` free the fit has two free parameters,
+    the amplitude and the power; with both pinned only the amplitude is free
+    and the resulting ratio between two biases carries no measured current at
+    all.  A pin at or below the top of the fit window is refused, because the
+    base ``(V_f - V)`` would not stay positive across the branch.
     """
     v = np.asarray(v, dtype=float)
     i_abs = np.asarray(i_abs, dtype=float)
     v_top = float(v.max())
     v_float_lower = v_top + 0.5
+
+    if v_float is not None:
+        if not float(v_float) > v_top:
+            raise ValueError(
+                f"pinned V_f = {float(v_float):.3f} V is not above the top of the fit "
+                f"window ({v_top:.3f} V); the sheath base (V_f - V) would not stay "
+                "positive across the branch"
+            )
+        v_float = float(v_float)
+        base = v_float - v
+        if exponent is not None:
+
+            def model(x, amplitude):
+                return amplitude * (v_float - x) ** exponent
+
+            p0 = [float(i_abs.mean() / base.mean() ** exponent)]
+            bounds = ([0.0], [np.inf])
+            popt, _ = curve_fit(model, v, i_abs, p0=p0, bounds=bounds, maxfev=200000)
+            amplitude, power = float(popt[0]), float(exponent)
+        else:
+
+            def model(x, amplitude, power_):
+                return amplitude * (v_float - x) ** power_
+
+            p0 = [float(i_abs.mean() / base.mean() ** 0.75), 0.75]
+            bounds = ([0.0, 0.0], [np.inf, 5.0])
+            popt, _ = curve_fit(model, v, i_abs, p0=p0, bounds=bounds, maxfev=200000)
+            amplitude, power = float(popt[0]), float(popt[1])
+        fit = PowerLawFit(amplitude, v_float, power, 0.0)
+        rms = float(np.sqrt(np.mean((np.asarray(fit.evaluate(v)) - i_abs) ** 2)))
+        return PowerLawFit(amplitude, v_float, power, rms)
 
     if exponent is not None:
 
@@ -275,6 +382,131 @@ def fit_linear(v: np.ndarray, i_abs: np.ndarray) -> LinearFit:
     fit = LinearFit(float(intercept), float(slope), 0.0)
     rms = float(np.sqrt(np.mean((np.asarray(fit.evaluate(v)) - i_abs) ** 2)))
     return LinearFit(float(intercept), float(slope), rms)
+
+
+@dataclass(frozen=True)
+class PinnedVFloat:
+    """The measured plasma potential one pinned fit anchors its sheath base to.
+
+    ``v_float`` is the value actually pinned, taken from ``estimator``;
+    ``by_estimator`` carries every plasma-potential estimator the product holds
+    over the same cells and time bins, so the estimator choice is visible
+    beside the answer rather than buried in it.
+    """
+
+    v_float: float
+    estimator: str
+    n_cells: int
+    n_time_bins: int
+    cell_std: float
+    by_estimator: dict = field(default_factory=dict)
+
+
+def read_pinned_v_float(
+    product_path: Path,
+    run_id: str,
+    cells: np.ndarray,
+    *,
+    n_positions: int,
+    experiment_set: int = SHALLOW_EXPERIMENT_SET,
+    estimator: str = VP_ESTIMATOR,
+) -> PinnedVFloat:
+    """Measured plasma potential of one run, over the plateau and the core cells.
+
+    Averaged over exactly the cells and the plateau window the factor itself is
+    measured on, so the pinned potential and the fitted branch describe the same
+    plasma.  Every failure is a refusal naming what was missing: this mode must
+    not fall back to a guessed potential.
+    """
+    product_path = Path(product_path)
+    if not product_path.exists():
+        raise ValueError(
+            f"--pin-vf measured needs the shot-averaged Langmuir product at "
+            f"{product_path}, which is not in this checkout; the pinned mode reads a "
+            "measured plasma potential and has no fallback"
+        )
+    cells = np.asarray(cells, dtype=int)
+    if cells.size == 0:
+        raise ValueError(f"run {run_id}: no core cells to average the plasma potential over")
+    group = f"experiment_sets/{experiment_set}/{run_id}"
+    with h5py.File(product_path, "r") as handle:
+        if group not in handle:
+            raise ValueError(
+                f"{product_path} has no {group}; the pinned mode needs the plasma "
+                f"potential of run {run_id} in experiment set {experiment_set}"
+            )
+        node = handle[group]
+        x_cm = np.asarray(handle["x_cm"][:], dtype=float)
+        if x_cm.size != n_positions:
+            raise ValueError(
+                f"{product_path} is on a {x_cm.size}-position grid while run {run_id} "
+                f"sweeps {n_positions} positions; the core-cell indices do not "
+                "transfer between the two"
+            )
+        t_ms = np.asarray(node["cycle_time_s"][:], dtype=float) * 1e3
+        available = [name for name in VP_ESTIMATORS_REPORTED if name in node]
+        if estimator not in available:
+            raise ValueError(
+                f"{group} in {product_path} carries {available or 'no'} plasma-potential "
+                f"estimator(s) and not {estimator}"
+            )
+        grids = {name: np.asarray(node[name][:], dtype=float) for name in available}
+
+    in_window = (t_ms >= PLATEAU_T_MIN_MS - 1e-9) & (t_ms <= PLATEAU_T_MAX_MS + 1e-9)
+    if not in_window.any():
+        raise ValueError(
+            f"{group}: no cycle-time bin lies inside the {PLATEAU_T_MIN_MS}-"
+            f"{PLATEAU_T_MAX_MS} ms plateau the factor is measured over"
+        )
+    index = np.ix_(cells, np.flatnonzero(in_window))
+
+    def cell_means(grid: np.ndarray) -> np.ndarray:
+        block = grid[index]
+        if not np.isfinite(block).any():
+            raise ValueError(
+                f"{group}: every plasma-potential sample over the plateau and the "
+                f"{cells.size} core cells is NaN"
+            )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            return np.nanmean(block, axis=1)
+
+    by_estimator = {}
+    for name, grid in grids.items():
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", RuntimeWarning)
+            by_estimator[name] = float(np.nanmean(cell_means(grid)))
+    pinned_cells = cell_means(grids[estimator])
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        cell_std = float(np.nanstd(pinned_cells))
+    return PinnedVFloat(
+        v_float=by_estimator[estimator],
+        estimator=estimator,
+        n_cells=int(cells.size),
+        n_time_bins=int(in_window.sum()),
+        cell_std=cell_std,
+        by_estimator=by_estimator,
+    )
+
+
+def pinned_gate_band(direct: float) -> tuple[float, float]:
+    """The pre-registered acceptance band for the pinned factor."""
+    low = float(direct)
+    return low, low * (1.0 + PINNED_GATE_TOLERANCE)
+
+
+def pinned_gate_verdict(direct: float, pinned: float | None) -> str:
+    """The pinned gate's one-line verdict; never a NaN and never a blank bin."""
+    low, high = pinned_gate_band(direct)
+    if pinned is None or not np.isfinite(pinned):
+        return "REFUSED (no fit)"
+    if low <= float(pinned) <= high:
+        return "inside -- the pinned fit supports the direct factor"
+    return (
+        f"outside -- the direct factor stands alone (F_pinned {float(pinned):.4f} "
+        f"vs [{low:.4f}, {high:.4f}])"
+    )
 
 
 def bracket_contains(direct: float, linear: float, candidate: float) -> bool:
@@ -450,8 +682,18 @@ def core_cells(deep: RunSweep, shallow: RunSweep) -> np.ndarray:
     return np.flatnonzero(mask(deep) & mask(shallow))
 
 
-def analyse_pair(deep: RunSweep, shallow: RunSweep, fit_v_min: float | None) -> dict:
-    """Measure the factor both ways for one port/face pair."""
+def analyse_pair(
+    deep: RunSweep,
+    shallow: RunSweep,
+    fit_v_min: float | None,
+    pin_product: Path | None = None,
+) -> dict:
+    """Measure the factor both ways for one port/face pair.
+
+    ``pin_product`` is the shot-averaged Langmuir product to read a measured
+    plasma potential from; ``None`` is the default invocation, which reads no
+    product and returns exactly the columns it always returned.
+    """
     if deep.experiment_set != DEEP_EXPERIMENT_SET:
         raise ValueError(
             f"Run {deep.run_id} is in experiment set {deep.experiment_set}; the deep-bias "
@@ -474,6 +716,25 @@ def analyse_pair(deep: RunSweep, shallow: RunSweep, fit_v_min: float | None) -> 
             f"{int(in_window.sum())} ramp samples; the branch does not reach it"
         )
     v_fit = shallow.v_ramp[in_window]
+
+    pin = None
+    if pin_product is not None:
+        pin = read_pinned_v_float(
+            pin_product,
+            shallow.run_id,
+            cells,
+            n_positions=int(shallow.i_ramp_abs.shape[0]),
+            experiment_set=shallow.experiment_set,
+        )
+
+    # Per-cell pinned results, collected only when the mode is on.  Every list
+    # is indexed by CONVERGED cell, and the free fit's residual is carried
+    # alongside so the control comparison is over exactly those cells.
+    per_cell = {
+        key: []
+        for key in ("ratio", "ratio_p075", "exponent", "rms", "rms_p075", "rms_free")
+    }
+    n_cells_pin_failed = 0
 
     direct, eta34, free, linear = [], [], [], []
     v_float_34, v_float_free, exponent_free = [], [], []
@@ -498,6 +759,22 @@ def analyse_pair(deep: RunSweep, shallow: RunSweep, fit_v_min: float | None) -> 
         slope.append(fitlin.slope)
         rms_linear.append(fitlin.rms)
 
+        if pin is not None:
+            try:
+                fitpin = fit_power_law(v_fit, i_fit, v_float=pin.v_float)
+                fitpin75 = fit_power_law(
+                    v_fit, i_fit, exponent=0.75, v_float=pin.v_float
+                )
+            except (RuntimeError, ValueError):
+                n_cells_pin_failed += 1
+            else:
+                per_cell["ratio"].append(fitpin.ratio(v_deep, v_shallow))
+                per_cell["exponent"].append(fitpin.exponent)
+                per_cell["rms"].append(fitpin.rms)
+                per_cell["rms_free"].append(fitfree.rms)
+                per_cell["ratio_p075"].append(fitpin75.ratio(v_deep, v_shallow))
+                per_cell["rms_p075"].append(fitpin75.rms)
+
     def stat(values):
         return float(np.mean(values)), float(np.std(values))
 
@@ -506,7 +783,7 @@ def analyse_pair(deep: RunSweep, shallow: RunSweep, fit_v_min: float | None) -> 
     f_free, f_free_std = stat(free)
     f_linear, f_linear_std = stat(linear)
     low, high = sorted((f_direct, f_linear))
-    return {
+    row = {
         "port": shallow.port,
         "rotation_deg": int(shallow.rotation_deg),
         "run_deep": deep.run_id,
@@ -563,6 +840,70 @@ def analyse_pair(deep: RunSweep, shallow: RunSweep, fit_v_min: float | None) -> 
         "n_cells_eta34_below_linear": int(np.sum(np.array(eta34) < np.array(linear))),
         "eta34_in_bracket": bracket_contains(f_direct, f_linear, f_eta34),
     }
+    if pin is None:
+        return row
+    return row | _pinned_columns(pin, f_direct, per_cell, n_cells_pin_failed)
+
+
+def _pinned_columns(
+    pin: PinnedVFloat,
+    f_direct: float,
+    per_cell: dict,
+    n_cells_pin_failed: int,
+) -> dict:
+    """The columns --pin-vf measured adds, and the only columns it adds.
+
+    ``per_cell`` holds one entry per core cell whose pinned fit converged.  A
+    pair on which none converged still returns every column, with the gate bin
+    carrying the REFUSED verdict rather than a blank or a NaN.
+    """
+    nan = float("nan")
+    converged = per_cell["ratio"]
+    if converged:
+        f_pinned = float(np.mean(converged))
+        f_pinned_std = float(np.std(converged))
+        f_pinned_p075 = float(np.mean(per_cell["ratio_p075"]))
+        f_pinned_p075_std = float(np.std(per_cell["ratio_p075"]))
+        exponent = float(np.mean(per_cell["exponent"]))
+        rms_pin = float(np.mean(per_cell["rms"]))
+        rms_pin_p075 = float(np.mean(per_cell["rms_p075"]))
+        rms_ref = float(np.mean(per_cell["rms_free"]))
+        rms_ratio = rms_pin / rms_ref if rms_ref > 0.0 else nan
+        verdict = pinned_gate_verdict(f_direct, f_pinned)
+    else:
+        f_pinned = f_pinned_std = f_pinned_p075 = f_pinned_p075_std = nan
+        exponent = rms_pin = rms_pin_p075 = rms_ref = rms_ratio = nan
+        verdict = pinned_gate_verdict(f_direct, None)
+    low, high = pinned_gate_band(f_direct)
+    columns = {
+        "vp_pin_estimator": pin.estimator,
+        "vp_pin_v": pin.v_float,
+        "vp_pin_cell_std_v": pin.cell_std,
+        "vp_pin_n_cells": pin.n_cells,
+        "vp_pin_n_time_bins": pin.n_time_bins,
+    }
+    for name in VP_ESTIMATORS_REPORTED:
+        columns[f"vp_pin_{name}"] = pin.by_estimator.get(name, nan)
+    columns.update(
+        {
+            "f_pinned": f_pinned,
+            "f_pinned_std": f_pinned_std,
+            "exponent_pinned": exponent,
+            "rms_pinned_a": rms_pin,
+            "rms_free_pinned_cells_a": rms_ref,
+            "rms_pinned_over_rms_free": rms_ratio,
+            "f_pinned_p075": f_pinned_p075,
+            "f_pinned_p075_std": f_pinned_p075_std,
+            "rms_pinned_p075_a": rms_pin_p075,
+            "n_cells_pinned_fit": len(converged),
+            "n_cells_pinned_fit_failed": int(n_cells_pin_failed),
+            "pinned_gate_low": low,
+            "pinned_gate_high": high,
+            "pinned_in_gate": bool(converged) and low <= f_pinned <= high,
+            "pinned_gate_verdict": verdict,
+        }
+    )
+    return columns
 
 
 def checked_output_path(path: Path) -> Path:
@@ -598,6 +939,14 @@ def parse_args(argv=None):
         "(default: the deepest bias that ramp actually reaches)",
     )
     parser.add_argument(
+        "--pin-vf",
+        choices=("off", "measured"),
+        default="off",
+        help="pin the sheath-expansion base potential to the measured plasma "
+        f"potential in {VP_PRODUCT_RELPATH} instead of fitting it (default: off, "
+        "which reads no product and changes no output)",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("es4_sweep_rest_bias_factor.csv"),
@@ -613,6 +962,9 @@ def main(argv=None) -> int:
     manifest_path = args.repo_root / "config/may2026_run_manifest.toml"
     data_dir = args.data_dir or args.repo_root / "data/may2026"
     configs = load_run_manifest(manifest_path, data_dir=data_dir)
+    pin_product = (
+        args.repo_root / VP_PRODUCT_RELPATH if args.pin_vf == "measured" else None
+    )
 
     print(f"manifest   {manifest_path}")
     print(f"raw runs   {data_dir}")
@@ -629,6 +981,22 @@ def main(argv=None) -> int:
     print("F = |I_i(ES3 rest bias)| / |I_i(ES4 rest bias)|  (>= 1)")
     print("1/F is the same factor with the ratio taken the other way (<= 1).")
     print()
+    if pin_product is not None:
+        print(f"pinned V_f {pin_product}")
+        print(
+            f"           estimator {VP_ESTIMATOR}, averaged over the same plateau and "
+            "the same core cells"
+        )
+        print(
+            "           the PLASMA potential is pinned and the amplitude and power are "
+            "free; F_pinned(p=3/4) additionally holds the power at 3/4, which leaves no "
+            "measured current in the ratio at all"
+        )
+        print(
+            f"GATE(pinned): F_pinned inside [F_direct, "
+            f"{1.0 + PINNED_GATE_TOLERANCE:.2f} x F_direct] supports the direct factor"
+        )
+        print()
 
     rows = []
     for port, rotation, run_deep, run_shallow in RUN_PAIRS:
@@ -636,7 +1004,7 @@ def main(argv=None) -> int:
         shallow = read_run_sweep(configs[run_shallow])
         if deep.port != port or shallow.port != port:
             raise ValueError(f"manifest ports disagree with the pairing for port {port}")
-        rows.append(analyse_pair(deep, shallow, args.fit_v_min))
+        rows.append(analyse_pair(deep, shallow, args.fit_v_min, pin_product))
         row = rows[-1]
         print(
             f"port {port:>2} rot {rotation:>3}  runs {run_deep}/{run_shallow}  "
@@ -691,6 +1059,34 @@ def main(argv=None) -> int:
             f"(at {100 * row['eta34_bracket_position']:.0f}% of the way from direct to "
             f"linear; below F_linear in {row['n_cells_eta34_below_linear']}/{row['n_cells']} cells)"
         )
+        if pin_product is not None:
+            print(
+                f"    V_f pinned  {row['vp_pin_v']:+.3f} +- {row['vp_pin_cell_std_v']:.3f} V "
+                f"({row['vp_pin_estimator']}, {row['vp_pin_n_cells']} cells x "
+                f"{row['vp_pin_n_time_bins']} plateau bins)   estimators: "
+                + "  ".join(
+                    f"{name} {row[f'vp_pin_{name}']:+.2f} V"
+                    for name in VP_ESTIMATORS_REPORTED
+                )
+            )
+            print(
+                f"    F_pinned  {row['f_pinned']:.4f} +- {row['f_pinned_std']:.4f}   "
+                f"V_f {row['vp_pin_v']:9.2f} V (pinned)   p {row['exponent_pinned']:.3f}   "
+                f"rms {row['rms_pinned_a']:.2e} A   [free-fit control rms "
+                f"{row['rms_free_pinned_cells_a']:.2e} A, ratio "
+                f"{row['rms_pinned_over_rms_free']:.3f}]   "
+                f"cells {row['n_cells_pinned_fit']}/{row['n_cells']} fitted"
+            )
+            print(
+                f"    F_pinned(p=3/4)  {row['f_pinned_p075']:.4f} +- "
+                f"{row['f_pinned_p075_std']:.4f}   rms {row['rms_pinned_p075_a']:.2e} A   "
+                "(diagnostic: no measured current enters this ratio)"
+            )
+            print(
+                f"    GATE(pinned)  band [{row['pinned_gate_low']:.4f}, "
+                f"{row['pinned_gate_high']:.4f}] vs F_pinned {row['f_pinned']:.4f}  -> "
+                f"{row['pinned_gate_verdict']}"
+            )
         print()
 
     inside = sum(1 for row in rows if row["eta34_in_bracket"])
@@ -716,6 +1112,31 @@ def main(argv=None) -> int:
         f"({min(extrapolations):.2f}-{max(extrapolations):.2f}) disagree by more than "
         "either one's spread.  The bracket is the claim."
     )
+    if pin_product is not None:
+        print()
+        verdicts = [row["pinned_gate_verdict"] for row in rows]
+        n_inside = sum(1 for verdict in verdicts if verdict.startswith("inside"))
+        n_refused = sum(1 for verdict in verdicts if verdict.startswith("REFUSED"))
+        print(
+            f"GATE(pinned): inside at {n_inside} of {len(rows)} port/face pairs, "
+            f"refused at {n_refused}"
+        )
+        ratios = [row["rms_pinned_over_rms_free"] for row in rows]
+        finite = [value for value in ratios if np.isfinite(value)]
+        if finite:
+            print(
+                f"Pinned-fit RMS residual is {min(finite):.3f}-{max(finite):.3f} times "
+                "the free fit's over the same cells; the free fit carries one more free "
+                "parameter and is the discrimination control, so a materially worse "
+                "pinned residual is the finding and not a failure of the mode."
+            )
+        exponents = [row["exponent_pinned"] for row in rows if np.isfinite(row["exponent_pinned"])]
+        if exponents:
+            print(
+                f"With the base pinned at the measured plasma potential the branch shows "
+                f"p = {min(exponents):.3f}-{max(exponents):.3f}, against the 3/4 the "
+                "sheath-expansion form assumes."
+            )
     print("This script rescales no product either way; it writes numbers only.")
 
     output.parent.mkdir(parents=True, exist_ok=True)
