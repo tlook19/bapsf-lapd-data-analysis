@@ -1,42 +1,74 @@
-"""Channel-scale factor between the ES4 and ES1-3 sweep rest biases.
+"""Channel-scale factor between the ES4 and ES3 sweep rest biases.
 
 What this measures
 ------------------
 Between voltage ramps the Langmuir sweep supply parks the probe at a fixed
 negative rest bias, and it is that dead-time current -- not the ramp -- that
-every ion-saturation product is built from.  The high-puff experiment set
-sweeps a nominal +-20 V ramp on a 3 ohm sense resistor while the other three
-sets sweep +-75 V on 1 ohm, so the two families park at DIFFERENT rest biases.
-Ion current on a probe grows with the sheath, so a dead-time current measured
-at the shallower bias is not on the same scale as one measured at the deeper
-bias, and comparing the two families cell for cell needs a factor
+every ion-saturation product is built from.  ES4 sweeps a nominal +-20 V ramp
+on a 3 ohm sense resistor while ES3 sweeps +-75 V on 1 ohm, so the two sets
+park at DIFFERENT rest biases.  Ion current on a probe grows with the sheath,
+so a dead-time current collected at the shallower bias is not on the same scale
+as one collected at the deeper bias, and comparing the two sets cell for cell
+needs a factor
 
-  F = |I_i(V_rest, deep family)| / |I_i(V_rest, shallow family)|      (>= 1)
+  F = |I_i(V_rest, ES3)| / |I_i(V_rest, ES4)|                         (>= 1)
 
-This script measures F.  The reciprocal 1/F = |I_i(shallow)| / |I_i(deep)|
-(<= 1) is the same statement read the other way and is printed beside it; both
+This script measures F.  The reciprocal 1/F = |I_i(ES4)| / |I_i(ES3)| (<= 1) is
+the same statement read the other way and is printed beside it; both
 conventions appear in the table so a reader cannot mistake one for the other.
 
-Both rest biases are MEASURED here, not assumed.  The script averages
-``v_sweep`` over the settled part of each dead-time window inside the plateau
-and reports the level it finds, per run.  That measured pair (V_deep,
-V_shallow) is what both methods below are evaluated at, so the two are
-comparable by construction.
+ES3 is the comparison set because it is the only defensible one: it shares
+ES4's 100 V bank and differs only in puff.  ES1 and ES2 move the bank voltage
+AND sweep a 250 us ramp instead of 500 us, so they are refused rather than
+silently averaged in.
+
+Where the bias numbers come from -- READ THIS BEFORE QUOTING THEM
+-----------------------------------------------------------------
+The absolute level of both rest biases is NOT a free measurement.  It is set by
+this repository's zero-offset convention (``LapdRun.zero_offset_target_v`` in
+``src/bapsf_lapd/reader.py``): the ``v_sweep`` trace is offset so that its
+post-sweep parked DC equals the manifest's configured ``sweep.voltage_start``.
+That anchor is -75 V for ES3 and -20 V for ES4, and the offsets it applies are
+large -- about -16.55 V and -5.07 V respectively, printed per run below.
+
+What this script genuinely measures is therefore the DEPARTURE of the dead-time
+rest level from that parked anchor: about +0.78 V on ES3 and +0.69 V on ES4.
+Anchor plus departure gives the biases the factor is quoted between, and the
+table prints all three so the split is visible.
+
+Residual systematic.  A common error in the anchor moves both biases together
+and does not cancel in F.  Displacing both by -1 V moves F_direct by +0.2 to
++4.4 percent, and by +1 V by -0.6 to -4.0 percent, depending on the pair.  That
+is larger than the cell-to-cell spread of the tightest pair (about +-1.0
+percent), so the anchor -- not counting statistics -- is the dominant
+uncertainty on the factor.  Nothing here tests the convention itself.
+
+Two frames, and why -90 V and -24 V are also right.  In the RAW digitizer frame
+(no zero offset applied) the same settled rest levels read about -90.8 V on ES3
+and -24.4 V on ES4; in the offset frame used throughout this script they read
+about -74.2 V and -19.3 V.  Both describe one measurement, and the table prints
+each rest bias in both frames.  Separately, the deepest single ``v_sweep``
+SAMPLE anywhere in a trace (about -92.9 V on ES3 and -22.4 V on ES4 in the
+offset frame) is a per-shot noise excursion, not a bias level; the deepest
+shot-averaged dead-window level is about -80.4 V and -21.4 V, reached in the
+ringing that follows each ramp.  That ringing overshoots POSITIVE first -- it
+starts near +80 V on ES3 and +21 V on ES4 -- which is why the rest bias is
+measured only past a settling margin.
 
 Two independent routes to the same factor
 -----------------------------------------
-(i) DIRECT, from the deep-family ramp.  The +-75 V ramp sweeps through BOTH
-    rest biases, so the ratio can simply be read off one measured ion branch
-    with no functional form at all:
+(i) DIRECT, from the ES3 ramp.  The +-75 V ramp sweeps through BOTH rest
+    biases, so the ratio can simply be read off one measured ion branch with no
+    functional form at all:
 
-      F_direct = |I(V_deep)| / |I(V_shallow)|   interpolated on that ramp
+      F_direct = |I(V_ES3)| / |I(V_ES4)|   interpolated on that ramp
 
     This is the least model-dependent number the data can give.
 
-(ii) EXTRAPOLATED, from the shallow-family ramp.  The +-20 V ramp never
-    reaches the deep bias, so its ion branch must be extended.  Three
-    extensions are fitted over the same window and each is evaluated as a
-    ratio between the same two biases:
+(ii) EXTRAPOLATED, from the ES4 ramp.  The +-20 V ramp never reaches the ES3
+    bias, so its ion branch must be extended.  Three extensions are fitted over
+    the same window and each is evaluated as a ratio between the same two
+    biases:
 
       orbital-motion sheath expansion   |I| = A (V_f - V)^(3/4)
       the same form with the exponent free    |I| = A (V_f - V)^p
@@ -47,27 +79,26 @@ Two independent routes to the same factor
 
 What the fits can and cannot resolve
 ------------------------------------
-The shallow family's ion branch spans only a few volts of sheath, so its
-current changes by a few percent across the whole fit window.  Every one of the
-three forms can be drawn through that with residuals of the same size, and the
-printed per-model RMS says so directly.  The consequence is that ``V_f`` and a
-free exponent are only weakly determined -- the 3/4 form buys its shape by
-placing ``V_f`` wherever it must, including far above the swept range, which is
-how a form with a 3/4 power ends up nearly straight over the window.  The
-fitted ``V_f`` and exponent are reported for exactly that reason: they are the
-diagnostic of how much of each extrapolation is the data and how much is the
-form.  They are fitted shape parameters, not measurements of a floating
-potential or of a sheath scaling.
+The ES4 ion branch spans only a few volts of sheath, so its current changes by
+a few percent across the whole fit window.  Every one of the three forms can be
+drawn through that with residuals of the same size, and the printed per-model
+RMS says so directly.  The consequence is that ``V_f`` and a free exponent are
+only weakly determined -- the 3/4 form buys its shape by placing ``V_f``
+wherever it must, including far above the swept range, which is how a form with
+a 3/4 power ends up nearly straight over the window.  The fitted ``V_f`` and
+exponent are reported for exactly that reason: they are the diagnostic of how
+much of each extrapolation is the data and how much is the form.  They are
+fitted shape parameters, not measurements of a floating potential or of a
+sheath scaling.
 
 The transfer is an ASSUMPTION
 -----------------------------
 Route (i) reads its ratio off a DIFFERENT plasma from the one the factor is
-applied to: the deep-family ramp belongs to its own experiment set, at its own
-bank voltage and puff.  Using it as the shallow family's factor assumes the
-shape of the ion branch -- not its level -- transfers between the two plasmas.
-Nothing in this data proves that.  It is stated here because the whole
-comparison rests on it, and it is why route (ii), which stays inside the
-shallow family's own ramp, is computed at all.
+applied to: the ES3 ramp belongs to its own experiment set, at its own puff.
+Using it as ES4's factor assumes the shape of the ion branch -- not its level
+-- transfers between the two plasmas.  Nothing in this data proves that.  It is
+stated here because the whole comparison rests on it, and it is why route (ii),
+which stays inside ES4's own ramp, is computed at all.
 
 Pre-registered gate
 -------------------
@@ -78,10 +109,18 @@ With the bracket drawn between the direct ratio and the linear extrapolation:
   it lands OUTSIDE at any port/face
       -> "the bracket is the claim and no product is rescaled"
 
-The script prints which side each pair lands on and the verdict sentence.  It
-does not interpret them.  NO PRODUCT IS RESCALED BY THIS SCRIPT EITHER WAY --
-it writes one CSV of numbers and nothing else, and its default output path is
-deliberately outside ``processed/`` so it cannot enter the scoring chain.
+THE GATE DOES NOT DISCRIMINATE, and the reader meets that fact beside the
+number: the 3/4 ratio sits 83 to 92 percent of the way from the direct end of
+the bracket to the linear end at all six pairs, and below the linear ratio in
+every core cell, because a 3/4 form with a free ``V_f`` can mimic the nearly
+straight branch the linear fit draws.  The finding is not which side of the
+bracket it falls on.  The finding is that the direct route (1.07 to 1.25) and
+both extrapolations (1.27 to 1.69) disagree by more than either one's spread.
+The bracket is the claim.
+
+NO PRODUCT IS RESCALED BY THIS SCRIPT EITHER WAY -- it writes one CSV of
+numbers and nothing else, and it refuses an output path inside ``processed/``
+so it cannot enter the scoring chain.
 
 Inputs
 ------
@@ -109,8 +148,14 @@ from bapsf_lapd.density import inter_sweep_sample_slices
 from bapsf_lapd.manifest import load_run_manifest
 from bapsf_lapd.reader import LapdRun
 
-# Port/face pairings: each shallow-family sweep run beside the deep-family run
-# that sits at the same port and probe rotation.
+# The deep-bias set is ES3 and only ES3: it shares ES4's bank voltage and ramp
+# duration and differs only in puff.  ES1 and ES2 move the bank and sweep a
+# shorter ramp.
+DEEP_EXPERIMENT_SET = 3
+SHALLOW_EXPERIMENT_SET = 4
+
+# Port/face pairings: each ES4 sweep run beside the ES3 run at the same port
+# and probe rotation.
 RUN_PAIRS = (
     (21, 0, "32", "42"),
     (21, 180, "33", "43"),
@@ -140,6 +185,10 @@ FIT_V_MAX = -10.0
 
 # Voltage tolerance for calling the post-ramp flyback settled.
 FLYBACK_SETTLED_V = 0.5
+
+# Directory this instrument must never write into: it is a one-shot measurement,
+# not a member of the product chain.
+FORBIDDEN_OUTPUT_DIR = "processed"
 
 
 @dataclass(frozen=True)
@@ -234,6 +283,35 @@ def bracket_contains(direct: float, linear: float, candidate: float) -> bool:
     return low <= float(candidate) <= high
 
 
+def bracket_position(direct: float, linear: float, candidate: float) -> float:
+    """Where the candidate sits on the direct-to-linear bracket, 0 at direct.
+
+    1 puts it on the linear end.  This is the number that says whether the gate
+    discriminated between the two ends or merely tracked one of them.
+    """
+    span = float(linear) - float(direct)
+    if span == 0.0:
+        return float("nan")
+    return (float(candidate) - float(direct)) / span
+
+
+def uniform_ramp_length(slices, run_id: str) -> int:
+    """Common sample count of a run's ramp slices, or a clear refusal.
+
+    A ramp whose duration is not a whole number of samples produces slices that
+    alternate in length by one -- ES1 and ES2 sweep 250 us at 0.16 us per
+    sample, which is 1562.5 -- and those cannot be stacked into one branch.
+    """
+    lengths = {s.stop - s.start for s in slices}
+    if len(lengths) != 1:
+        raise ValueError(
+            f"Run {run_id}: ramp windows are {sorted(lengths)} samples long, so they "
+            "cannot be averaged into one branch; the ramp duration is not a whole "
+            "number of samples for this run"
+        )
+    return lengths.pop()
+
+
 def plateau_cycle_indices(sweep, *, window: str) -> list[int]:
     """Cycles whose ramp (or dead-time) window lies wholly inside the plateau."""
     if window not in {"ramp", "dead"}:
@@ -263,10 +341,22 @@ class RunSweep:
     i_ramp_abs: np.ndarray        # (n_positions, n_ramp_samples) mean |ion current|
     v_rest: float
     v_rest_std: float
+    v_parked: float               # the configured anchor the offset pins the trace to
+    v_offset_applied: float       # the offset the convention subtracts, in probe volts
     n_ramps: int
     n_dead_windows: int
     n_shots_per_position: int
     flyback_us: float
+
+    @property
+    def v_departure(self) -> float:
+        """Measured rise of the dead-time rest level above the parked anchor."""
+        return self.v_rest - self.v_parked
+
+    @property
+    def v_rest_raw_frame(self) -> float:
+        """The same rest level read in the raw digitizer frame, before the offset."""
+        return self.v_rest + self.v_offset_applied
 
 
 def read_run_sweep(config) -> RunSweep:
@@ -279,15 +369,15 @@ def read_run_sweep(config) -> RunSweep:
     dead_k = plateau_cycle_indices(config.sweep, window="dead")
     if not ramp_k or not dead_k:
         raise ValueError(f"Run {config.run_id} has no whole cycle inside the plateau")
+    uniform_ramp_length([ramp_slices[k] for k in ramp_k], config.run_id)
 
     # One contiguous read per channel spanning every window this run needs, with
     # the zero offset resolved once instead of per slice.
     span_start = min(ramp_slices[ramp_k[0]].start, dead_slices[dead_k[0]].start)
     span_stop = max(ramp_slices[ramp_k[-1]].stop, dead_slices[dead_k[-1]].stop)
     span = slice(span_start, span_stop)
-    v_all = run.langmuir_traces(
-        "v_sweep", span, zero_offset_v=run.default_zero_offset_v("v_sweep")
-    )
+    v_offset_pre = run.default_zero_offset_v("v_sweep")
+    v_all = run.langmuir_traces("v_sweep", span, zero_offset_v=v_offset_pre)
     i_all = run.langmuir_traces(
         "i_sweep", span, zero_offset_v=run.default_zero_offset_v("i_sweep")
     )
@@ -323,6 +413,8 @@ def read_run_sweep(config) -> RunSweep:
         i_ramp_abs=i_ramp_abs,
         v_rest=v_rest,
         v_rest_std=float(np.std(rest_means)),
+        v_parked=float(config.sweep.voltage_start),
+        v_offset_applied=float(v_offset_pre * config.channel("v_sweep").multiplier),
         n_ramps=len(ramp_k),
         n_dead_windows=len(dead_k),
         n_shots_per_position=config.acquisition.n_shots_per_position,
@@ -360,6 +452,17 @@ def core_cells(deep: RunSweep, shallow: RunSweep) -> np.ndarray:
 
 def analyse_pair(deep: RunSweep, shallow: RunSweep, fit_v_min: float | None) -> dict:
     """Measure the factor both ways for one port/face pair."""
+    if deep.experiment_set != DEEP_EXPERIMENT_SET:
+        raise ValueError(
+            f"Run {deep.run_id} is in experiment set {deep.experiment_set}; the deep-bias "
+            f"run must be in set {DEEP_EXPERIMENT_SET}, the only set that shares ES4's "
+            "bank voltage and ramp duration"
+        )
+    if shallow.experiment_set != SHALLOW_EXPERIMENT_SET:
+        raise ValueError(
+            f"Run {shallow.run_id} is in experiment set {shallow.experiment_set}; the "
+            f"shallow-bias run must be in set {SHALLOW_EXPERIMENT_SET}"
+        )
     v_deep = deep.v_rest
     v_shallow = shallow.v_rest
     cells = core_cells(deep, shallow)
@@ -410,10 +513,18 @@ def analyse_pair(deep: RunSweep, shallow: RunSweep, fit_v_min: float | None) -> 
         "run_shallow": shallow.run_id,
         "experiment_set_deep": deep.experiment_set,
         "experiment_set_shallow": shallow.experiment_set,
+        "v_parked_deep_v": deep.v_parked,
+        "v_offset_applied_deep_v": deep.v_offset_applied,
+        "v_departure_deep_v": deep.v_departure,
         "v_rest_deep_v": v_deep,
         "v_rest_deep_std_v": deep.v_rest_std,
+        "v_rest_deep_raw_frame_v": deep.v_rest_raw_frame,
+        "v_parked_shallow_v": shallow.v_parked,
+        "v_offset_applied_shallow_v": shallow.v_offset_applied,
+        "v_departure_shallow_v": shallow.v_departure,
         "v_rest_shallow_v": v_shallow,
         "v_rest_shallow_std_v": shallow.v_rest_std,
+        "v_rest_shallow_raw_frame_v": shallow.v_rest_raw_frame,
         "ramp_min_deep_v": float(deep.v_ramp.min()),
         "ramp_max_deep_v": float(deep.v_ramp.max()),
         "ramp_min_shallow_v": float(shallow.v_ramp.min()),
@@ -448,8 +559,22 @@ def analyse_pair(deep: RunSweep, shallow: RunSweep, fit_v_min: float | None) -> 
         "rms_linear_a": float(np.mean(rms_linear)),
         "bracket_low": low,
         "bracket_high": high,
+        "eta34_bracket_position": bracket_position(f_direct, f_linear, f_eta34),
+        "n_cells_eta34_below_linear": int(np.sum(np.array(eta34) < np.array(linear))),
         "eta34_in_bracket": bracket_contains(f_direct, f_linear, f_eta34),
     }
+
+
+def checked_output_path(path: Path) -> Path:
+    """Refuse an output path that resolves inside the product directory."""
+    resolved = path.expanduser().resolve()
+    if FORBIDDEN_OUTPUT_DIR in resolved.parts:
+        raise ValueError(
+            f"--output {path} resolves to {resolved}, inside a {FORBIDDEN_OUTPUT_DIR}/ "
+            "directory; this instrument writes measurements, not products, and must "
+            "not write into the product chain"
+        )
+    return resolved
 
 
 def parse_args(argv=None):
@@ -469,20 +594,22 @@ def parse_args(argv=None):
         "--fit-v-min",
         type=float,
         default=None,
-        help="lower edge of the shallow-family ion-branch fit window in volts "
+        help="lower edge of the ES4 ion-branch fit window in volts "
         "(default: the deepest bias that ramp actually reaches)",
     )
     parser.add_argument(
         "--output",
         type=Path,
         default=Path("es4_sweep_rest_bias_factor.csv"),
-        help="CSV path; defaults to the working directory, outside processed/",
+        help="CSV path; defaults to the working directory, and a path inside "
+        f"{FORBIDDEN_OUTPUT_DIR}/ is refused",
     )
     return parser.parse_args(argv)
 
 
 def main(argv=None) -> int:
     args = parse_args(argv)
+    output = checked_output_path(args.output)
     manifest_path = args.repo_root / "config/may2026_run_manifest.toml"
     data_dir = args.data_dir or args.repo_root / "data/may2026"
     configs = load_run_manifest(manifest_path, data_dir=data_dir)
@@ -492,9 +619,14 @@ def main(argv=None) -> int:
     print(f"plateau    {PLATEAU_T_MIN_MS}-{PLATEAU_T_MAX_MS} ms, whole cycles only")
     print(f"rest bias  mean v_sweep over each dead-time window past {REST_SETTLE_US:.0f} us of settling")
     print(f"core cells |I_i| >= {CORE_FRACTION:.2f} of profile peak on both runs of a pair")
-    print(f"fit window [fit-v-min, {FIT_V_MAX:.1f}] V on the shallow-family ion branch")
+    print(f"fit window [fit-v-min, {FIT_V_MAX:.1f}] V on the ES4 ion branch")
     print()
-    print("F = |I_i(deep rest bias)| / |I_i(shallow rest bias)|  (>= 1)")
+    print("The rest bias is an ANCHOR plus a MEASURED DEPARTURE: the zero-offset")
+    print("convention pins the parked DC to the manifest's sweep voltage_start, and")
+    print("only the departure from it is measured here.  Both are printed per run,")
+    print("with the same rest level also given in the raw digitizer frame.")
+    print()
+    print("F = |I_i(ES3 rest bias)| / |I_i(ES4 rest bias)|  (>= 1)")
     print("1/F is the same factor with the ratio taken the other way (<= 1).")
     print()
 
@@ -513,12 +645,22 @@ def main(argv=None) -> int:
             f"shots/cell {row['n_shots_per_cell_deep']}/{row['n_shots_per_cell_shallow']}"
         )
         print(
-            f"    rest bias   deep {row['v_rest_deep_v']:8.3f} +- {row['v_rest_deep_std_v']:.3f} V   "
-            f"shallow {row['v_rest_shallow_v']:8.3f} +- {row['v_rest_shallow_std_v']:.3f} V"
+            f"    ES3 bias    parked {row['v_parked_deep_v']:7.2f} V   offset applied "
+            f"{row['v_offset_applied_deep_v']:7.2f} V   departure "
+            f"{row['v_departure_deep_v']:+.3f} V   ->  rest {row['v_rest_deep_v']:8.3f} "
+            f"+- {row['v_rest_deep_std_v']:.3f} V   (raw frame "
+            f"{row['v_rest_deep_raw_frame_v']:.3f} V)"
         )
         print(
-            f"    ramp span   deep [{row['ramp_min_deep_v']:.2f}, {row['ramp_max_deep_v']:.2f}] V   "
-            f"shallow [{row['ramp_min_shallow_v']:.2f}, {row['ramp_max_shallow_v']:.2f}] V   "
+            f"    ES4 bias    parked {row['v_parked_shallow_v']:7.2f} V   offset applied "
+            f"{row['v_offset_applied_shallow_v']:7.2f} V   departure "
+            f"{row['v_departure_shallow_v']:+.3f} V   ->  rest {row['v_rest_shallow_v']:8.3f} "
+            f"+- {row['v_rest_shallow_std_v']:.3f} V   (raw frame "
+            f"{row['v_rest_shallow_raw_frame_v']:.3f} V)"
+        )
+        print(
+            f"    ramp span   ES3 [{row['ramp_min_deep_v']:.2f}, {row['ramp_max_deep_v']:.2f}] V   "
+            f"ES4 [{row['ramp_min_shallow_v']:.2f}, {row['ramp_max_shallow_v']:.2f}] V   "
             f"flyback {row['flyback_us_deep']:.1f}/{row['flyback_us_shallow']:.1f} us"
         )
         print(
@@ -545,24 +687,43 @@ def main(argv=None) -> int:
         print(
             f"    GATE  bracket [{row['bracket_low']:.4f}, {row['bracket_high']:.4f}] "
             f"vs F_eta34 {row['f_eta34']:.4f}  -> "
-            f"{'INSIDE' if row['eta34_in_bracket'] else 'OUTSIDE'}"
+            f"{'INSIDE' if row['eta34_in_bracket'] else 'OUTSIDE'}   "
+            f"(at {100 * row['eta34_bracket_position']:.0f}% of the way from direct to "
+            f"linear; below F_linear in {row['n_cells_eta34_below_linear']}/{row['n_cells']} cells)"
         )
         print()
 
     inside = sum(1 for row in rows if row["eta34_in_bracket"])
+    positions = [100 * row["eta34_bracket_position"] for row in rows]
+    # The two bracket ends only; the free exponent is a diagnostic, not an end.
+    extrapolations = [
+        value for row in rows for value in (row["f_eta34"], row["f_linear"])
+    ]
     print(f"GATE: eta^(3/4) inside the bracket at {inside} of {len(rows)} port/face pairs")
     if inside == len(rows):
         print("GATE VERDICT: the factor is bracketed")
     else:
         print("GATE VERDICT: the bracket is the claim and no product is rescaled")
+    print(
+        f"THE GATE DOES NOT DISCRIMINATE: eta^(3/4) sits at {min(positions):.0f}-"
+        f"{max(positions):.0f}% of the way from the direct end of the bracket to the "
+        "linear end, so it tracks the linear extrapolation rather than testing it."
+    )
+    print(
+        "The finding is that the direct route "
+        f"({min(row['f_direct_up'] for row in rows):.2f}-"
+        f"{max(row['f_direct_up'] for row in rows):.2f}) and both extrapolations "
+        f"({min(extrapolations):.2f}-{max(extrapolations):.2f}) disagree by more than "
+        "either one's spread.  The bracket is the claim."
+    )
     print("This script rescales no product either way; it writes numbers only.")
 
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    with args.output.open("w", newline="") as handle:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
         writer.writerows(rows)
-    print(f"wrote {args.output}")
+    print(f"wrote {output}")
     return 0
 
 
