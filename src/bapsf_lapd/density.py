@@ -81,10 +81,16 @@ MACH_K_BRACKET: tuple[float, float] = (1.34, 1.74)
 #: area-free estimator and half their difference is the systematic.  Measured
 #: by the rotation-pair read of the processed Mach product (plateau window
 #: 14–19 ms, x = 0, K = ``MACH_K``) over the nine valid ES1–ES3 port pairs.
-#: ES4 pairs are EXCLUDED from the statistic: run 43 railed, and the ES4 p41
-#: pair is an anomaly in ln R.  Being a magnitude it is carried as ±RMS about a
-#: reading.  Consumed by any error budget that quotes a Mach number; no
-#: correction is applied.
+#: The pooled RMS is a spread over state: the asymmetry grows from ES1 to ES3
+#: at the downstream position.  ES4 pairs are EXCLUDED from the statistic for
+#: two reasons: the ES4 sweep face rests at −24 V between ramps (ES1–ES3 rest
+#: at −90 V), so every ES4 rot-pair half-difference carries a rest-bias
+#: convention term (ln 0.10–0.41, the Isweep face reading low) that the ES1–ES3
+#: pairs do not — it is not a face-asymmetry measurement under the ES1–ES3
+#: convention; and run 43's Isat channel sits in a ×1.76 state over shots
+#: 240–695, of which the rail is a symptom.  Being a magnitude it is carried as
+#: ±RMS about a reading.  Consumed by any error budget that quotes a Mach
+#: number; no correction is applied.
 MACH_FACE_ASYMMETRY_M_RMS: float = 0.082
 
 #: Full spread of the same nine face-asymmetry half-differences, dimensionless
