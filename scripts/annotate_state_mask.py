@@ -30,7 +30,9 @@ REGISTERED STATES
     x = -14 cm to x = -13 cm, so its raw size contains the profile move: x1.852
     raw, x1.75 corrected for that move; the down step, which falls inside a
     position, is 1/0.568 = 1.761; the registry carries 1.76, and the same-band
-    low-versus-high comparison at x = -13...-10 cm reads 1.65.
+    low-versus-high comparison, at UNMATCHED x (the high-state side at
+    x = -13...-10 cm against the low-state side at |x| = 10...16 cm), reads
+    1.65.
 
 PROJECTION ONTO CELLS
     Cells are the (position, inter-sweep dead-time window) cells the product

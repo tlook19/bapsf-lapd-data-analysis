@@ -106,8 +106,10 @@ BOUNDARY_RULE = (
     f"across a position boundary, block means of the last {BLOCK_SHOTS} shots "
     f"below and the first {BLOCK_SHOTS} above, all four eligible; flag "
     f"|ln(R_upper/R_lower)| > ln {LN_RATIO_FLAG:g} on the two-channel ratio "
-    "R = |ISAT|/|I_SWEEP|, in which the profile move cancels; attributed to the "
-    "channel whose own boundary ratio departs the further from unity"
+    "R = |ISAT|/|I_SWEEP|, in which only the part of the profile move common "
+    "to the two channels cancels -- their differential response to x "
+    "survives; attributed to the channel whose own boundary ratio departs "
+    "the further from unity"
 )
 ELIGIBILITY_RULE = (
     f"|signal| > {SIGNIFICANCE_FACTOR:g} x the run's own tail noise level on "
