@@ -32,18 +32,31 @@ LEG 1 -- FIXED POSITION
     position, so the profile is held fixed and the ratio is a pure level ratio.
     Flags ``|ln(s[j+1] / s[j])| > ln(LN_RATIO_FLAG)`` on eligible pairs.
 
+    It does not separate a channel-level change from a plasma-level one: a
+    plasma that changes between two consecutive shots moves the recorded signal
+    exactly as a channel that changes does, and one channel's own record holds
+    nothing that tells them apart.
+
     A step that falls exactly on a position boundary is invisible to this leg by
     construction, because no pair spans two positions.  Leg 2 is what reaches it.
 
 LEG 2 -- POSITION BOUNDARY, TWO-CHANNEL
     Across a position boundary the profile moves, and a single-channel ratio
-    cannot tell a profile move from a level step.  The TWO-CHANNEL ratio can:
-    both channels see the same plasma at the same position, so the profile move
-    cancels in ISAT/I_SWEEP while a level step on one channel does not.  Per
-    boundary, the screen takes block means of the last BLOCK_SHOTS shots of the
-    lower position and the first BLOCK_SHOTS of the upper, forms
+    cannot tell a profile move from a level step.  The TWO-CHANNEL ratio removes
+    the part of that move COMMON to the two channels: both are sampled at the
+    same position at the same time, so a change that scales both alike cancels
+    in ISAT/I_SWEEP while a level step on one channel does not.  Per boundary,
+    the screen takes block means of the last BLOCK_SHOTS shots of the lower
+    position and the first BLOCK_SHOTS of the upper, forms
     ``R = |ISAT| / |I_SWEEP|`` on each side, and flags
     ``|ln(R_upper / R_lower)| > ln(LN_RATIO_FLAG)``.
+
+    Only the common part cancels.  The two channels are the probe's upstream and
+    downstream faces -- the pair whose ratio IS the Mach signal -- so their
+    DIFFERENTIAL response to x survives: at a boundary where the two faces'
+    profiles differ in slope, R steps without either channel having changed
+    state.  That is what a boundary flagged at the same x in several runs is,
+    and it is not separable here from a per-run channel state.
 
     The step is ATTRIBUTED to the channel whose own single-channel boundary
     ratio departs the further from unity: with a profile move ``p`` common to

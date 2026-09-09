@@ -184,10 +184,18 @@ def _rail_rule(*grps: h5py.Group) -> str:
 
 
 def _state_rule(*grps: h5py.Group) -> str:
-    """The channel-state exclusion rule as stated by the source products."""
-    return _mask_rule(
-        grps, STATE_RULE_ATTR, NO_STATE_MASK_NOTE.format(dataset=STATE_MASK_DATASET)
-    )
+    """The channel-state exclusion rule, or the absence note when no face has one.
+
+    Unlike the rail mask -- whose annotator writes a mask for every run, so a
+    file-level rule is true of every run in the file -- a state mask is written
+    only for the runs with a registered state.  The file-level rule is therefore
+    read only when a face of THIS pair actually carries the mask; otherwise the
+    pair would report a positive rule it is not subject to.
+    """
+    absent = NO_STATE_MASK_NOTE.format(dataset=STATE_MASK_DATASET)
+    if not any(STATE_MASK_DATASET in grp for grp in grps):
+        return absent
+    return _mask_rule(grps, STATE_RULE_ATTR, absent)
 
 
 def _state_factors(*grps: h5py.Group) -> str:

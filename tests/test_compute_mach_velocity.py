@@ -284,3 +284,16 @@ def test_state_rule_falls_back_when_no_product_states_one(tmp_path):
     up_path, down_path, _ = _make_inputs(tmp_path)
     with h5py.File(up_path, "r") as up, h5py.File(down_path, "r") as down:
         assert "no channel state is registered" in _state_rule(up["run"], down["run"])
+
+
+def test_state_rule_is_the_absence_note_when_neither_face_carries_a_mask(tmp_path):
+    # The product states a rule because ANOTHER run in it has a registered
+    # state; a pair with no mask of its own is not subject to that rule.
+    up_path, down_path, _ = _make_inputs(tmp_path, state_rule=STATE_RULE_TEXT)
+    with h5py.File(up_path, "r") as up, h5py.File(down_path, "r") as down:
+        assert "no channel state is registered" in _state_rule(up["run"], down["run"])
+
+    _, prov = _run(tmp_path, state_rule=STATE_RULE_TEXT)
+    assert prov["state_mask_upstream_present"] is False
+    assert prov["state_mask_downstream_present"] is False
+    assert "no channel state is registered" in prov["state_exclusion_rule"]
