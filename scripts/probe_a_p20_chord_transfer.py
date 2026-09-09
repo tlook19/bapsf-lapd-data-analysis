@@ -87,7 +87,11 @@ Usage
   PYTHONPATH=src python scripts/probe_a_p20_chord_transfer.py \
       --ratio 1:1.08 --ratio 3:0.98 --ratio 4:0.89 \
       --free-axis 2 --free-axis-ratios 1.00,1.08,0.98 \
-      --output processed/probe_a_p20_chord_transfer.csv
+      --output probe_a_p20_chord_transfer.csv
+
+``--output`` defaults to the working directory (not ``processed/``): this is a
+one-shot measurement, not a member of the product chain, and a path resolving
+inside ``processed/`` is refused.
 """
 
 from __future__ import annotations
@@ -117,6 +121,10 @@ PROBE_A_CALIB_TOML = Path("config/may2026_probe_a_area_calibration.toml")
 
 # He-4 ion mass in amu; the value scripts/calibrate_probe_areas.py calibrates with.
 M_I_AMU = 4.003
+
+# Directory this instrument must never write into: it is a one-shot
+# measurement, not a member of the product chain.
+FORBIDDEN_OUTPUT_DIR = "processed"
 
 # Stable plasma plateau, mirroring the window the B/C/D calibration uses.
 CALIB_T_MIN_MS = 10.0
@@ -396,6 +404,18 @@ def _parse_float_list(text: str) -> list[float]:
     return [float(part) for part in text.split(",") if part.strip()]
 
 
+def checked_output_path(path: Path) -> Path:
+    """Refuse an output path that resolves inside the product directory."""
+    resolved = path.expanduser().resolve()
+    if FORBIDDEN_OUTPUT_DIR in resolved.parts:
+        raise ValueError(
+            f"--output {path} resolves to {resolved}, inside a {FORBIDDEN_OUTPUT_DIR}/ "
+            "directory; this instrument writes measurements, not products, and must "
+            "not write into the product chain"
+        )
+    return resolved
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__.splitlines()[0],
@@ -432,8 +452,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("processed/probe_a_p20_chord_transfer.csv"),
-        help="path for the result table",
+        default=Path("probe_a_p20_chord_transfer.csv"),
+        help="path for the result table; defaults to the working directory, "
+        f"and a path inside {FORBIDDEN_OUTPUT_DIR}/ is refused",
     )
     return parser
 
@@ -466,6 +487,7 @@ CSV_FIELDS = (
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    args.output = checked_output_path(args.output)
     root = args.repo_root
     declared = _parse_ratios(args.ratio)
     free_axis_sets = set(args.free_axis)
