@@ -124,9 +124,9 @@ def screen_cells(run, kind):
 
     t_ms = inter_sweep_times_ms(sw)
     plat = (t_ms >= PLATEAU_MS[0]) & (t_ms <= PLATEAU_MS[1])
-    n_dead = int(n_cell_samples.sum())
+    n_dead = int(np.broadcast_to(n_cell_samples, rail_counts.shape).sum())
     rail_dead = int(rail_counts.sum())
-    n_plat = int(n_cell_samples[:, plat].sum())
+    n_plat = int(np.broadcast_to(n_cell_samples, rail_counts.shape)[:, plat].sum())
     rail_plat = int(rail_counts[:, plat].sum())
 
     return dict(
