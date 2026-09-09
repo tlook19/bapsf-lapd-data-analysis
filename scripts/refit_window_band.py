@@ -32,6 +32,17 @@ which is the cell set a port's own ``T_e`` row is built from, and ``--sets`` /
 those defaults to the band pass described above, so the default invocation is
 the D-i product and nothing else.
 
+A pass that is NOT the band pass must be given all three output paths, because
+the default ones are the band products ``fit_te_spatial.py`` consumes and
+nothing in those files would let it notice the substitution; the pass REFUSES
+to start otherwise.  So a core pass reads, in full::
+
+  MPLCONFIGDIR=.matplotlib python scripts/refit_window_band.py \
+      --cells core --sets 4 --ports 21,29,41 --rotation-deg 0 \
+      --output   <outside processed/>/window_refit_band_es4_core_rot0.hdf5 \
+      --summary  <outside processed/>/window_refit_band_es4_core_rot0_summary.csv \
+      --metadata <outside processed/>/window_refit_band_es4_core_rot0_metadata.json
+
 Outputs
 -------
 processed/window_refit_band.hdf5
@@ -235,7 +246,7 @@ def refit_port(
     order: int,
     cells_mode: str = "band",
 ) -> dict:
-    """Re-fit every window in the family, for every sweep, at every band cell."""
+    """Re-fit every window in the family, for every sweep, at every *cells* cell."""
     started = time.time()
     run = dataset.run(run_id)
     cycle_start_s = _pls._cycle_start_times(run)
@@ -357,6 +368,75 @@ def _port_summary(record: dict) -> dict:
     return summary
 
 
+#: Per-port summary fields that mean something only for the band pass: the
+#: band statistics themselves, the criterion verdict built from their median,
+#: and the trust-to-aperture verdict, which is a band adjudication.  The core
+#: metadata drops them rather than restating them under band names.
+_BAND_ONLY_SUMMARY_FIELDS = (
+    "in_band_cells",
+    "in_band_median_dln",
+    "in_band_upper_quartile_dln",
+    "in_band_max_dln",
+    "in_band_fraction_at_or_above_criterion",
+    "passes_criterion",
+    "trust_to_aperture_adopted",
+)
+
+
+def _core_metadata(
+    summaries: list[dict],
+    *,
+    created: str,
+    core_mode: dict,
+    hdf5_path: Path,
+    summary_path: Path,
+) -> dict:
+    """Return the metadata payload describing a CORE pass.
+
+    It states the core protocol and the core gate and carries no band-only
+    field, so a consumer that reads the JSON cannot mistake this product for
+    the band product whose file name it resembles.  A port the gate refused
+    carries ``null`` where its ``T_e`` would be, rather than the ``NaN``
+    literal that would make the file invalid JSON to a strict parser.
+    """
+    ports = []
+    for summary in summaries:
+        entry = {
+            key: (
+                None
+                if isinstance(value, float) and not np.isfinite(value)
+                else value
+            )
+            for key, value in summary.items()
+            if key not in _BAND_ONLY_SUMMARY_FIELDS
+        }
+        entry["core_gate_passes"] = bool(
+            summary["core_cells_below_criterion"]
+            >= core_mode["core_gate_min_cells"]
+        )
+        ports.append(entry)
+    return {
+        "product": "window_refit_core",
+        "created_utc": created,
+        "generating_script": "scripts/refit_window_band.py",
+        "protocol": CORE_PROTOCOL,
+        "lineage": LINEAGE,
+        "cells_mode": "core",
+        "core_max_cm": core_mode["core_max_cm"],
+        "core_gate_min_cells": core_mode["core_gate_min_cells"],
+        "rotation_deg": core_mode["rotation_deg"],
+        "criterion_dln_te_window": CRITERION_DLN,
+        "sets_run": sorted({int(summary["set_id"]) for summary in summaries}),
+        "ports_run": [int(summary["port"]) for summary in summaries],
+        "plateau_ms": list(PLATEAU_MS),
+        "window_p_low_percent": list(_rw.P_LOW),
+        "window_f_high_fraction": list(_rw.F_HIGH),
+        "full_product_hdf5": _display_path(hdf5_path),
+        "per_cell_csv": _display_path(summary_path),
+        "ports": ports,
+    }
+
+
 def _display_path(path: Path) -> str:
     """Return ``path`` repo-relative under ``ROOT``, else its resolved absolute form."""
     resolved = Path(path).resolve()
@@ -373,12 +453,14 @@ def write_product(
     hdf5_path: Path,
     summary_path: Path,
     metadata_path: Path,
-    extra_root_attrs: dict | None = None,
+    core_mode: dict | None = None,
 ) -> list[dict]:
     """Write the HDF5 product, the tracked per-cell CSV and the metadata.
 
-    ``extra_root_attrs`` is written verbatim onto the HDF5 root; with the
-    default ``None`` the file is exactly the band product it has always been.
+    ``core_mode`` carries the core pass's rotation and gate; with the default
+    ``None`` all three files are exactly the band products they have always
+    been.  When it is given, the metadata JSON describes the CORE protocol and
+    drops the band-only fields, so a core product cannot be read as a band one.
     """
     created = _datetime.datetime.now(_datetime.UTC).isoformat(timespec="seconds")
     summaries = [_port_summary(record) for record in records]
@@ -399,8 +481,12 @@ def write_product(
         hdf.attrs["window_f_high_fraction"] = np.asarray(_rw.F_HIGH, dtype=np.float64)
         hdf.attrs["source_sweeps_hdf5"] = str(_rw.SWEEPS_H5.name)
         hdf.attrs["created_utc"] = created
-        for key, value in (extra_root_attrs or {}).items():
-            hdf.attrs[key] = value
+        if core_mode is not None:
+            hdf.attrs["cells_mode"] = "core"
+            hdf.attrs["core_protocol"] = CORE_PROTOCOL
+            hdf.attrs["core_max_cm"] = core_mode["core_max_cm"]
+            hdf.attrs["core_gate_min_cells"] = core_mode["core_gate_min_cells"]
+            hdf.attrs["rotation_deg"] = core_mode["rotation_deg"]
         hdf.create_dataset("x_cm", data=x_cm)
         for record, summary in zip(records, summaries):
             group = hdf.create_group(f"set{summary['set_id']}/port{summary['port']}")
@@ -466,29 +552,33 @@ def write_product(
                 )
     print(f"wrote {summary_path}")
 
-    metadata_path.write_text(
-        json.dumps(
-            {
-                "product": "window_refit_band",
-                "created_utc": created,
-                "generating_script": "scripts/refit_window_band.py",
-                "protocol": PROTOCOL,
-                "adjudication": ADJUDICATION,
-                "lineage": LINEAGE,
-                "criterion_dln_te_window": CRITERION_DLN,
-                "band_min_cm": BAND_MIN_CM,
-                "band_max_cm": BAND_MAX_CM,
-                "plateau_ms": list(PLATEAU_MS),
-                "window_p_low_percent": list(_rw.P_LOW),
-                "window_f_high_fraction": list(_rw.F_HIGH),
-                "full_product_hdf5": _display_path(hdf5_path),
-                "per_cell_csv": _display_path(summary_path),
-                "ports": summaries,
-            },
-            indent=2,
+    if core_mode is None:
+        metadata = {
+            "product": "window_refit_band",
+            "created_utc": created,
+            "generating_script": "scripts/refit_window_band.py",
+            "protocol": PROTOCOL,
+            "adjudication": ADJUDICATION,
+            "lineage": LINEAGE,
+            "criterion_dln_te_window": CRITERION_DLN,
+            "band_min_cm": BAND_MIN_CM,
+            "band_max_cm": BAND_MAX_CM,
+            "plateau_ms": list(PLATEAU_MS),
+            "window_p_low_percent": list(_rw.P_LOW),
+            "window_f_high_fraction": list(_rw.F_HIGH),
+            "full_product_hdf5": _display_path(hdf5_path),
+            "per_cell_csv": _display_path(summary_path),
+            "ports": summaries,
+        }
+    else:
+        metadata = _core_metadata(
+            summaries,
+            created=created,
+            core_mode=core_mode,
+            hdf5_path=hdf5_path,
+            summary_path=summary_path,
         )
-        + "\n"
-    )
+    metadata_path.write_text(json.dumps(metadata, indent=2) + "\n")
     print(f"wrote {metadata_path}")
     return summaries
 
@@ -507,9 +597,70 @@ CORE_PROTOCOL = (
 CORE_GATE_MIN_CELLS = 3
 
 
+def refuse_band_output_paths(
+    *,
+    cells: str,
+    sets,
+    rotation_deg: float,
+    output: Path,
+    summary: Path,
+    metadata: Path,
+) -> None:
+    """Refuse to write a non-band pass into the band products' own paths.
+
+    ``processed/window_refit_band_summary.csv`` and its metadata are TRACKED
+    and are read by ``fit_te_spatial.py`` to mark semi-quantitative cells; its
+    metric-identity guard compares only the window family and the plateau
+    window, all of which a core or rot-180 pass shares, so a substituted file
+    would be consumed silently.  A pass that changes the cell set, the rotation
+    or the sets therefore has to name its own output paths, and is refused at
+    argument resolution -- before any fitting -- if it has not.
+    """
+    requested = []
+    if cells != "band":
+        requested.append(f"--cells {cells}")
+    if float(rotation_deg) != 0.0:
+        requested.append(f"--rotation-deg {float(rotation_deg):g}")
+    if tuple(sets) != tuple(SETS):
+        requested.append("--sets " + ",".join(str(int(s)) for s in sets))
+    if not requested:
+        return
+
+    still_default = [
+        flag
+        for flag, given, default in (
+            ("--output", output, OUTPUT_HDF5),
+            ("--summary", summary, OUTPUT_SUMMARY),
+            ("--metadata", metadata, OUTPUT_METADATA),
+        )
+        if Path(given) == Path(default)
+    ]
+    if not still_default:
+        return
+
+    raise ValueError(
+        f"{', '.join(requested)} asks for a pass that is not the band pass, "
+        f"but {', '.join(still_default)} still points at the band product "
+        "written by the default invocation.  Those files are the D-i band "
+        "products -- scripts/fit_te_spatial.py reads the summary CSV to mark "
+        "semi-quantitative cells, and its metric-identity guard compares only "
+        "the window family and the plateau window, which this pass shares, so "
+        "it could not tell the substitution from the real thing.  Pass "
+        f"{' and '.join(still_default)} explicitly, outside processed/."
+    )
+
+
 def _comma_ints(text: str) -> tuple[int, ...]:
     """Parse a comma-separated integer list for the set and port options."""
     return tuple(int(part) for part in str(text).split(",") if part.strip())
+
+
+def _refused(summary: dict) -> str:
+    """Return the phrase for a port whose gate admitted too few core cells."""
+    return (
+        f"REFUSED ({summary['core_cells_below_criterion']} of "
+        f"{summary['core_cells']} core cells window-stable)"
+    )
 
 
 def _print_core_report(records: list[dict], summaries: list[dict]) -> None:
@@ -535,34 +686,51 @@ def _print_core_report(records: list[dict], summaries: list[dict]) -> None:
                 f"{float(record['te_default_med'][index]):10.3f} {dln:7.3f} "
                 f"{int(record['n_sweeps'][index]):8d}  {str(passes):>6}"
             )
+        if summary["core_cells_below_criterion"] >= CORE_GATE_MIN_CELLS:
+            reading = (
+                f"gate PASS;  core-mean T_e = {summary['core_mean_te_ev']:.3f} "
+                f"eV (default window "
+                f"{summary['core_mean_te_default_window_ev']:.3f} eV)"
+            )
+        else:
+            reading = f"gate FAIL;  T_e {_refused(summary)}"
         print(
             f"  cells below criterion: {summary['core_cells_below_criterion']}"
-            f" / {summary['core_cells']};  gate "
-            f"{'PASS' if summary['core_cells_below_criterion'] >= CORE_GATE_MIN_CELLS else 'FAIL'}"
-            f";  core-mean T_e = {summary['core_mean_te_ev']:.3f} eV "
-            f"(default window {summary['core_mean_te_default_window_ev']:.3f} eV)"
+            f" / {summary['core_cells']};  {reading}"
         )
 
-    by_port = {
-        summary["port"]: summary
-        for summary in summaries
-        if summary["core_cells_below_criterion"] >= CORE_GATE_MIN_CELLS
-    }
-    te29 = by_port.get(29, {}).get("core_mean_te_ev", float("nan"))
-    te41 = by_port.get(41, {}).get("core_mean_te_ev", float("nan"))
-    print(f"\nbins: T_e(p29) = {te29:.3f} eV, T_e(p41) = {te41:.3f} eV")
-    if np.isfinite(te29) and np.isfinite(te41) and te29 <= 0.8 and te41 <= 0.4:
-        verdict = "the T_e-prior explanation is confirmed"
-    elif (
-        np.isfinite(te29)
-        and np.isfinite(te41)
-        and abs(te29 / 3.7 - 1.0) <= 0.25
-        and abs(te41 / 1.8 - 1.0) <= 0.25
-    ):
-        verdict = "the collection deficit owns it"
+    all_ports = {summary["port"]: summary for summary in summaries}
+    readings = {}
+    print()
+    for port in (29, 41):
+        summary = all_ports.get(port)
+        if summary is None:
+            print(f"bins: T_e(p{port}) = NOT RUN")
+            continue
+        if summary["core_cells_below_criterion"] >= CORE_GATE_MIN_CELLS:
+            readings[port] = float(summary["core_mean_te_ev"])
+            print(f"bins: T_e(p{port}) = {readings[port]:.3f} eV")
+        else:
+            print(f"bins: T_e(p{port}) = {_refused(summary)}")
+
+    te29, te41 = readings.get(29), readings.get(41)
+    if te29 is None or te41 is None:
+        refused = [
+            f"p{port}" for port in (29, 41) if readings.get(port) is None
+        ]
+        print(
+            f"bin : NOT REACHED -- the gate admitted no core T_e at "
+            f"{' and '.join(refused)}, so there is no measured value to place "
+            "in a bin"
+        )
     else:
-        verdict = "outside the bins"
-    print(f"bin: {verdict}")
+        if te29 <= 0.8 and te41 <= 0.4:
+            verdict = "the T_e-prior explanation is confirmed"
+        elif abs(te29 / 3.7 - 1.0) <= 0.25 and abs(te41 / 1.8 - 1.0) <= 0.25:
+            verdict = "the collection deficit owns it"
+        else:
+            verdict = "outside the bins"
+        print(f"bin : {verdict}")
     print(
         "  (bin 1 is T_e(p29) <= 0.8 and T_e(p41) <= 0.4; bin 2 is 'at the "
         "prior' read as within 25 percent of p29 = 3.7 and p41 = 1.8, the "
@@ -613,6 +781,14 @@ def main() -> None:
         help="probe rotation of the runs to walk",
     )
     args = parser.parse_args()
+    refuse_band_output_paths(
+        cells=args.cells,
+        sets=args.sets,
+        rotation_deg=args.rotation_deg,
+        output=args.output,
+        summary=args.summary,
+        metadata=args.metadata,
+    )
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
     with h5py.File(_rw.SWEEPS_H5, "r") as hdf:
@@ -666,12 +842,10 @@ def main() -> None:
             )
         records.append(record)
 
-    extra_root_attrs = None
+    core_mode = None
     if args.cells == "core":
-        extra_root_attrs = {
-            "cells_mode": "core",
+        core_mode = {
             "core_max_cm": CORE_MAX_CM,
-            "core_protocol": CORE_PROTOCOL,
             "core_gate_min_cells": CORE_GATE_MIN_CELLS,
             "rotation_deg": float(args.rotation_deg),
         }
@@ -681,7 +855,7 @@ def main() -> None:
         hdf5_path=args.output,
         summary_path=args.summary,
         metadata_path=args.metadata,
-        extra_root_attrs=extra_root_attrs,
+        core_mode=core_mode,
     )
 
     print(
