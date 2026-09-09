@@ -23,6 +23,15 @@ Protocol (PRE-DECLARED 2026-08-20, before the numbers existed)
   ``dln_te_window`` is below ``CRITERION_DLN``; the full per-cell distribution
   is reported either way and the criterion is not adjusted afterwards.
 
+Cell sets and rotations
+-----------------------
+The pass fits the band above by default.  ``--cells core`` fits the CORE cells
+instead (``|x| <= CORE_MAX_CM``, the ``X_CORE_CM`` of ``fit_te_spatial.py``),
+which is the cell set a port's own ``T_e`` row is built from, and ``--sets`` /
+``--ports`` / ``--rotation-deg`` select which runs are walked.  Every one of
+those defaults to the band pass described above, so the default invocation is
+the D-i product and nothing else.
+
 Outputs
 -------
 processed/window_refit_band.hdf5
@@ -102,6 +111,10 @@ BAND_MAX_CM = 18.415
 #: A cell at or above this window spread is SEMI-QUANTITATIVE; a port passes
 #: when its in-band median is below it.  Fixed before the first look.
 CRITERION_DLN = 0.50
+#: Outer edge of the CORE, the cell set ``--cells core`` fits.  This is the
+#: ``X_CORE_CM`` of ``fit_te_spatial.py``, which builds a port's ``T_e`` row
+#: from exactly these cells; the two are pinned equal by the unit tests.
+CORE_MAX_CM = 10.0
 
 PROTOCOL = (
     "Per-cell fit-window re-fits, PRE-DECLARED 2026-08-20 before the numbers "
@@ -149,6 +162,65 @@ def band_cell_indices(x_cm: np.ndarray) -> tuple[np.ndarray, int]:
     return np.concatenate([in_band, [index_x0]]), index_x0
 
 
+def window_spread_dln(median_grid: np.ndarray) -> float:
+    """Return ``ln(max / min)`` over one cell's window-family ``T_e`` grid.
+
+    NaN entries -- windows that held too few samples to fit -- are ignored, and
+    a cell whose grid is empty or non-positive returns NaN rather than a
+    spread, so an unfittable cell never reads as a stable one.
+    """
+    grid = np.asarray(median_grid, dtype=float)
+    if not np.any(np.isfinite(grid)):
+        return float("nan")
+    te_min, te_max = np.nanmin(grid), np.nanmax(grid)
+    if np.isfinite(te_min) and te_min > 0:
+        return float(np.log(te_max / te_min))
+    return float("nan")
+
+
+def window_family_median(median_grid: np.ndarray) -> float:
+    """Return the median ``T_e`` over one cell's window family.
+
+    The window-family median is the convention-free summary of a cell: it does
+    not privilege the pipeline's default window, and it is the quantity the
+    per-port core mean is built from.
+    """
+    return float(np.nanmedian(np.asarray(median_grid, dtype=float)))
+
+
+def core_cell_indices(x_cm: np.ndarray) -> tuple[np.ndarray, int]:
+    """Return the core cell indices and the index of the ``x = 0`` control.
+
+    The core is ``|x| <= CORE_MAX_CM``, in scan order.  Unlike the band it
+    already contains ``x = 0``, so no control cell is appended.
+    """
+    index_x0 = int(np.abs(x_cm).argmin())
+    core = np.flatnonzero(np.abs(x_cm) <= CORE_MAX_CM)
+    return core, index_x0
+
+
+def set_runs(sets, rotation_deg: float = 0.0):
+    """Yield ``(set_id, run_id, port)`` for runs at one probe rotation.
+
+    ``refit_sweep_windows.rot0_runs`` is the rot-0 case of this walk and is
+    reused verbatim for it, so the default pass cannot drift from the x = 0
+    product; ``rotation_deg = 180`` walks the reversed-probe runs of the same
+    sets, which no published product consumes and which are reported as a
+    labelled second column only.
+    """
+    if float(rotation_deg) == 0.0:
+        yield from _rw.rot0_runs(sets=sets)
+        return
+    with h5py.File(_rw.SWEEPS_H5, "r") as hdf:
+        for set_id in sorted(hdf["experiment_sets"], key=int):
+            if int(set_id) not in sets:
+                continue
+            for run_id in sorted(hdf["experiment_sets"][set_id]):
+                group = hdf["experiment_sets"][set_id][run_id]
+                if float(group.attrs.get("rotation_deg", 0)) == float(rotation_deg):
+                    yield int(set_id), run_id, int(group.attrs["port"])
+
+
 def refit_port(
     dataset: LapdDataset,
     run_id: str,
@@ -161,6 +233,7 @@ def refit_port(
     plateau_ms: tuple[float, float],
     clip_us: float,
     order: int,
+    cells_mode: str = "band",
 ) -> dict:
     """Re-fit every window in the family, for every sweep, at every band cell."""
     started = time.time()
@@ -212,9 +285,7 @@ def refit_port(
         grids[(grids <= 0.05) | (grids > 30.0)] = np.nan
         median_grid = np.nanmedian(grids, axis=0)
         med_grids[index] = median_grid
-        te_min, te_max = np.nanmin(median_grid), np.nanmax(median_grid)
-        if np.isfinite(te_min) and te_min > 0:
-            dln[index] = float(np.log(te_max / te_min))
+        dln[index] = window_spread_dln(median_grid)
         te_default_med[index] = float(np.nanmedian(defaults))
         n_sweeps[index] = int(np.isfinite(defaults).sum())
 
@@ -231,6 +302,7 @@ def refit_port(
         port=port,
         wall_s=time.time() - started,
         n_plateau=len(in_plateau),
+        cells_mode=cells_mode,
     )
 
 
@@ -241,7 +313,7 @@ def _port_summary(record: dict) -> dict:
     in_band = dln[~is_x0]
     x0 = float(dln[is_x0][0])
     median = float(np.nanmedian(in_band))
-    return {
+    summary = {
         "set_id": int(record["sid"]),
         "port": int(record["port"]),
         "run_id": str(record["run_id"]),
@@ -261,6 +333,28 @@ def _port_summary(record: dict) -> dict:
             (int(record["sid"]), int(record["port"])) in ADOPTED_SET_PORTS
         ),
     }
+    if str(record.get("cells_mode", "band")) != "core":
+        return summary
+
+    # The core pass reports the port's own T_e, so it carries the cell count
+    # the criterion admits and the mean over exactly those cells.  A port with
+    # no admitted cell reports NaN rather than a mean over rejected cells.
+    family_median = np.array(
+        [window_family_median(grid) for grid in np.asarray(record["med_grids"])]
+    )
+    passes = np.isfinite(dln) & (dln < CRITERION_DLN)
+    summary["core_cells"] = int(dln.size)
+    summary["core_cells_below_criterion"] = int(passes.sum())
+    summary["core_mean_te_ev"] = (
+        float(np.nanmean(family_median[passes])) if passes.any() else float("nan")
+    )
+    summary["core_mean_te_default_window_ev"] = (
+        float(np.nanmean(np.asarray(record["te_default_med"])[passes]))
+        if passes.any()
+        else float("nan")
+    )
+    summary["core_max_cm"] = CORE_MAX_CM
+    return summary
 
 
 def _display_path(path: Path) -> str:
@@ -279,8 +373,13 @@ def write_product(
     hdf5_path: Path,
     summary_path: Path,
     metadata_path: Path,
+    extra_root_attrs: dict | None = None,
 ) -> list[dict]:
-    """Write the HDF5 product, the tracked per-cell CSV and the metadata."""
+    """Write the HDF5 product, the tracked per-cell CSV and the metadata.
+
+    ``extra_root_attrs`` is written verbatim onto the HDF5 root; with the
+    default ``None`` the file is exactly the band product it has always been.
+    """
     created = _datetime.datetime.now(_datetime.UTC).isoformat(timespec="seconds")
     summaries = [_port_summary(record) for record in records]
 
@@ -300,6 +399,8 @@ def write_product(
         hdf.attrs["window_f_high_fraction"] = np.asarray(_rw.F_HIGH, dtype=np.float64)
         hdf.attrs["source_sweeps_hdf5"] = str(_rw.SWEEPS_H5.name)
         hdf.attrs["created_utc"] = created
+        for key, value in (extra_root_attrs or {}).items():
+            hdf.attrs[key] = value
         hdf.create_dataset("x_cm", data=x_cm)
         for record, summary in zip(records, summaries):
             group = hdf.create_group(f"set{summary['set_id']}/port{summary['port']}")
@@ -316,6 +417,17 @@ def write_product(
             group.create_dataset("te_default_med_ev", data=record["te_default_med"])
             group.create_dataset("n_sweeps", data=np.asarray(record["n_sweeps"]))
             group.create_dataset("te_window_ev", data=record["med_grids"])
+            if str(record.get("cells_mode", "band")) == "core":
+                group.attrs["cells_mode"] = "core"
+                group.create_dataset(
+                    "te_window_family_median_ev",
+                    data=np.array(
+                        [
+                            window_family_median(grid)
+                            for grid in np.asarray(record["med_grids"])
+                        ]
+                    ),
+                )
     print(f"wrote {hdf5_path}")
 
     with summary_path.open("w", newline="") as handle:
@@ -381,6 +493,84 @@ def write_product(
     return summaries
 
 
+CORE_PROTOCOL = (
+    "Core-cell window re-fits: the band pass's window family, plateau window, "
+    "filter and retarding-branch fit, run over the CORE cells "
+    f"|x| <= {CORE_MAX_CM:g} cm instead of the band, so that the per-cell "
+    "window spread is measured on exactly the cells a port's T_e row is built "
+    "from.  Gate: dln_te_window < "
+    f"{CRITERION_DLN:g} on at least 3 core cells per port.  The port T_e is "
+    "the mean over the admitted cells of the per-cell window-family median."
+)
+
+#: Cells a port must have below the criterion for its core T_e to be read.
+CORE_GATE_MIN_CELLS = 3
+
+
+def _comma_ints(text: str) -> tuple[int, ...]:
+    """Parse a comma-separated integer list for the set and port options."""
+    return tuple(int(part) for part in str(text).split(",") if part.strip())
+
+
+def _print_core_report(records: list[dict], summaries: list[dict]) -> None:
+    """Print the per-cell core tables, the gate and the pre-registered bins."""
+    print(f"\ncore cells: |x| <= {CORE_MAX_CM:g} cm; gate: dln_te_window < "
+          f"{CRITERION_DLN:g} on >= {CORE_GATE_MIN_CELLS} core cells per port")
+    for record, summary in zip(records, summaries):
+        print(
+            f"\nset{summary['set_id']} port{summary['port']} "
+            f"run {summary['run_id']}  ({summary['n_plateau_cycles']} plateau "
+            f"cycles)"
+        )
+        print(f"{'x_cm':>7} {'Te_family_med':>13} {'Te_default':>10} "
+              f"{'dln':>7} {'n_sweeps':>8}  {'passes':>6}")
+        family = [
+            window_family_median(grid) for grid in np.asarray(record["med_grids"])
+        ]
+        for index in range(len(family)):
+            dln = float(record["dln_te_window"][index])
+            passes = bool(np.isfinite(dln) and dln < CRITERION_DLN)
+            print(
+                f"{float(record['x_cm'][index]):7.1f} {family[index]:13.3f} "
+                f"{float(record['te_default_med'][index]):10.3f} {dln:7.3f} "
+                f"{int(record['n_sweeps'][index]):8d}  {str(passes):>6}"
+            )
+        print(
+            f"  cells below criterion: {summary['core_cells_below_criterion']}"
+            f" / {summary['core_cells']};  gate "
+            f"{'PASS' if summary['core_cells_below_criterion'] >= CORE_GATE_MIN_CELLS else 'FAIL'}"
+            f";  core-mean T_e = {summary['core_mean_te_ev']:.3f} eV "
+            f"(default window {summary['core_mean_te_default_window_ev']:.3f} eV)"
+        )
+
+    by_port = {
+        summary["port"]: summary
+        for summary in summaries
+        if summary["core_cells_below_criterion"] >= CORE_GATE_MIN_CELLS
+    }
+    te29 = by_port.get(29, {}).get("core_mean_te_ev", float("nan"))
+    te41 = by_port.get(41, {}).get("core_mean_te_ev", float("nan"))
+    print(f"\nbins: T_e(p29) = {te29:.3f} eV, T_e(p41) = {te41:.3f} eV")
+    if np.isfinite(te29) and np.isfinite(te41) and te29 <= 0.8 and te41 <= 0.4:
+        verdict = "the T_e-prior explanation is confirmed"
+    elif (
+        np.isfinite(te29)
+        and np.isfinite(te41)
+        and abs(te29 / 3.7 - 1.0) <= 0.25
+        and abs(te41 / 1.8 - 1.0) <= 0.25
+    ):
+        verdict = "the collection deficit owns it"
+    else:
+        verdict = "outside the bins"
+    print(f"bin: {verdict}")
+    print(
+        "  (bin 1 is T_e(p29) <= 0.8 and T_e(p41) <= 0.4; bin 2 is 'at the "
+        "prior' read as within 25 percent of p29 = 3.7 and p41 = 1.8, the "
+        "tolerance stated here because the registration gave the priors as "
+        "approximate values)"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -398,21 +588,57 @@ def main() -> None:
     parser.add_argument("--plateau-ms", nargs=2, type=float, default=PLATEAU_MS)
     parser.add_argument("--clip-us", type=float, default=CLIP_US)
     parser.add_argument("--order", type=int, default=FILTER_ORDER)
+    parser.add_argument(
+        "--sets",
+        type=_comma_ints,
+        default=SETS,
+        help="experiment sets to walk, comma separated",
+    )
+    parser.add_argument(
+        "--ports",
+        type=_comma_ints,
+        default=None,
+        help="restrict to these ports; default is every port of each set",
+    )
+    parser.add_argument(
+        "--cells",
+        choices=("band", "core"),
+        default="band",
+        help="fit the trust band (default) or the core cells",
+    )
+    parser.add_argument(
+        "--rotation-deg",
+        type=float,
+        default=0.0,
+        help="probe rotation of the runs to walk",
+    )
     args = parser.parse_args()
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
     with h5py.File(_rw.SWEEPS_H5, "r") as hdf:
         x_cm = hdf["x_cm"][:]
-    cells, index_x0 = band_cell_indices(x_cm)
+    if args.cells == "core":
+        cells, index_x0 = core_cell_indices(x_cm)
+    else:
+        cells, index_x0 = band_cell_indices(x_cm)
     dataset = LapdDataset.from_manifest(_rw.MANIFEST)
 
     records = []
-    for set_id, run_id, port in _rw.rot0_runs(sets=SETS):
-        checkpoint = args.work_dir / f"di_set{set_id}_port{port}.npz"
+    for set_id, run_id, port in set_runs(args.sets, args.rotation_deg):
+        if args.ports is not None and port not in args.ports:
+            continue
+        if args.cells == "band" and args.rotation_deg == 0.0:
+            checkpoint = args.work_dir / f"di_set{set_id}_port{port}.npz"
+        else:
+            checkpoint = args.work_dir / (
+                f"{args.cells}{args.rotation_deg:.0f}_set{set_id}_port{port}.npz"
+            )
         if checkpoint.exists():
             with np.load(checkpoint, allow_pickle=False) as loaded:
                 record = {key: loaded[key] for key in loaded.files}
             record["run_id"] = str(record["run_id"])
+            if "cells_mode" in record:
+                record["cells_mode"] = str(record["cells_mode"])
             print(f"[reuse] set{set_id} port{port} <- {checkpoint.name}")
         else:
             record = refit_port(
@@ -426,6 +652,7 @@ def main() -> None:
                 plateau_ms=tuple(args.plateau_ms),
                 clip_us=args.clip_us,
                 order=args.order,
+                cells_mode=args.cells,
             )
             np.savez(checkpoint, **record)
             print(
@@ -439,12 +666,22 @@ def main() -> None:
             )
         records.append(record)
 
+    extra_root_attrs = None
+    if args.cells == "core":
+        extra_root_attrs = {
+            "cells_mode": "core",
+            "core_max_cm": CORE_MAX_CM,
+            "core_protocol": CORE_PROTOCOL,
+            "core_gate_min_cells": CORE_GATE_MIN_CELLS,
+            "rotation_deg": float(args.rotation_deg),
+        }
     summaries = write_product(
         records,
         x_cm,
         hdf5_path=args.output,
         summary_path=args.summary,
         metadata_path=args.metadata,
+        extra_root_attrs=extra_root_attrs,
     )
 
     print(
@@ -463,6 +700,9 @@ def main() -> None:
             f"{summary['in_band_fraction_at_or_above_criterion']:8.2f} "
             f"{summary['x0_control_dln']:7.3f}  {verdict}"
         )
+
+    if args.cells == "core":
+        _print_core_report(records, summaries)
 
 
 if __name__ == "__main__":
