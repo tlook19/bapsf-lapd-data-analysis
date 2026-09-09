@@ -60,6 +60,10 @@ processed/window_refit_band_summary.csv
 processed/window_refit_band_metadata.json
   Protocol, criterion, adjudication reference and the per-port summary.  Also
   tracked, following ``isweep_frontside_arc_shot_exclusions_metadata.json``.
+  Its ``numerics_vintage`` block records the interpreter and the numpy / scipy /
+  h5py versions the run was produced under, because the product's last digits
+  are a function of them; ``scripts/verify_window_band_product.py`` is the
+  check to run when regenerating under a different vintage.
 
 Usage
 -----
@@ -78,12 +82,14 @@ import csv
 import datetime as _datetime
 import importlib.util
 import json
+import platform
 import sys
 import time
 from pathlib import Path
 
 import h5py
 import numpy as np
+import scipy
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
@@ -155,6 +161,18 @@ LINEAGE = (
     "which supplies refit_sweep(), the window family and the run selection; the "
     "band pass was first executed 2026-08-20 as the D-i discriminator and "
     "archived here so the filled T_e product can condition on it."
+)
+
+#: What the recorded library versions mean for anyone regenerating the product.
+REGENERATION_NOTE = (
+    "The product's last digits are a function of the numerical library versions "
+    "recorded in this block: the same code on the same raw traces reproduces "
+    "the fitted quantities to roughly 1e-8 relative, not bit for bit, under a "
+    "different numpy / scipy / h5py vintage.  Byte-exact regeneration requires "
+    "the recorded versions; under any other vintage the check to run is "
+    "scripts/verify_window_band_product.py, which holds the cell sets, run "
+    "identities, sweep counts and which cells were fittable to byte identity, "
+    "and the fitted floats to a disclosed relative tolerance."
 )
 
 #: The eight set-ports at which trust-to-aperture is adopted, recorded per port
@@ -426,6 +444,7 @@ def _core_metadata(
     return {
         "product": "window_refit_core",
         "created_utc": created,
+        "numerics_vintage": _numerics_vintage(),
         "generating_script": "scripts/refit_window_band.py",
         "protocol": CORE_PROTOCOL,
         "lineage": LINEAGE,
@@ -442,6 +461,23 @@ def _core_metadata(
         "full_product_hdf5": _display_path(hdf5_path),
         "per_cell_csv": _display_path(summary_path),
         "ports": ports,
+    }
+
+
+def _numerics_vintage() -> dict:
+    """Return the interpreter and library versions this run was produced under.
+
+    Read at run time, never restated, so the block cannot go stale the way a
+    written-down version would.  It is written on EVERY pass, band and core
+    alike, because the drift it discloses is a property of the numerics rather
+    than of which cells were fitted.
+    """
+    return {
+        "python": platform.python_version(),
+        "numpy": np.__version__,
+        "scipy": scipy.__version__,
+        "h5py": h5py.__version__,
+        "regeneration_note": REGENERATION_NOTE,
     }
 
 
@@ -568,6 +604,7 @@ def write_product(
         metadata = {
             "product": "window_refit_band",
             "created_utc": created,
+            "numerics_vintage": _numerics_vintage(),
             "generating_script": "scripts/refit_window_band.py",
             "protocol": PROTOCOL,
             "adjudication": ADJUDICATION,

@@ -416,6 +416,25 @@ def test_the_two_modes_write_distinguishable_metadata(tmp_path):
     assert not any(key.startswith("in_band") for key in core["ports"][0])
 
 
+def test_both_modes_record_the_numerics_vintage_they_ran_under(tmp_path):
+    # The product's last digits depend on these versions, so every pass records
+    # them, and records them as READ rather than as written down.
+    import h5py as _h5py
+    import platform
+    import scipy as _scipy
+
+    written = _write_both_modes(tmp_path)
+    for mode in ("band", "core"):
+        vintage = written[mode]["numerics_vintage"]
+        assert vintage["python"] == platform.python_version()
+        assert vintage["numpy"] == np.__version__
+        assert vintage["scipy"] == _scipy.__version__
+        assert vintage["h5py"] == _h5py.__version__
+        assert "Byte-exact regeneration requires the recorded versions" in (
+            vintage["regeneration_note"]
+        )
+
+
 def test_the_core_product_marks_its_cell_mode_in_the_hdf5_root(tmp_path):
     _write_both_modes(tmp_path)
     with h5py.File(tmp_path / "core.hdf5", "r") as core:
