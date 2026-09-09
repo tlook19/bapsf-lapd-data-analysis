@@ -12,11 +12,15 @@ exactly representable rather than merely close.
 """
 
 import math
+from pathlib import Path
 
 import numpy as np
 import pytest
 
 from probe_a_p20_chord_transfer import (
+    FORBIDDEN_OUTPUT_DIR,
+    build_parser,
+    checked_output_path,
     chord_transfer_area_m2,
     probe_a_factor,
 )
@@ -88,3 +92,24 @@ def test_an_unusable_profile_gives_a_nan_factor():
     )
     assert math.isnan(area)
     assert math.isnan(probe_a_factor(3.0e-06, area))
+
+
+def test_output_defaults_outside_the_product_directory():
+    # A one-shot instrument's default output must not land in processed/,
+    # which would put it in the scoring chain unasked.
+    args = build_parser().parse_args([])
+    assert FORBIDDEN_OUTPUT_DIR not in args.output.parts
+    assert checked_output_path(args.output) == args.output.resolve()
+
+
+def test_output_inside_the_product_directory_is_refused(tmp_path):
+    allowed = tmp_path / "probe_a_p20_chord_transfer.csv"
+    assert checked_output_path(allowed) == allowed.resolve()
+
+    forbidden = tmp_path / FORBIDDEN_OUTPUT_DIR / "probe_a_p20_chord_transfer.csv"
+    with pytest.raises(ValueError, match=FORBIDDEN_OUTPUT_DIR):
+        checked_output_path(forbidden)
+
+    (tmp_path / FORBIDDEN_OUTPUT_DIR).mkdir()
+    with pytest.raises(ValueError, match=FORBIDDEN_OUTPUT_DIR):
+        checked_output_path(tmp_path / FORBIDDEN_OUTPUT_DIR / ".." / FORBIDDEN_OUTPUT_DIR / "f.csv")
