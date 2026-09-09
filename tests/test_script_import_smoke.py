@@ -15,7 +15,9 @@ SCRIPT_MODULES = [
     "scripts.annotate_discharge_artifacts",
     "scripts.annotate_rail_mask",
     "scripts.annotate_saturation_attrs",
+    "scripts.annotate_state_mask",
     "scripts.compare_run_annotations",
+    "scripts.screen_consecutive_shot_steps",
     "scripts.screen_rot180_saturation",
 ]
 

@@ -1,4 +1,4 @@
-"""Rail-mask exclusion in the Mach/velocity computation."""
+"""Rail-mask and channel-state-mask exclusion in the Mach/velocity computation."""
 
 import h5py
 import numpy as np
@@ -7,10 +7,13 @@ import pytest
 from compute_mach_velocity import (
     MACH_K,
     RAIL_MASK_DATASET,
+    STATE_MASK_DATASET,
     X_CM,
     _compute_run,
     _face_rail_mask,
+    _face_state_mask,
     _rail_rule,
+    _state_rule,
 )
 
 
@@ -18,9 +21,11 @@ N_X = X_CM.size
 N_WINDOWS = 4
 Z_CM = 789.55
 RULE_TEXT = "cell excluded when it contains any railed raw sample"
+STATE_RULE_TEXT = "cell excluded when its position lies in the state shot range"
 
 
-def _write_face(group, current_a, *, rail_mask=None, rule=None):
+def _write_face(group, current_a, *, rail_mask=None, rule=None,
+                state_mask=None, state_rule=None, state_factor=None):
     """One probe face of a dead-time profile product."""
     group.create_dataset("isat_a_raw", data=current_a)
     group.create_dataset("isat_a_raw_std", data=np.full_like(current_a, 1e-4))
@@ -33,9 +38,17 @@ def _write_face(group, current_a, *, rail_mask=None, rule=None):
         group.create_dataset(RAIL_MASK_DATASET, data=rail_mask)
     if rule is not None:
         group.file.attrs["rail_mask_rule"] = rule
+    if state_mask is not None:
+        group.create_dataset(STATE_MASK_DATASET, data=state_mask)
+    if state_rule is not None:
+        group.file.attrs["state_mask_rule"] = state_rule
+    if state_factor is not None:
+        group.attrs["state_factor"] = state_factor
 
 
-def _make_inputs(tmp_path, *, upstream_mask=None, downstream_mask=None, rule=None):
+def _make_inputs(tmp_path, *, upstream_mask=None, downstream_mask=None, rule=None,
+                 upstream_state=None, downstream_state=None, state_rule=None,
+                 state_factor=None):
     """A minimal upstream/downstream pair plus the filled-T_e grid they need."""
     rng = np.random.default_rng(20260904)
     upstream_a = 0.05 + 0.01 * rng.random((N_X, N_WINDOWS))
@@ -46,9 +59,12 @@ def _make_inputs(tmp_path, *, upstream_mask=None, downstream_mask=None, rule=Non
     te_path = tmp_path / "te.hdf5"
 
     with h5py.File(up_path, "w") as f:
-        _write_face(f.create_group("run"), upstream_a, rail_mask=upstream_mask, rule=rule)
+        _write_face(f.create_group("run"), upstream_a, rail_mask=upstream_mask,
+                    rule=rule, state_mask=upstream_state, state_rule=state_rule,
+                    state_factor=state_factor)
     with h5py.File(down_path, "w") as f:
-        _write_face(f.create_group("run"), downstream_a, rail_mask=downstream_mask)
+        _write_face(f.create_group("run"), downstream_a, rail_mask=downstream_mask,
+                    state_mask=downstream_state)
     with h5py.File(te_path, "w") as f:
         grp = f.create_group("experiment_sets/1")
         grp.create_dataset("x_cm", data=X_CM)
@@ -175,3 +191,96 @@ def test_rule_falls_back_when_no_product_states_one(tmp_path):
     up_path, down_path, _ = _make_inputs(tmp_path)
     with h5py.File(up_path, "r") as up, h5py.File(down_path, "r") as down:
         assert "predates the rail-mask marking" in _rail_rule(up["run"], down["run"])
+
+
+def test_no_state_mask_excludes_nothing_and_is_recorded(tmp_path):
+    results, prov = _run(tmp_path)
+
+    assert prov["state_cells_excluded"] == 0
+    assert prov["state_mask_upstream_present"] is False
+    assert prov["state_mask_downstream_present"] is False
+    # Absence records that no state was registered, not that the run is clean.
+    assert "no channel state is registered" in prov["state_exclusion_rule"]
+    assert prov["state_factors_disclosed_not_applied"] == ""
+    assert not results["state_excluded_cells"].any()
+
+
+def test_state_mask_drops_those_cells_on_both_faces(tmp_path):
+    mask = np.zeros((N_X, N_WINDOWS), dtype=bool)
+    mask[12:35, :] = True
+
+    masked, prov = _run(tmp_path, upstream_state=mask, state_rule=STATE_RULE_TEXT)
+    unmasked = _run(tmp_path)[0]
+
+    for name in MASKED_DATASETS:
+        assert np.isnan(masked[name][mask]).all(), name
+        assert np.array_equal(masked[name][~mask], unmasked[name][~mask]), name
+
+    assert np.array_equal(masked["state_excluded_cells"], mask)
+    assert prov["state_cells_excluded"] == int(mask.sum())
+    assert prov["state_cells_excluded_upstream"] == int(mask.sum())
+    assert prov["state_cells_excluded_downstream"] == 0
+    assert prov["state_exclusion_rule"] == STATE_RULE_TEXT
+    # The rail mask is a separate book and stays empty here.
+    assert prov["rail_cells_excluded"] == 0
+
+
+def test_rail_and_state_masks_stack(tmp_path):
+    rail = np.zeros((N_X, N_WINDOWS), dtype=bool)
+    rail[20, 1] = True
+    state = np.zeros((N_X, N_WINDOWS), dtype=bool)
+    state[12:35, :] = True
+    assert state[rail].all(), "the rail cell must lie inside the state range"
+
+    results, prov = _run(tmp_path, upstream_mask=rail, upstream_state=state)
+
+    assert prov["rail_cells_excluded"] == 1
+    assert prov["state_cells_excluded"] == int(state.sum())
+    assert prov["cells_excluded_any_mask"] == int((rail | state).sum())
+    assert prov["cells_kept_any_mask"] == int((~(rail | state)).sum())
+    assert np.array_equal(results["excluded_cells"], rail | state)
+    assert np.isnan(results["mach"][rail | state]).all()
+
+
+def test_state_mask_on_the_downstream_face_also_excludes(tmp_path):
+    mask = np.zeros((N_X, N_WINDOWS), dtype=bool)
+    mask[4, 2] = True
+
+    results, prov = _run(tmp_path, downstream_state=mask)
+
+    assert prov["state_mask_upstream_present"] is False
+    assert prov["state_mask_downstream_present"] is True
+    assert prov["state_cells_excluded"] == 1
+    assert np.isnan(results["mach"][4, 2])
+
+
+def test_state_factor_is_disclosed_and_not_applied(tmp_path):
+    mask = np.zeros((N_X, N_WINDOWS), dtype=bool)
+    mask[12:35, :] = True
+
+    masked, prov = _run(tmp_path, upstream_state=mask, state_factor=1.76)
+    unmasked = _run(tmp_path)[0]
+
+    assert prov["state_factors_disclosed_not_applied"] == "43:1.76"
+    # Disclosure only: no surviving value is scaled by the factor.
+    assert np.array_equal(
+        masked["isat_upstream_a"], unmasked["isat_upstream_a"]
+    )
+    assert np.array_equal(
+        masked["mach"][~mask], unmasked["mach"][~mask]
+    )
+
+
+def test_wrong_shaped_state_mask_is_refused(tmp_path):
+    up_path, _, _ = _make_inputs(
+        tmp_path, upstream_state=np.zeros((N_X, N_WINDOWS), dtype=bool)
+    )
+    with h5py.File(up_path, "r") as f:
+        with pytest.raises(ValueError, match="per \\(position, dead-time window\\)"):
+            _face_state_mask(f["run"], (N_X, N_WINDOWS + 1))
+
+
+def test_state_rule_falls_back_when_no_product_states_one(tmp_path):
+    up_path, down_path, _ = _make_inputs(tmp_path)
+    with h5py.File(up_path, "r") as up, h5py.File(down_path, "r") as down:
+        assert "no channel state is registered" in _state_rule(up["run"], down["run"])
