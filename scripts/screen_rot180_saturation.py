@@ -19,60 +19,43 @@ both Langmuir current channels:
   * the same two quantities restricted to the 14-19 ms plateau cycles.
 
 Dead-time windows use the same CLIP_S = 10 us as scripts/plot_isat_profiles.py.
+
+The rail counting itself is ``bapsf_lapd.rail_screen.screen_cells``, which
+scripts/annotate_rail_mask.py calls too; ``screen`` adds only the flat-top mass
+at the run's own observed extremes, which no product attr carries.
 """
 import argparse
 import sys
 from pathlib import Path
-import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 from bapsf_lapd import LapdDataset, ChannelKind, effective_rotation_deg
-from bapsf_lapd.density import inter_sweep_sample_slices
-
-CLIP_S = 10e-6
-RAIL_LO, RAIL_HI = 0, 65535
-PLATEAU_MS = (14.0, 19.0)
-BATCH = 50
-
-
-def inter_sweep_times_s(sw):
-    return np.array([sw.t0_s + k * sw.tau_cycle_s
-                     + 0.5 * (sw.tau_ramp_s + sw.tau_cycle_s)
-                     for k in range(sw.n_cycles)])
+from bapsf_lapd.rail_screen import (
+    BATCH,
+    CLIP_S,
+    PLATEAU_MS,
+    RAIL_HI,
+    RAIL_LO,
+    screen_cells,
+)
 
 
 def screen(run, kind):
-    cfg = run.config
-    ch = cfg.channel(kind)
-    sw, acq = cfg.sweep, cfg.acquisition
-    dead = inter_sweep_sample_slices(sw, acq, clip_s=CLIP_S)
-    t_ms = inter_sweep_times_s(sw) * 1e3
-    plat = [k for k, t in enumerate(t_ms) if PLATEAU_MS[0] <= t <= PLATEAU_MS[1]]
-    dead_idx = np.concatenate([np.arange(s.start, s.stop) for s in dead])
-    plat_idx = np.concatenate([np.arange(dead[k].start, dead[k].stop) for k in plat])
+    """The shared rail screen for one channel, plus this script's flat-top mass.
 
-    n_all = n_dead = n_plat = 0
-    rail_all = rail_dead = rail_plat = 0
-    lo = 65535
-    hi = 0
+    ``at_lo``/``at_hi`` (and their plateau counterparts) count the dead-time
+    samples sitting exactly on the run's OWN observed extremes -- the flat-top
+    signature of a pin that is not at full scale -- which needs those extremes
+    first and so cannot be counted in the screen's own pass.
+    """
+    cells = screen_cells(run, kind)
+    dead_idx, plat_idx = cells["dead_idx"], cells["plateau_dead_idx"]
+    lo, hi = cells["code_lo"], cells["code_hi"]
+
+    at_lo = at_hi = at_lo_p = at_hi_p = 0
     with run.open() as h5:
-        d = h5[ch.hdf5_path]
-        n_rows = d.shape[0]
-        for start in range(0, n_rows, BATCH):
-            block = d[start:start + BATCH, :]
-            n_all += block.size
-            rail_all += int(((block == RAIL_LO) | (block == RAIL_HI)).sum())
-            lo = min(lo, int(block.min()))
-            hi = max(hi, int(block.max()))
-            dd = block[:, dead_idx]
-            n_dead += dd.size
-            rail_dead += int(((dd == RAIL_LO) | (dd == RAIL_HI)).sum())
-            pp = block[:, plat_idx]
-            n_plat += pp.size
-            rail_plat += int(((pp == RAIL_LO) | (pp == RAIL_HI)).sum())
-        # second pass for mass at the run's own observed extremes
-        at_lo = at_hi = at_lo_p = at_hi_p = 0
-        for start in range(0, n_rows, BATCH):
+        d = h5[run.config.channel(kind).hdf5_path]
+        for start in range(0, d.shape[0], BATCH):
             block = d[start:start + BATCH, :]
             dd = block[:, dead_idx]
             at_lo += int((dd == lo).sum())
@@ -81,10 +64,12 @@ def screen(run, kind):
             at_lo_p += int((pp == lo).sum())
             at_hi_p += int((pp == hi).sum())
     return dict(
-        n_all=n_all, rail_all=rail_all, n_dead=n_dead, rail_dead=rail_dead,
-        n_plat=n_plat, rail_plat=rail_plat, code_lo=lo, code_hi=hi,
+        n_all=cells["n_all"], rail_all=cells["rail_all"],
+        n_dead=cells["n_dead"], rail_dead=cells["rail_dead"],
+        n_plat=cells["n_plat"], rail_plat=cells["rail_plat"],
+        code_lo=lo, code_hi=hi,
         at_lo=at_lo, at_hi=at_hi, at_lo_p=at_lo_p, at_hi_p=at_hi_p,
-        plateau_cycles=(plat[0], plat[-1]), plateau_ms=(t_ms[plat[0]], t_ms[plat[-1]]),
+        plateau_cycles=cells["plateau_cycles"], plateau_ms=cells["plateau_ms"],
     )
 
 
