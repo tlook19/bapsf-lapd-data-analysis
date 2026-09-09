@@ -82,9 +82,8 @@ MACH_K_BRACKET: tuple[float, float] = (1.34, 1.74)
 #: by the rotation-pair read of the processed Mach product (plateau window
 #: 14–19 ms, x = 0, K = ``MACH_K``) over the nine valid ES1–ES3 port pairs.
 #: The pooled RMS is a spread over state: the state dependence is non-monotone
-#: in the ladder (smallest at ES2 at every port; the downstream-face wake
-#: asymmetry is largest at ES1 and shrinks toward ES3).  ES4 pairs are EXCLUDED
-#: from the statistic for
+#: in the ladder (per-set RMS 0.086 / 0.042 / 0.106 in M at ES1 / ES2 / ES3).
+#: ES4 pairs are EXCLUDED from the statistic for
 #: two reasons: the ES4 sweep face rests at −24 V between ramps (ES1–ES3 rest
 #: at −90 V), so every ES4 rot-pair half-difference carries a rest-bias
 #: convention term (ln 0.10–0.41, the Isweep face reading low) that the ES1–ES3
