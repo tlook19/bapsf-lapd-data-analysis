@@ -150,6 +150,15 @@ def _compare_dataset(
     name: str, placed: np.ndarray, new: np.ndarray, *, rtol: float
 ) -> Row:
     """Compare one dataset; float data is tolerated, everything else is not."""
+    if placed.dtype.kind == "O":
+        # Variable-length strings arrive as an object array, whose buffer holds
+        # pointers rather than characters; comparing its bytes would compare
+        # addresses.  The values themselves are what identity means here.
+        identical = bool(np.array_equal(placed, new))
+        if not identical:
+            return Row(name, "text", False, float("nan"), "NOT identical")
+        return Row(name, "text", True, 0.0)
+
     byte_identical = placed.tobytes() == new.tobytes()
     if placed.dtype.kind != "f":
         kind = {"i": "int", "u": "int", "b": "bool"}.get(placed.dtype.kind, "text")
@@ -328,6 +337,13 @@ def main() -> None:
                         help="the placed band HDF5 product to check")
     parser.add_argument("--summary", type=Path, default=PLACED_SUMMARY,
                         help="the placed per-cell CSV to check")
+    parser.add_argument("--metadata", type=Path, default=PLACED_METADATA,
+                        help=(
+                            "the placed metadata JSON.  Its presence is required "
+                            "-- it is part of the product -- but it is not "
+                            "compared: it carries created_utc and the vintage "
+                            "block, which differ between two runs by construction"
+                        ))
     parser.add_argument("--work-dir", type=Path, default=None,
                         help=(
                             "per-(set, port) checkpoints to regenerate from. "
@@ -339,7 +355,11 @@ def main() -> None:
                         help=f"relative tolerance on the float data (default {DEFAULT_RTOL:g})")
     args = parser.parse_args()
 
-    missing = [path for path in (args.output, args.summary) if not path.exists()]
+    missing = [
+        path
+        for path in (args.output, args.summary, args.metadata)
+        if not path.exists()
+    ]
     if missing:
         print("missing placed product: " + ", ".join(str(path) for path in missing))
         raise SystemExit(2)
