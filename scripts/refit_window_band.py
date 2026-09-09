@@ -32,10 +32,12 @@ which is the cell set a port's own ``T_e`` row is built from, and ``--sets`` /
 those defaults to the band pass described above, so the default invocation is
 the D-i product and nothing else.
 
-A pass that is NOT the band pass must be given all three output paths, because
+A pass that moves ANY of those four flags -- ``--cells``, ``--sets``,
+``--ports``, ``--rotation-deg`` -- must be given all three output paths, because
 the default ones are the band products ``fit_te_spatial.py`` consumes and
 nothing in those files would let it notice the substitution; the pass REFUSES
-to start otherwise.  So a core pass reads, in full::
+to start otherwise.  Its checkpoints follow ``--output`` rather than staying in
+``processed/``.  So a core pass reads, in full::
 
   MPLCONFIGDIR=.matplotlib python scripts/refit_window_band.py \
       --cells core --sets 4 --ports 21,29,41 --rotation-deg 0 \
@@ -106,7 +108,9 @@ _pls = _rw.pls
 OUTPUT_HDF5 = ROOT / "processed" / "window_refit_band.hdf5"
 OUTPUT_SUMMARY = ROOT / "processed" / "window_refit_band_summary.csv"
 OUTPUT_METADATA = ROOT / "processed" / "window_refit_band_metadata.json"
-WORK_DIR = ROOT / "processed" / "window_refit_band_work"
+#: Checkpoint directory name, resolved beside whichever product is written.
+WORK_DIR_NAME = "window_refit_band_work"
+WORK_DIR = ROOT / "processed" / WORK_DIR_NAME
 
 SETS = (1, 2)
 PLATEAU_MS = (10.0, 19.5)
@@ -318,34 +322,50 @@ def refit_port(
 
 
 def _port_summary(record: dict) -> dict:
-    """Return the per-port in-band statistics and the criterion verdict."""
+    """Return the per-port statistics and the criterion verdict.
+
+    The band pass reports its in-band statistics and the trust-to-aperture
+    adjudication; the core pass reports the SAME statistics over its own
+    non-``x = 0`` cells, but under ``core_`` names, because a reader who found
+    ``in_band_median_dln`` in a core product would reasonably take it for the
+    band's.  Neither set of names appears in the other mode.
+    """
     is_x0 = np.asarray(record["is_x0"], dtype=bool)
     dln = np.asarray(record["dln_te_window"], dtype=float)
-    in_band = dln[~is_x0]
+    off_x0 = dln[~is_x0]
     x0 = float(dln[is_x0][0])
-    median = float(np.nanmedian(in_band))
-    summary = {
+    median = float(np.nanmedian(off_x0))
+    common = {
         "set_id": int(record["sid"]),
         "port": int(record["port"]),
         "run_id": str(record["run_id"]),
         "n_plateau_cycles": int(record["n_plateau"]),
-        "in_band_cells": int(in_band.size),
-        "in_band_median_dln": median,
-        "in_band_upper_quartile_dln": float(np.nanpercentile(in_band, 75)),
-        "in_band_max_dln": float(np.nanmax(in_band)),
-        "in_band_fraction_at_or_above_criterion": float(
-            np.mean(in_band >= CRITERION_DLN)
-        ),
+    }
+    statistics = {
+        "cells": int(off_x0.size),
+        "median_dln": median,
+        "upper_quartile_dln": float(np.nanpercentile(off_x0, 75)),
+        "max_dln": float(np.nanmax(off_x0)),
+        "fraction_at_or_above_criterion": float(np.mean(off_x0 >= CRITERION_DLN)),
+    }
+    tail = {
         "x0_control_dln": x0,
         "criterion_dln": CRITERION_DLN,
-        "passes_criterion": bool(median < CRITERION_DLN),
         "x0_control_passes_criterion": bool(x0 < CRITERION_DLN),
-        "trust_to_aperture_adopted": bool(
-            (int(record["sid"]), int(record["port"])) in ADOPTED_SET_PORTS
-        ),
     }
+
     if str(record.get("cells_mode", "band")) != "core":
-        return summary
+        return {
+            **common,
+            **{f"in_band_{key}": value for key, value in statistics.items()},
+            "x0_control_dln": tail["x0_control_dln"],
+            "criterion_dln": tail["criterion_dln"],
+            "passes_criterion": bool(median < CRITERION_DLN),
+            "x0_control_passes_criterion": tail["x0_control_passes_criterion"],
+            "trust_to_aperture_adopted": bool(
+                (int(record["sid"]), int(record["port"])) in ADOPTED_SET_PORTS
+            ),
+        }
 
     # The core pass reports the port's own T_e, so it carries the cell count
     # the criterion admits and the mean over exactly those cells.  A port with
@@ -354,33 +374,26 @@ def _port_summary(record: dict) -> dict:
         [window_family_median(grid) for grid in np.asarray(record["med_grids"])]
     )
     passes = np.isfinite(dln) & (dln < CRITERION_DLN)
-    summary["core_cells"] = int(dln.size)
-    summary["core_cells_below_criterion"] = int(passes.sum())
-    summary["core_mean_te_ev"] = (
-        float(np.nanmean(family_median[passes])) if passes.any() else float("nan")
-    )
-    summary["core_mean_te_default_window_ev"] = (
-        float(np.nanmean(np.asarray(record["te_default_med"])[passes]))
-        if passes.any()
-        else float("nan")
-    )
-    summary["core_max_cm"] = CORE_MAX_CM
-    return summary
-
-
-#: Per-port summary fields that mean something only for the band pass: the
-#: band statistics themselves, the criterion verdict built from their median,
-#: and the trust-to-aperture verdict, which is a band adjudication.  The core
-#: metadata drops them rather than restating them under band names.
-_BAND_ONLY_SUMMARY_FIELDS = (
-    "in_band_cells",
-    "in_band_median_dln",
-    "in_band_upper_quartile_dln",
-    "in_band_max_dln",
-    "in_band_fraction_at_or_above_criterion",
-    "passes_criterion",
-    "trust_to_aperture_adopted",
-)
+    n_below = int(passes.sum())
+    return {
+        **common,
+        "cells_mode": "core",
+        "core_max_cm": CORE_MAX_CM,
+        "core_cells": int(dln.size),
+        "core_cells_below_criterion": n_below,
+        "core_gate_min_cells": CORE_GATE_MIN_CELLS,
+        "core_gate_passes": bool(n_below >= CORE_GATE_MIN_CELLS),
+        "core_mean_te_ev": (
+            float(np.nanmean(family_median[passes])) if passes.any() else float("nan")
+        ),
+        "core_mean_te_default_window_ev": (
+            float(np.nanmean(np.asarray(record["te_default_med"])[passes]))
+            if passes.any()
+            else float("nan")
+        ),
+        **{f"core_off_x0_{key}": value for key, value in statistics.items()},
+        **tail,
+    }
 
 
 def _core_metadata(
@@ -399,22 +412,17 @@ def _core_metadata(
     carries ``null`` where its ``T_e`` would be, rather than the ``NaN``
     literal that would make the file invalid JSON to a strict parser.
     """
-    ports = []
-    for summary in summaries:
-        entry = {
+    ports = [
+        {
             key: (
                 None
                 if isinstance(value, float) and not np.isfinite(value)
                 else value
             )
             for key, value in summary.items()
-            if key not in _BAND_ONLY_SUMMARY_FIELDS
         }
-        entry["core_gate_passes"] = bool(
-            summary["core_cells_below_criterion"]
-            >= core_mode["core_gate_min_cells"]
-        )
-        ports.append(entry)
+        for summary in summaries
+    ]
     return {
         "product": "window_refit_core",
         "created_utc": created,
@@ -467,13 +475,19 @@ def write_product(
 
     hdf5_path.parent.mkdir(parents=True, exist_ok=True)
     with h5py.File(hdf5_path, "w") as hdf:
-        hdf.attrs["protocol"] = PROTOCOL
-        hdf.attrs["adjudication"] = ADJUDICATION
+        if core_mode is None:
+            hdf.attrs["protocol"] = PROTOCOL
+            hdf.attrs["adjudication"] = ADJUDICATION
+        else:
+            # No band protocol, no band adjudication and no band edges: this
+            # file is not a band product and must not read as one.
+            hdf.attrs["protocol"] = CORE_PROTOCOL
         hdf.attrs["lineage"] = LINEAGE
         hdf.attrs["generating_script"] = "scripts/refit_window_band.py"
         hdf.attrs["criterion_dln_te_window"] = CRITERION_DLN
-        hdf.attrs["band_min_cm"] = BAND_MIN_CM
-        hdf.attrs["band_max_cm"] = BAND_MAX_CM
+        if core_mode is None:
+            hdf.attrs["band_min_cm"] = BAND_MIN_CM
+            hdf.attrs["band_max_cm"] = BAND_MAX_CM
         hdf.attrs["plateau_ms"] = np.asarray(PLATEAU_MS, dtype=np.float64)
         hdf.attrs["clip_us"] = CLIP_US
         hdf.attrs["filter_order"] = FILTER_ORDER
@@ -483,7 +497,6 @@ def write_product(
         hdf.attrs["created_utc"] = created
         if core_mode is not None:
             hdf.attrs["cells_mode"] = "core"
-            hdf.attrs["core_protocol"] = CORE_PROTOCOL
             hdf.attrs["core_max_cm"] = core_mode["core_max_cm"]
             hdf.attrs["core_gate_min_cells"] = core_mode["core_gate_min_cells"]
             hdf.attrs["rotation_deg"] = core_mode["rotation_deg"]
@@ -504,7 +517,6 @@ def write_product(
             group.create_dataset("n_sweeps", data=np.asarray(record["n_sweeps"]))
             group.create_dataset("te_window_ev", data=record["med_grids"])
             if str(record.get("cells_mode", "band")) == "core":
-                group.attrs["cells_mode"] = "core"
                 group.create_dataset(
                     "te_window_family_median_ev",
                     data=np.array(
@@ -601,6 +613,7 @@ def refuse_band_output_paths(
     *,
     cells: str,
     sets,
+    ports,
     rotation_deg: float,
     output: Path,
     summary: Path,
@@ -611,10 +624,11 @@ def refuse_band_output_paths(
     ``processed/window_refit_band_summary.csv`` and its metadata are TRACKED
     and are read by ``fit_te_spatial.py`` to mark semi-quantitative cells; its
     metric-identity guard compares only the window family and the plateau
-    window, all of which a core or rot-180 pass shares, so a substituted file
-    would be consumed silently.  A pass that changes the cell set, the rotation
-    or the sets therefore has to name its own output paths, and is refused at
-    argument resolution -- before any fitting -- if it has not.
+    window, all of which every pass here shares, so a substituted file would be
+    consumed silently.  A pass that moves ANY of the four run-selecting flags
+    -- ``--cells``, ``--sets``, ``--ports``, ``--rotation-deg`` -- therefore has
+    to name its own output paths, and is refused at argument resolution, before
+    any fitting, if it has not.
     """
     requested = []
     if cells != "band":
@@ -623,6 +637,10 @@ def refuse_band_output_paths(
         requested.append(f"--rotation-deg {float(rotation_deg):g}")
     if tuple(sets) != tuple(SETS):
         requested.append("--sets " + ",".join(str(int(s)) for s in sets))
+    if ports is not None:
+        # A port subset is as much a substitution as a different cell set: the
+        # product would carry fewer ports under the same file name.
+        requested.append("--ports " + ",".join(str(int(p)) for p in ports))
     if not requested:
         return
 
@@ -648,6 +666,20 @@ def refuse_band_output_paths(
         "it could not tell the substitution from the real thing.  Pass "
         f"{' and '.join(still_default)} explicitly, outside processed/."
     )
+
+
+def resolve_work_dir(work_dir: Path | None, output: Path) -> Path:
+    """Return where the per-(set, port) checkpoints live.
+
+    Unset, they sit beside the product they belong to, so a pass sent outside
+    ``processed/`` -- as the refusal above requires of every non-band pass --
+    leaves nothing behind inside it.  The default band invocation is unaffected:
+    its output is already in ``processed/``, so the work directory resolves to
+    the one it has always used.
+    """
+    if work_dir is not None:
+        return Path(work_dir)
+    return Path(output).parent / WORK_DIR_NAME
 
 
 def _comma_ints(text: str) -> tuple[int, ...]:
@@ -697,6 +729,13 @@ def _print_core_report(records: list[dict], summaries: list[dict]) -> None:
         print(
             f"  cells below criterion: {summary['core_cells_below_criterion']}"
             f" / {summary['core_cells']};  {reading}"
+        )
+        print(
+            f"  off-x0 median dln {summary['core_off_x0_median_dln']:.3f}, "
+            f"max {summary['core_off_x0_max_dln']:.3f}, "
+            f"fraction >= criterion "
+            f"{summary['core_off_x0_fraction_at_or_above_criterion']:.2f}; "
+            f"x = 0 control dln {summary['x0_control_dln']:.3f}"
         )
 
     all_ports = {summary["port"]: summary for summary in summaries}
@@ -750,8 +789,11 @@ def main() -> None:
     parser.add_argument(
         "--work-dir",
         type=Path,
-        default=WORK_DIR,
-        help="per-(set, port) npz checkpoints; an existing checkpoint is reused",
+        default=None,
+        help=(
+            "per-(set, port) npz checkpoints; an existing checkpoint is reused. "
+            f"Default: {WORK_DIR_NAME}/ beside --output"
+        ),
     )
     parser.add_argument("--plateau-ms", nargs=2, type=float, default=PLATEAU_MS)
     parser.add_argument("--clip-us", type=float, default=CLIP_US)
@@ -784,11 +826,13 @@ def main() -> None:
     refuse_band_output_paths(
         cells=args.cells,
         sets=args.sets,
+        ports=args.ports,
         rotation_deg=args.rotation_deg,
         output=args.output,
         summary=args.summary,
         metadata=args.metadata,
     )
+    args.work_dir = resolve_work_dir(args.work_dir, args.output)
 
     args.work_dir.mkdir(parents=True, exist_ok=True)
     with h5py.File(_rw.SWEEPS_H5, "r") as hdf:
@@ -858,6 +902,10 @@ def main() -> None:
         core_mode=core_mode,
     )
 
+    if args.cells == "core":
+        _print_core_report(records, summaries)
+        return
+
     print(
         f"\n{'set':>3} {'port':>5} {'median':>7} {'UQ':>7} {'max':>7} "
         f"{'frac>=c':>8} {'x0':>7}  verdict"
@@ -874,9 +922,6 @@ def main() -> None:
             f"{summary['in_band_fraction_at_or_above_criterion']:8.2f} "
             f"{summary['x0_control_dln']:7.3f}  {verdict}"
         )
-
-    if args.cells == "core":
-        _print_core_report(records, summaries)
 
 
 if __name__ == "__main__":

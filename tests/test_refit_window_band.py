@@ -169,19 +169,23 @@ from scripts.refit_window_band import (  # noqa: E402
 BAND_DEFAULTS = dict(
     output=OUTPUT_HDF5, summary=OUTPUT_SUMMARY, metadata=OUTPUT_METADATA
 )
+#: The band pass selects every port of its sets, which argparse spells None.
+BAND_PORTS = None
 
 
 def test_the_band_pass_resolves_against_its_own_defaults():
     # The default invocation is the one that MAY write the band products.
     refuse_band_output_paths(
-        cells="band", sets=SETS, rotation_deg=0.0, **BAND_DEFAULTS
+        cells="band", sets=SETS, ports=BAND_PORTS, rotation_deg=0.0,
+        **BAND_DEFAULTS
     )
 
 
 def test_a_core_pass_is_refused_at_the_band_output_paths():
     with pytest.raises(ValueError) as excinfo:
         refuse_band_output_paths(
-            cells="core", sets=SETS, rotation_deg=0.0, **BAND_DEFAULTS
+            cells="core", sets=SETS, ports=BAND_PORTS, rotation_deg=0.0,
+            **BAND_DEFAULTS
         )
     message = str(excinfo.value)
     assert "--cells core" in message
@@ -194,11 +198,13 @@ def test_a_core_pass_is_refused_at_the_band_output_paths():
 def test_a_rot180_pass_and_a_non_band_set_list_are_refused_too():
     with pytest.raises(ValueError, match="--rotation-deg 180"):
         refuse_band_output_paths(
-            cells="band", sets=SETS, rotation_deg=180.0, **BAND_DEFAULTS
+            cells="band", sets=SETS, ports=BAND_PORTS, rotation_deg=180.0,
+            **BAND_DEFAULTS
         )
     with pytest.raises(ValueError, match="--sets 4"):
         refuse_band_output_paths(
-            cells="band", sets=(4,), rotation_deg=0.0, **BAND_DEFAULTS
+            cells="band", sets=(4,), ports=BAND_PORTS, rotation_deg=0.0,
+            **BAND_DEFAULTS
         )
 
 
@@ -207,6 +213,7 @@ def test_the_refusal_names_only_the_paths_still_at_their_band_default(tmp_path):
         refuse_band_output_paths(
             cells="core",
             sets=(4,),
+            ports=BAND_PORTS,
             rotation_deg=0.0,
             output=tmp_path / "core.hdf5",
             summary=OUTPUT_SUMMARY,
@@ -222,6 +229,7 @@ def test_a_fully_redirected_core_pass_resolves(tmp_path):
     refuse_band_output_paths(
         cells="core",
         sets=(4,),
+        ports=(21,),
         rotation_deg=180.0,
         output=tmp_path / "core.hdf5",
         summary=tmp_path / "core.csv",
@@ -244,32 +252,23 @@ from scripts.refit_window_band import (  # noqa: E402
 
 
 def _core_summary(port, below):
-    return {
-        "set_id": 4,
-        "port": port,
-        "run_id": "42",
-        "n_plateau_cycles": 10,
-        "in_band_cells": 20,
-        "in_band_median_dln": 0.4,
-        "in_band_upper_quartile_dln": 0.5,
-        "in_band_max_dln": 1.0,
-        "in_band_fraction_at_or_above_criterion": 0.25,
-        "x0_control_dln": 0.44,
-        "criterion_dln": 0.5,
-        "passes_criterion": True,
-        "x0_control_passes_criterion": True,
-        "trust_to_aperture_adopted": False,
-        "core_cells": 21,
-        "core_cells_below_criterion": below,
-        "core_mean_te_ev": 0.66,
-        "core_mean_te_default_window_ev": 0.70,
-        "core_max_cm": 10.0,
-    }
+    """The real core-mode summary, so the tests cannot drift from the writer."""
+    from scripts.refit_window_band import _port_summary
+
+    record = _one_record("core")
+    record["port"] = port
+    dln = (
+        np.array([0.30, 0.44, 0.35, 0.40])
+        if below
+        else np.array([0.90, 0.95, 0.92, 0.97])
+    )
+    record["dln_te_window"] = dln
+    return _port_summary(record)
 
 
 def _built_core_metadata(**overrides):
     summaries = overrides.pop(
-        "summaries", [_core_summary(21, 16), _core_summary(29, 0)]
+        "summaries", [_core_summary(21, True), _core_summary(29, False)]
     )
     return _core_metadata(
         summaries,
@@ -321,16 +320,38 @@ def test_core_metadata_records_the_gate_per_port():
     assert ports[29]["core_cells_below_criterion"] == 0
 
 
+def test_the_core_summary_names_its_statistics_after_its_own_cells():
+    # The same statistic the band pass calls in_band_median_dln is a CORE
+    # statistic here, so it may not wear the band's name.
+    summary = _core_summary(21, True)
+    assert summary["cells_mode"] == "core"
+    assert "core_off_x0_median_dln" in summary
+    assert not any(key.startswith("in_band") for key in summary)
+    assert "trust_to_aperture_adopted" not in summary
+    assert "passes_criterion" not in summary
+
+
+def test_the_band_summary_keeps_its_own_names():
+    from scripts.refit_window_band import _port_summary
+
+    summary = _port_summary(_one_record("band"))
+    assert "in_band_median_dln" in summary
+    assert summary["trust_to_aperture_adopted"] is False
+    assert "passes_criterion" in summary
+    assert not any(key.startswith("core_") for key in summary)
+    assert "cells_mode" not in summary
+
+
 def _one_record(cells_mode):
     """A minimal two-cell record the writer accepts, in either cell mode."""
     record = dict(
-        cells=np.array([0, 1]),
-        x_cm=np.array([-1.0, 0.0]),
-        is_x0=np.array([False, True]),
-        dln_te_window=np.array([0.30, 0.44]),
-        te_default_med=np.array([0.70, 0.74]),
-        n_sweeps=np.array([200, 200]),
-        med_grids=np.full((2, 5, 5), 0.66),
+        cells=np.array([0, 1, 2, 3]),
+        x_cm=np.array([-2.0, -1.0, 0.0, 1.0]),
+        is_x0=np.array([False, False, True, False]),
+        dln_te_window=np.array([0.30, 0.44, 0.35, 0.40]),
+        te_default_med=np.array([0.70, 0.72, 0.74, 0.71]),
+        n_sweeps=np.array([200, 200, 200, 200]),
+        med_grids=np.full((4, 5, 5), 0.66),
         run_id="42",
         sid=4,
         port=21,
@@ -363,7 +384,7 @@ def _write_both_modes(tmp_path):
         metadata_path = tmp_path / f"{mode}.json"
         write_product(
             [_one_record(mode)],
-            np.array([-1.0, 0.0]),
+            np.array([-2.0, -1.0, 0.0, 1.0]),
             hdf5_path=tmp_path / f"{mode}.hdf5",
             summary_path=tmp_path / f"{mode}.csv",
             metadata_path=metadata_path,
@@ -399,12 +420,28 @@ def test_the_core_product_marks_its_cell_mode_in_the_hdf5_root(tmp_path):
     _write_both_modes(tmp_path)
     with h5py.File(tmp_path / "core.hdf5", "r") as core:
         assert core.attrs["cells_mode"] == "core"
-        assert core.attrs["core_protocol"] == CORE_PROTOCOL
+        # The root protocol IS the core protocol, and the band's adjudication
+        # and edges are absent -- this file may not read as a band product.
+        assert core.attrs["protocol"] == CORE_PROTOCOL
+        assert "adjudication" not in core.attrs
+        assert "band_min_cm" not in core.attrs
+        assert "band_max_cm" not in core.attrs
         assert core.attrs["core_max_cm"] == 10.0
         assert core.attrs["rotation_deg"] == 0.0
+        group = core["set4/port21"]
+        assert group.attrs["cells_mode"] == "core"
+        assert "core_off_x0_median_dln" in group.attrs
+        assert not any(key.startswith("in_band") for key in group.attrs)
+        assert "trust_to_aperture_adopted" not in group.attrs
     with h5py.File(tmp_path / "band.hdf5", "r") as band:
+        assert band.attrs["protocol"] == PROTOCOL
+        assert band.attrs["adjudication"] == ADJUDICATION
+        assert "band_min_cm" in band.attrs and "band_max_cm" in band.attrs
         assert "cells_mode" not in band.attrs
         assert "core_protocol" not in band.attrs
+        band_group = band["set4/port21"]
+        assert "in_band_median_dln" in band_group.attrs
+        assert not any(key.startswith("core_") for key in band_group.attrs)
 
 
 def test_a_refused_port_carries_null_rather_than_a_nan_literal(tmp_path):
@@ -424,3 +461,62 @@ def test_a_refused_port_carries_null_rather_than_a_nan_literal(tmp_path):
 
 def _no_constants(name):
     raise AssertionError(f"non-standard JSON constant in the product: {name}")
+
+
+def test_a_port_subset_alone_is_refused_at_the_band_output_paths():
+    # A port subset changes what the product covers without changing anything
+    # fit_te_spatial.py's metric-identity guard inspects, so it is the most
+    # invisible substitution of the four and must refuse like the rest.
+    with pytest.raises(ValueError) as excinfo:
+        refuse_band_output_paths(
+            cells="band",
+            sets=SETS,
+            ports=(21,),
+            rotation_deg=0.0,
+            **BAND_DEFAULTS,
+        )
+    message = str(excinfo.value)
+    assert "--ports 21" in message
+    for flag in ("--output", "--summary", "--metadata"):
+        assert flag in message
+
+
+def test_every_run_selecting_flag_refuses_on_its_own():
+    selections = (
+        {"cells": "core"},
+        {"sets": (4,)},
+        {"ports": (21, 29)},
+        {"rotation_deg": 180.0},
+    )
+    band = dict(cells="band", sets=SETS, ports=BAND_PORTS, rotation_deg=0.0)
+    for selection in selections:
+        with pytest.raises(ValueError):
+            refuse_band_output_paths(**(band | selection), **BAND_DEFAULTS)
+
+
+# --------------------------------------------------------------------------
+# checkpoints follow the product they belong to
+# --------------------------------------------------------------------------
+
+
+from scripts.refit_window_band import (  # noqa: E402
+    WORK_DIR,
+    WORK_DIR_NAME,
+    resolve_work_dir,
+)
+
+
+def test_the_band_pass_keeps_its_historical_work_directory():
+    assert resolve_work_dir(None, OUTPUT_HDF5) == WORK_DIR
+
+
+def test_a_redirected_pass_leaves_no_checkpoint_inside_processed(tmp_path):
+    resolved = resolve_work_dir(None, tmp_path / "core.hdf5")
+    assert resolved == tmp_path / WORK_DIR_NAME
+    assert "processed" not in resolved.parts
+
+
+def test_an_explicit_work_dir_still_wins(tmp_path):
+    assert resolve_work_dir(tmp_path / "elsewhere", OUTPUT_HDF5) == (
+        tmp_path / "elsewhere"
+    )
