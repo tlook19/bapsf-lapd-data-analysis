@@ -6,11 +6,11 @@ placed inside and outside of by hand, and the two area-key conventions compared
 against each other rather than against a run.  Nothing reads a data file, so
 these run in a checkout with no products placed.
 
-One test carries a disclosure rather than an assertion of correctness: the area
-key this instrument uses for the ISAT face and the key
-``density_area_key_for_deadtime_source`` returns for it disagree at ports 29 and
-41, and the test pins that disagreement so a later change to either side is
-visible instead of silent.
+The area key this instrument uses for the ISAT face and the key
+``density_area_key_for_deadtime_source`` returns for it once disagreed at ports
+21/29/41; the helper is electrode-keyed now, and the two agree at every port and
+in both rotations.  One test pins that agreement so a later change to either
+side is visible instead of silent.
 """
 
 import numpy as np
@@ -50,30 +50,24 @@ def test_area_key_follows_the_collecting_electrode():
         area_key_for_electrode(ChannelKind.V_SWEEP)
 
 
-def test_the_disclosed_divergence_from_the_deadtime_source_helper_is_pinned():
-    """The helper agrees at port 11 and disagrees at the ports built here.
+def test_the_deadtime_source_helper_agrees_at_every_port_built_here():
+    """The helper and this instrument name the same electrode area.
 
-    ``density_area_key_for_deadtime_source`` special-cases port 11 with an ISAT
-    source and answers ``ap_L_cm2`` everywhere else, so it names the I_SWEEP
-    face's area for the ISAT face at ports 21/29/41.  This instrument uses the
-    collecting electrode's own area instead.  Pinned, not corrected: changing
-    the helper is a separate, registered step.
+    ``density_area_key_for_deadtime_source`` used to special-case port 11 with
+    an ISAT source and answer ``ap_L_cm2`` everywhere else, which named the
+    I_SWEEP face's area for the ISAT face at ports 21/29/41.  It is keyed on the
+    collecting electrode now, so it returns what this instrument uses at every
+    port, port 11 included.
     """
-    assert (
-        density_area_key_for_deadtime_source(11, ChannelKind.ISAT)
-        == area_key_for_electrode(ChannelKind.ISAT)
-        == "ap_R_cm2"
-    )
-    for port in (21, 29, 41):
-        assert density_area_key_for_deadtime_source(port, ChannelKind.ISAT) == "ap_L_cm2"
-        assert area_key_for_electrode(ChannelKind.ISAT) == "ap_R_cm2"
+    for port in (11, 21, 29, 41, 50):
+        for channel in (ChannelKind.ISAT, ChannelKind.I_SWEEP):
+            assert (
+                density_area_key_for_deadtime_source(port, channel)
+                == area_key_for_electrode(channel)
+            )
 
-    # The I_SWEEP face is the one case the two conventions always agree on.
-    for port in (21, 29, 41):
-        assert (
-            density_area_key_for_deadtime_source(port, ChannelKind.I_SWEEP)
-            == area_key_for_electrode(ChannelKind.I_SWEEP)
-        )
+    assert area_key_for_electrode(ChannelKind.ISAT) == "ap_R_cm2"
+    assert area_key_for_electrode(ChannelKind.I_SWEEP) == "ap_L_cm2"
 
 
 def test_plateau_window_selects_the_four_scoring_windows():

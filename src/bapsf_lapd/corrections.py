@@ -55,7 +55,26 @@ def density_area_key_for_deadtime_source(
     port: int | None,
     source_channel: ChannelKind,
 ) -> str:
-    """Return the calibration TOML area key matching a dead-time source face."""
-    if int(port or 0) == 11 and source_channel == ChannelKind.ISAT:
+    """Return the calibration TOML area key of the electrode that collected.
+
+    The face areas are keyed by ELECTRODE, not by which face happened to look
+    upstream: ``scripts/calibrate_probe_areas.py`` accumulates ``ap_R_m2`` from
+    the rot-180 ISAT product and ``ap_L_m2`` from the rot-0 I_SWEEP product, so
+    ``ap_R_cm2`` is the ISAT electrode's area and ``ap_L_cm2`` the I_SWEEP
+    electrode's.  A density built from a dead-time current reproduces the
+    calibration that defined the areas only under this assignment, and it holds
+    at every port and in both rotations.
+
+    ``port`` is accepted for call-site symmetry with ``effective_deadtime_source``
+    and does not enter the answer.  The port-11 wiring-swap run, whose upstream
+    row sources ISAT, still gets ``ap_R_cm2`` because ISAT is its collecting
+    channel.
+
+    Raises ``ValueError`` for a channel that has no calibrated face area.
+    """
+    del port  # the collecting electrode, not the port, sets the area
+    if source_channel == ChannelKind.ISAT:
         return "ap_R_cm2"
-    return "ap_L_cm2"
+    if source_channel == ChannelKind.I_SWEEP:
+        return "ap_L_cm2"
+    raise ValueError(f"no calibrated face area for channel {source_channel!r}")

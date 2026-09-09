@@ -53,15 +53,15 @@ with
          product -- so it is the only key assignment under which a density built
          from these rows reproduces the calibration that defined the areas.
 
-         DISCLOSED DIVERGENCE.  ``density_area_key_for_deadtime_source`` in
-         ``src/bapsf_lapd/corrections.py`` returns ``ap_R_cm2`` only for port 11
-         with an ISAT source and ``ap_L_cm2`` otherwise, so it names ``ap_L_cm2``
-         for the ISAT face at ports 21/29/41, and the rot-180 ISAT product stamps
-         that answer into each run's ``density_area_key`` attribute.  That helper
-         was written for the I_SWEEP-sourced chain, where the only ISAT source is
-         the port-11 wiring swap; it does not generalise to a product whose
-         source is ISAT at every run.  Both readings are printed for every row so
-         the choice is auditable, and neither is hidden.
+         ``density_area_key_for_deadtime_source`` in
+         ``src/bapsf_lapd/corrections.py`` now answers by the same electrode
+         rule, so the two agree at every port and in both rotations.  A rot-180
+         ISAT product PLACED BEFORE that change stamps the older port-keyed
+         answer (``ap_L_cm2`` for the ISAT face at ports 21/29/41) into each
+         run's ``density_area_key`` attribute, and a stale stamp is not what
+         this instrument builds its density from.  Both readings are printed for
+         every row, so a product that predates the fix is visible rather than
+         silently trusted.
 
   window the SCORING PLATEAU WINDOW, 15.0-19.5 ms, which is
          ``RAW_PLATEAU_WINDOW_MS`` in ``scripts/export_es1_sim1d_overlay.py`` and
@@ -408,7 +408,7 @@ def build_port(port: int, repo: Path, window_ms=PLATEAU_MS) -> dict:
     areas = load_areas_cm2(repo / AREA_TOML)[probe]
     area_isat_m2 = areas[area_key_for_electrode(ChannelKind.ISAT)] * 1e-4
     area_isweep_m2 = areas[area_key_for_electrode(ChannelKind.I_SWEEP)] * 1e-4
-    # The area key the placed products stamp, for the disclosed divergence.
+    # The area key the placed product stamps, against the helper's live answer.
     stamped_isat = str(isat["attrs"].get("density_area_key", ""))
     helper_isat = density_area_key_for_deadtime_source(port, ChannelKind.ISAT)
 
@@ -572,9 +572,14 @@ def report_port(record: dict, repo: Path) -> list[dict]:
           f"rot-180 ISAT run {record['run_isat']}   probe {record['probe']}")
     print(f"  areas      ISAT {record['area_isat_key']} = {record['area_isat_cm2']:.6f} cm^2   "
           f"I_SWEEP {record['area_isweep_key']} = {record['area_isweep_cm2']:.6f} cm^2")
-    print(f"  disclosed  the placed product stamps density_area_key = "
+    stamp_state = (
+        "agrees" if record["stamped_isat_key"] == record["helper_isat_key"]
+        else "PREDATES the electrode-keyed helper"
+    )
+    print(f"  stamp      the placed product stamps density_area_key = "
           f"'{record['stamped_isat_key']}' for the ISAT face and the helper returns "
-          f"'{record['helper_isat_key']}'; the alternate row under that key is printed below")
+          f"'{record['helper_isat_key']}' ({stamp_state}); the alternate row under "
+          f"the stamped key is printed below")
     te = record["te_ev_window"]
     print(f"  T_e        {te.min():.4f}-{te.max():.4f} eV over the plateau windows "
           f"({'MEASURED' if record['te_measured'] else 'PRIOR-DERIVED'} row)")
