@@ -1766,11 +1766,11 @@ def export_overlay(
             "is applied: interf_decay_time_ms is the raw interferometer clock "
             "and isat_decay_time_ms is the raw SIS clock.  A consumer putting "
             "the two on one axis must carry this as a systematic.  This "
-            "exporter also runs on ES2 and ES3: the offset above is carried "
-            "into those exports UNMEASURED, not re-derived from each set's "
-            "own traces, so a consumer relying on this field outside ES1 "
-            "must treat the transfer to that set, not only the offset "
-            "itself, as an assumption."
+            "exporter also runs on every other experiment set: the offset "
+            "above is carried into those exports UNMEASURED, not re-derived "
+            "from each set's own traces, so a consumer relying on this field "
+            "outside ES1 must treat the transfer to that set, not only the "
+            "offset itself, as an assumption."
         ),
         discharge_time_ms=discharge["time_ms"],
         discharge_current_mean_a=discharge["current_mean_a"],
