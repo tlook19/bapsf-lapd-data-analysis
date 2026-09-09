@@ -81,8 +81,10 @@ MACH_K_BRACKET: tuple[float, float] = (1.34, 1.74)
 #: area-free estimator and half their difference is the systematic.  Measured
 #: by the rotation-pair read of the processed Mach product (plateau window
 #: 14–19 ms, x = 0, K = ``MACH_K``) over the nine valid ES1–ES3 port pairs.
-#: The pooled RMS is a spread over state: the asymmetry grows from ES1 to ES3
-#: at the downstream position.  ES4 pairs are EXCLUDED from the statistic for
+#: The pooled RMS is a spread over state: the state dependence is non-monotone
+#: in the ladder (smallest at ES2 at every port; the downstream-face wake
+#: asymmetry is largest at ES1 and shrinks toward ES3).  ES4 pairs are EXCLUDED
+#: from the statistic for
 #: two reasons: the ES4 sweep face rests at −24 V between ramps (ES1–ES3 rest
 #: at −90 V), so every ES4 rot-pair half-difference carries a rest-bias
 #: convention term (ln 0.10–0.41, the Isweep face reading low) that the ES1–ES3
