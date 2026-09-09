@@ -263,6 +263,15 @@ def _port_summary(record: dict) -> dict:
     }
 
 
+def _display_path(path: Path) -> str:
+    """Return ``path`` repo-relative under ``ROOT``, else its resolved absolute form."""
+    resolved = Path(path).resolve()
+    try:
+        return str(resolved.relative_to(ROOT))
+    except ValueError:
+        return str(resolved)
+
+
 def write_product(
     records: list[dict],
     x_cm: np.ndarray,
@@ -360,8 +369,8 @@ def write_product(
                 "plateau_ms": list(PLATEAU_MS),
                 "window_p_low_percent": list(_rw.P_LOW),
                 "window_f_high_fraction": list(_rw.F_HIGH),
-                "full_product_hdf5": str(hdf5_path.relative_to(ROOT)),
-                "per_cell_csv": str(summary_path.relative_to(ROOT)),
+                "full_product_hdf5": _display_path(hdf5_path),
+                "per_cell_csv": _display_path(summary_path),
                 "ports": summaries,
             },
             indent=2,
