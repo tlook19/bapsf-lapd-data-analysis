@@ -12,8 +12,10 @@ from scripts.screen_consecutive_shot_steps import (
     GATE_RUN_ID,
     LN_RATIO_FLAG,
     PERSISTENT_MIN_LN,
+    PERSISTENT_MIN_REFERENCE_SHOTS,
     PRE_STEP_POSITIONS,
     SIGNIFICANCE_FACTOR,
+    _min_reference_shots,
     _persistence_shots,
     _persistent_min_ln,
     _pre_step_level,
@@ -168,19 +170,22 @@ def _step_pair(return_shot):
     return [(STEP_SHOT, LN_STEP), (return_shot, -LN_STEP)]
 
 
-def _leg3(steps, level, eligible):
-    return persistence_leg(steps, level, eligible, SHOTS_PER_POSITION)
+def _leg3(steps, level, eligible, min_reference_shots=0):
+    """Leg 3 with the coverage clause off unless the test asks for it."""
+    return persistence_leg(steps, level, eligible, SHOTS_PER_POSITION,
+                           min_reference_shots)
 
 
-def _row(run_id, channel, pairs=(), open_ended=()):
+def _row(run_id, channel, pairs=(), open_ended=(), untestable=()):
     return {"run_id": run_id, "channel": channel,
-            "pairs": list(pairs), "open_ended": list(open_ended)}
+            "pairs": list(pairs), "open_ended": list(open_ended),
+            "untestable": list(untestable)}
 
 
 def test_a_matched_pair_one_shot_short_of_n_is_not_persistent():
     n = 200
     level, eligible = _stepped_series(STEP_SHOT + n - 1)
-    pairs, open_ended = _leg3(_step_pair(STEP_SHOT + n - 1), level, eligible)
+    pairs, open_ended, _ = _leg3(_step_pair(STEP_SHOT + n - 1), level, eligible)
 
     assert not open_ended
     assert [pair["separation"] for pair in pairs] == [n - 1]
@@ -190,7 +195,7 @@ def test_a_matched_pair_one_shot_short_of_n_is_not_persistent():
 def test_a_matched_pair_at_n_is_persistent():
     n = 200
     level, eligible = _stepped_series(STEP_SHOT + n)
-    pairs, _ = _leg3(_step_pair(STEP_SHOT + n), level, eligible)
+    pairs, _, _ = _leg3(_step_pair(STEP_SHOT + n), level, eligible)
 
     assert [pair["separation"] for pair in pairs] == [n]
     rows = persistent_rows([_row("77", "isat", pairs)], n, 0.0)
@@ -199,7 +204,7 @@ def test_a_matched_pair_at_n_is_persistent():
 
 def test_a_step_that_never_comes_back_is_open_ended():
     level, eligible = _stepped_series(TOTAL_SHOTS)
-    pairs, open_ended = _leg3([(STEP_SHOT, LN_STEP)], level, eligible)
+    pairs, open_ended, _ = _leg3([(STEP_SHOT, LN_STEP)], level, eligible)
 
     assert not pairs
     assert len(open_ended) == 1
@@ -212,7 +217,7 @@ def test_a_return_to_the_pre_step_level_inside_the_span_breaks_persistence():
     level, eligible = _stepped_series(return_shot)
     # One shot back at the pre-step level: the channel did not stay stepped.
     level[STEP_SHOT + 100] = 0.0
-    pairs, open_ended = _leg3(_step_pair(return_shot), level, eligible)
+    pairs, open_ended, _ = _leg3(_step_pair(return_shot), level, eligible)
 
     assert not pairs
     # The broken step consumes nothing, so the step that would have closed it
@@ -225,7 +230,7 @@ def test_a_shot_that_is_not_eligible_cannot_report_a_return():
     level, eligible = _stepped_series(return_shot)
     level[STEP_SHOT + 100] = 0.0
     eligible[STEP_SHOT + 100] = False
-    pairs, _ = _leg3(_step_pair(return_shot), level, eligible)
+    pairs, _, _ = _leg3(_step_pair(return_shot), level, eligible)
 
     assert [pair["separation"] for pair in pairs] == [400]
 
@@ -236,7 +241,7 @@ def test_the_return_half_of_an_excursion_is_not_a_fresh_open_ended_state():
     # to the end of the run.
     return_shot = STEP_SHOT + 40
     level, eligible = _stepped_series(return_shot)
-    pairs, open_ended = _leg3(_step_pair(return_shot), level, eligible)
+    pairs, open_ended, _ = _leg3(_step_pair(return_shot), level, eligible)
 
     assert [pair["separation"] for pair in pairs] == [40]
     assert not open_ended
@@ -268,9 +273,10 @@ def test_a_one_position_dip_cannot_be_the_pre_step_reference():
     assert _returns_to_level(level, eligible, DIP_LEVEL, step_shot,
                              level.size) is None
     # Three positions, taken by median, read the level the dip interrupted.
-    assert _pre_step_level(level, eligible, step_shot,
-                           SHOTS_PER_POSITION) == 0.0
-    pairs, open_ended = _leg3([(step_shot, -DIP_LEVEL)], level, eligible)
+    assert _pre_step_level(level, eligible, step_shot, SHOTS_PER_POSITION) == (
+        0.0, PRE_STEP_POSITIONS * SHOTS_PER_POSITION
+    )
+    pairs, open_ended, _ = _leg3([(step_shot, -DIP_LEVEL)], level, eligible)
     assert not pairs and not open_ended
 
 
@@ -282,7 +288,9 @@ def test_the_pre_step_reference_reaches_back_exactly_three_positions():
     # would read 2.5, and the step's own position 5 is never part of it.
     assert PRE_STEP_POSITIONS == 3
     assert _pre_step_level(level, eligible, 5 * SHOTS_PER_POSITION,
-                           SHOTS_PER_POSITION) == 3.0
+                           SHOTS_PER_POSITION) == (
+        3.0, PRE_STEP_POSITIONS * SHOTS_PER_POSITION
+    )
 
 
 def test_the_pre_step_reference_reads_only_both_eligible_shots():
@@ -290,16 +298,117 @@ def test_the_pre_step_reference_reads_only_both_eligible_shots():
     level, eligible = _positioned(levels)
     eligible[3 * SHOTS_PER_POSITION:5 * SHOTS_PER_POSITION] = False
 
+    # Only position 2 survives, so the reference is its level and its coverage.
     assert _pre_step_level(level, eligible, 5 * SHOTS_PER_POSITION,
-                           SHOTS_PER_POSITION) == 2.0
+                           SHOTS_PER_POSITION) == (2.0, SHOTS_PER_POSITION)
 
 
 def test_a_step_with_no_position_behind_it_is_untestable_not_persistent():
     level, eligible = _positioned([0.0] * LEG3_POSITIONS)
 
-    assert _pre_step_level(level, eligible, 5, SHOTS_PER_POSITION) is None
-    pairs, open_ended = _leg3([(5, LN_STEP)], level, eligible)
+    assert _pre_step_level(level, eligible, 5, SHOTS_PER_POSITION) == (None, 0)
+    pairs, open_ended, untestable = _leg3([(5, LN_STEP)], level, eligible)
     assert not pairs and not open_ended
+    assert [step["reference_shots"] for step in untestable] == [0]
+
+
+# ------------------------------------------- leg 3: the reference's coverage
+
+
+def _thin_reference_run():
+    """Run 03 ISAT's shape: a step whose reference survives on one shot.
+
+    The three positions below the step are eligible on one shot only, and it
+    reads a level nothing later in the run comes near.
+    """
+    levels = [1.489] * 5 + [4.2] * (LEG3_POSITIONS - 5)
+    level, eligible = _positioned(levels)
+    eligible[:5 * SHOTS_PER_POSITION] = False
+    eligible[2 * SHOTS_PER_POSITION] = True          # the one survivor
+    return level, eligible
+
+
+def test_a_reference_carried_by_one_shot_leaves_the_step_untestable():
+    level, eligible = _thin_reference_run()
+    step_shot = 5 * SHOTS_PER_POSITION
+
+    # The reference exists, and rests on a single both-eligible shot.
+    assert _pre_step_level(level, eligible, step_shot,
+                           SHOTS_PER_POSITION) == (1.489, 1)
+    # Nothing later in the run comes back to it, so without the clause the step
+    # reads as a state running to the end.
+    assert _returns_to_level(level, eligible, 1.489, step_shot,
+                             level.size) is None
+
+    pairs, open_ended, untestable = _leg3(
+        [(step_shot, LN_STEP)], level, eligible,
+        PERSISTENT_MIN_REFERENCE_SHOTS)
+
+    assert not pairs and not open_ended
+    assert [(step["shot_step"], step["position"], step["reference_shots"])
+            for step in untestable] == [(step_shot, 5, 1)]
+
+
+def test_the_coverage_clause_off_reads_the_thin_reference_as_a_state():
+    # The same run with the clause removed: what --persistent-min-reference-
+    # shots 0 restores, and why the clause is what closes the ramp-up region.
+    level, eligible = _thin_reference_run()
+    step_shot = 5 * SHOTS_PER_POSITION
+
+    pairs, open_ended, untestable = _leg3([(step_shot, LN_STEP)], level,
+                                          eligible, 0)
+
+    assert not pairs and not untestable
+    assert [step["shots_to_end"] for step in open_ended] == [
+        level.size - step_shot
+    ]
+
+
+def test_a_reference_one_shot_short_of_the_minimum_is_still_untestable():
+    level, eligible = _positioned([0.0] * LEG3_POSITIONS)
+    step_shot = 5 * SHOTS_PER_POSITION
+    short = PERSISTENT_MIN_REFERENCE_SHOTS - 1
+    eligible[:step_shot] = False
+    eligible[2 * SHOTS_PER_POSITION:2 * SHOTS_PER_POSITION + short] = True
+
+    assert _pre_step_level(level, eligible, step_shot,
+                           SHOTS_PER_POSITION)[1] == short
+    _, _, untestable = _leg3([(step_shot, LN_STEP)], level, eligible,
+                             PERSISTENT_MIN_REFERENCE_SHOTS)
+    assert [step["reference_shots"] for step in untestable] == [short]
+
+    # One more both-eligible shot and the reference carries a level test --
+    # which this flat run passes at once, so nothing is reported at all.
+    eligible[2 * SHOTS_PER_POSITION + short] = True
+    pairs, open_ended, untestable = _leg3([(step_shot, LN_STEP)], level,
+                                          eligible,
+                                          PERSISTENT_MIN_REFERENCE_SHOTS)
+    assert not untestable and not pairs and not open_ended
+
+
+def test_the_clause_off_reclassifies_nothing_and_only_names_the_dropped():
+    # A run holding one testable step and one with no reference at all.  With
+    # the clause off, the testable step is classified exactly as it was before
+    # the clause existed, and the untestable list holds only the step that was
+    # silently dropped then -- so the hit list at 0 is the hit list without it.
+    level, eligible = _positioned([0.0] * LEG3_POSITIONS)
+    late = 5 * SHOTS_PER_POSITION
+    level[late:] = LN_STEP
+    steps = [(3, LN_STEP), (late, LN_STEP)]
+
+    pairs, open_ended, untestable = _leg3(steps, level, eligible, 0)
+
+    assert not pairs
+    assert [step["shot_step"] for step in open_ended] == [late]
+    assert [(step["shot_step"], step["reference_shots"])
+            for step in untestable] == [(3, 0)]
+
+
+def test_the_reference_coverage_is_a_non_negative_number_of_shots():
+    assert _min_reference_shots("20") == 20
+    assert _min_reference_shots("0") == 0
+    with pytest.raises(argparse.ArgumentTypeError):
+        _min_reference_shots("-1")
 
 
 # ------------------------------------------------ leg 3: the magnitude floor
@@ -384,9 +493,10 @@ def test_the_gate_reads_run_43_isat_alone_as_a_pass():
     quiet = _row("44", "isat",
                  [{"separation": 12, "ln_step": +0.9, "ln_return": -0.9}])
 
-    assert gate_verdict([hit, quiet], 200, PERSISTENT_MIN_LN) == (
+    assert gate_verdict([hit, quiet], 200, PERSISTENT_MIN_LN,
+                        PERSISTENT_MIN_REFERENCE_SHOTS) == (
         f"GATE PASS: fires on run {GATE_RUN_ID} {GATE_CHANNEL.upper()} "
-        "only (N = 200, floor 0.40)"
+        "only (N = 200, floor 0.40, reference \u2265 20)"
     )
 
 
@@ -396,7 +506,8 @@ def test_the_gate_names_every_other_row_with_its_ln_ratios():
                  [{"separation": 770, "ln_step": -0.801, "ln_return": +0.752}],
                  [{"shots_to_end": 389, "ln_step": -1.200}])
 
-    assert gate_verdict([hit, other], 200, PERSISTENT_MIN_LN) == (
+    assert gate_verdict([hit, other], 200, PERSISTENT_MIN_LN,
+                        PERSISTENT_MIN_REFERENCE_SHOTS) == (
         "GATE FAIL: also fires on run 34 ISAT "
         "(770 shots, ln -0.801/+0.752; 389 shots to end, ln -1.200)"
     )
@@ -406,7 +517,8 @@ def test_the_gate_fails_when_run_43_is_absent():
     other = _row("34", "isat",
                  [{"separation": 770, "ln_step": -0.801, "ln_return": +0.752}])
 
-    assert gate_verdict([other], 200, PERSISTENT_MIN_LN) == (
+    assert gate_verdict([other], 200, PERSISTENT_MIN_LN,
+                        PERSISTENT_MIN_REFERENCE_SHOTS) == (
         f"GATE FAIL: run {GATE_RUN_ID} {GATE_CHANNEL.upper()} not flagged"
     )
 
@@ -417,10 +529,12 @@ def test_a_row_the_floor_removes_no_longer_fails_the_gate():
                     [{"separation": 770, "ln_step": -0.301,
                       "ln_return": +0.196}])
 
-    assert gate_verdict([hit, marginal], 200, 0.0).startswith("GATE FAIL")
-    assert gate_verdict([hit, marginal], 200, PERSISTENT_MIN_LN) == (
+    assert gate_verdict([hit, marginal], 200, 0.0,
+                        PERSISTENT_MIN_REFERENCE_SHOTS).startswith("GATE FAIL")
+    assert gate_verdict([hit, marginal], 200, PERSISTENT_MIN_LN,
+                        PERSISTENT_MIN_REFERENCE_SHOTS) == (
         f"GATE PASS: fires on run {GATE_RUN_ID} {GATE_CHANNEL.upper()} "
-        "only (N = 200, floor 0.40)"
+        "only (N = 200, floor 0.40, reference \u2265 20)"
     )
 
 
@@ -489,8 +603,8 @@ def test_the_default_invocation_writes_what_it_wrote_before_persistence(
     assert persistence_files == default_files
     assert persistence_stdout.startswith(default_stdout)
     assert "LEG 3 -- PERSISTENCE" not in default_stdout
-    assert ("LEG 3 -- PERSISTENCE (N = 40 shots, floor ln 0.40)"
-            in persistence_stdout)
+    assert ("LEG 3 -- PERSISTENCE (N = 40 shots, floor ln 0.40, "
+            "reference \u2265 20 shots)" in persistence_stdout)
 
 
 def test_the_floor_is_inert_without_persistence_and_reported_with_it(
@@ -505,11 +619,11 @@ def test_the_floor_is_inert_without_persistence_and_reported_with_it(
 
     # The four written files never depend on leg 3, floor or no floor.
     assert persistence_files == default_files
-    assert ("LEG 3 -- PERSISTENCE (N = 40 shots, floor ln 0.90)"
-            in persistence_stdout)
+    assert ("LEG 3 -- PERSISTENCE (N = 40 shots, floor ln 0.90, "
+            "reference \u2265 20 shots)" in persistence_stdout)
     # The synthetic state steps by ln(1.9) = 0.64, so a 0.9 floor removes it
     # while the registered 0.40 keeps it.
     assert "GATE FAIL: run 43 ISAT not flagged" in persistence_stdout
     _synthetic_main(monkeypatch, tmp_path, ["--persistence", "40"])
-    assert "GATE PASS: fires on run 43 ISAT only (N = 40, floor 0.40)" in (
-        capsys.readouterr().out)
+    assert ("GATE PASS: fires on run 43 ISAT only (N = 40, floor 0.40, "
+            "reference \u2265 20)" in capsys.readouterr().out)
