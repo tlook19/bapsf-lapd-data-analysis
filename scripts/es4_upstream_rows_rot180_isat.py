@@ -83,8 +83,10 @@ PORT COVERAGE
 -------------
 p29 (runs 44/45) and p41 (runs 46/47) are the ports this instrument is for.
 p21 (runs 42/43) is reported for its EDGE cells only and labelled: the run-43
-state mask removes scan positions 12-34, which is the whole core band, so p21
-has no admitted core cell and its core gates refuse rather than report a number.
+state mask removes 20 of the 21 core positions, leaving one admitted core
+position (x = +10.0 cm, 4 of 84 core cells, ratio ISAT180/isweep0 = 1.017) --
+too few to form the core-band mean or the chord line integral, so the core
+gates refuse rather than report a number.
 p50 (run 48) is rot-0 only -- there is no rot-180 partner and no ISAT upstream
 row to build -- and is not touched.
 
@@ -642,7 +644,9 @@ def report_port(record: dict, repo: Path) -> list[dict]:
           f"admitted, {record['core_positions_admitted']} of {record['core_positions_total']} positions")
     if not is_core_port:
         print("  LABEL      p21 is reported for its EDGE cells only: the run-43 state mask "
-              "removes the whole core band, so the core gates refuse.")
+              "removes 20 of the 21 core positions, leaving one")
+        print("             admitted core position (x = +10.0 cm) -- too few to form the "
+              "core-band mean or the chord line integral, so the core gates refuse.")
 
     # A T_e move rescales the whole row; print the sensitivity as a worked factor.
     te_mid = float(np.median(te))

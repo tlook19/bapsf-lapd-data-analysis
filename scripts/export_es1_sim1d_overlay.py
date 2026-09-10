@@ -250,9 +250,11 @@ FLUX_TUBE_RADIUS_CM = 18.415
 ES4_UPSTREAM_SET_ID = 4
 
 #: The ports whose rot-180 partner survives that product's own exclusion
-#: masks.  p21's partner (run 43) carries a registered channel-state shot
-#: range covering the whole core band, so it has no admitted core cell and no
-#: rot-180 row is built there; p50 (run 48) is rot-0 only and has no partner.
+#: masks.  p21's partner (run 43) carries a registered channel-state shot range
+#: that removes 20 of the 21 core positions, leaving one admitted core position
+#: (x = +10.0 cm, 4 of 84 core cells, ratio ISAT180/isweep0 = 1.017) -- too few
+#: to form the core-band mean or the chord line integral, so no rot-180 row is
+#: built there; p50 (run 48) is rot-0 only and has no partner.
 ES4_UPSTREAM_BRACKET_PORTS = (29, 41)
 
 #: The port whose density row is re-derived at a MEASURED plateau T_e.
@@ -579,11 +581,23 @@ def _es4_upstream_definitions() -> dict[str, np.ndarray]:
             "face they read: identical cell-admission mask (finite and "
             "positive on both faces, and carrying neither the rot-180 "
             "product's rail_mask nor its state_mask), identical T_e, "
-            "identical plateau, identical area convention.  The partner row is "
-            "therefore NOT the same number as density_mean_cm3 at that port, "
-            "which comes from the full density product with its own per-cell "
-            "T_e and no dead-time admission mask; both are in the file and "
-            "both are labelled.  AREAS are keyed by the ELECTRODE that "
+            "identical plateau, identical area convention.  THREE LEVELS, NOT "
+            "TWO.  The partner row is NOT the SCORED row: density_mean_cm3 and "
+            "density_ftavg_cm3 at that port come from the full density "
+            "product, with its own per-cell T_e and no dead-time admission "
+            "mask, and this family does not touch them.  Over the scoring "
+            "plateau window the three read, as primary / partner / scored: at "
+            "p29, flux-tube 2.982e12 / 2.466e12 / 2.703e12 cm^-3 (primary "
+            "1.103 and partner 0.912 times the scored row) and core-band "
+            "4.709e12 / 4.434e12 / 4.416e12 cm^-3 (1.066 and 1.004); at p41, "
+            "flux-tube 2.784e11 / 2.550e11 / 2.420e11 cm^-3 (1.150 and 1.054) "
+            "and core-band 9.133e11 / 6.722e11 / 6.686e11 cm^-3 (1.366 and "
+            "1.005).  The partner and the scored row agree to 0.4-0.5 percent "
+            "in the core band and part by -8.8 percent at p29 and +5.4 percent "
+            "at p41 under the flux-tube convention, which reduces the whole "
+            "scan and so is where the dead-time admission mask and the "
+            "despiking part company; a consumer must say which of the three it "
+            "quoted.  AREAS are keyed by the ELECTRODE that "
             "collected, es4_upstream_row_area_key with the value in "
             "es4_upstream_row_area_cm2: ap_R_cm2 is the RIGHT electrode, which "
             "is what the isat channel sits on under the nominal wiring every "
@@ -595,10 +609,13 @@ def _es4_upstream_definitions() -> dict[str, np.ndarray]:
             "density_area_key_for_deadtime_source for these runs.  PORTS: "
             "only p29 (runs 44/45) and p41 (runs 46/47) carry the pair.  p21's "
             "rot-180 partner (run 43) carries a registered channel-state shot "
-            "range covering the whole core band, so it has no admitted core "
-            "cell and NO rot-180 row is built there; p11 and p50 have no "
-            "rot-180 partner run at all.  A consumer must not read the absence "
-            "of a row as a null result -- it is an absent measurement."
+            "range that removes 20 of the 21 core positions, leaving one "
+            "admitted core position (x = +10.0 cm, 4 of 84 core cells, ratio "
+            "ISAT180/isweep0 = 1.017) -- too few to form the core-band mean or "
+            "the chord line integral, so NO rot-180 row is built there; p11 "
+            "and p50 have no rot-180 partner run at all.  A consumer must not "
+            "read the absence of a row as a null result -- it is an absent "
+            "measurement."
         ),
         "es4_upstream_te_definition": np.array(
             "WHICH T_e EACH ROW WAS DERIVED AT.  n_e is proportional to "
@@ -643,8 +660,20 @@ def _es4_upstream_definitions() -> dict[str, np.ndarray]:
             "chain on record was computed at it.  es4_upstream_p21_te_"
             "measured_rot180_ev and its _display counterpart are the opposite "
             "face at the same port under the same estimator and the same two "
-            "windows: the T_e FACE SPREAD, which is the uncertainty the "
-            "re-derivation inherits and is about 1 percent of the value.  The "
+            "windows.  WHAT THE RE-DERIVATION INHERITS, largest term first.  "
+            "(1) THE ESTIMATOR SPREAD.  The instrument reports four estimators "
+            "per face -- core band or x = 0, each under the window-family "
+            "median or the default window -- and on run 42 they read "
+            "0.6507-0.7144 eV over the scoring window and 0.6641-0.7355 eV "
+            "over the display window: 9.8 and 10.7 percent in T_e, which is "
+            "4.6 and 5.0 percent on the density.  The value used here is the "
+            "COOLEST of the four at both windows, so the spread is ONE-SIDED: "
+            "every other estimator reads hotter, and a hotter T_e gives a "
+            "smaller density, so the re-derived row is biased HIGH by up to "
+            "that amount and not symmetrically uncertain.  (2) THE FACE "
+            "SPREAD, the second and smaller term: the same estimator on the "
+            "opposite face reads 0.6431 eV against 0.6507 eV over the scoring "
+            "window, 1.2 percent in T_e and 0.6 percent on the density.  The "
             "pre-existing te_mean_ev, te_row_measured and te_row_measured_"
             "cells at p21 are UNCHANGED and still describe the filled-T_e "
             "product, which is still prior-derived there: this family does not "
@@ -654,11 +683,15 @@ def _es4_upstream_definitions() -> dict[str, np.ndarray]:
         "es4_upstream_f_convention": np.array(
             "SWEEP REST-BIAS FACTOR: NOT APPLIED.  es4_upstream_row_f_applied "
             "is 1.0 on every row, and it is exported to say so explicitly.  "
-            "The ES4 sweep parks the swept face at a shallower rest bias than "
-            "ES3 does (-20 V against -75 V nominal), and every dead-time "
-            "ion-saturation current is collected at that parked bias, so "
-            "comparing an ES4 i_sweep row with its ES3 control needs a "
-            "channel-scale factor F.  Neither the density product behind "
+            "ES4 runs 42-48 -- p21, p29, p41 and p50 -- sweep a nominal +-20 V "
+            "ramp and park the swept face at that shallower rest bias, while "
+            "ES3 parks at -75 V nominal, and a dead-time ion-saturation "
+            "current is collected at the parked bias, so comparing one of "
+            "those i_sweep rows with its ES3 control needs a channel-scale "
+            "factor F.  ES4 p11 (run 41) is the EXCEPTION and needs no F: it "
+            "sweeps +-75 V, identical to its ES3 p11 control (run 31), so the "
+            "two are already on one bias scale.  Neither the density product "
+            "behind "
             "density_mean_cm3 nor this exporter has ever multiplied an ES4 row "
             "by one, so the retained i_sweep rows here carry exactly what the "
             "placed product carries and no factor is invented at export.  F is "
