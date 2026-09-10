@@ -151,21 +151,40 @@ GATE_HIGH_PCT_PER_MS = -0.5
 MIN_FINITE_CYCLES = 3
 
 #: Ports whose core-cell window-family spread fails ``refit_window_band.py``'s
-#: own core-mode gate (``dln_te_window < 0.5``) on every one of its 21 core
-#: cells, on BOTH rotation faces -- measured by running that script's core
-#: pass over set 4 (checked 2026-09-09; not re-run here on every invocation):
+#: own core-mode gate (``dln_te_window < CRITERION_DLN``,
+#: ``scripts/refit_window_band.py:134``, fixed at 0.50) on every one of its 21
+#: core cells, on BOTH rotation faces -- measured by running that script's
+#: core pass over ALL THREE ES4 ports (checked 2026-09-09; not re-run here on
+#: every invocation):
 #:   PYTHONPATH=src python scripts/refit_window_band.py --cells core \
-#:       --sets 4 --ports 29 --rotation-deg 0   --output ... --summary ... --metadata ...
+#:       --sets 4 --ports 21,29,41 --rotation-deg 0   --output ... --summary ... --metadata ...
 #:   PYTHONPATH=src python scripts/refit_window_band.py --cells core \
-#:       --sets 4 --ports 29 --rotation-deg 180 --output ... --summary ... --metadata ...
-#: 21/21 core cells clear ``at_or_above_criterion`` on both rot0 (run 44) and
-#: rot180 (run 45).  No TRACKED product carries this per-cell gate result for
-#: set 4 -- the committed ``processed/window_refit_band_summary.csv`` carries
-#: sets 1/2 only -- so this is recorded as a documented constant, not read
-#: from a product; a data-driven check should replace it if that ever
-#: changes.  A port in this set is SEMI-QUANTITATIVE by the repo's own
-#: window-spread criterion, and every T_e read for it here is captioned.
-SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS = (29,)
+#:       --sets 4 --ports 21,29,41 --rotation-deg 180 --output ... --summary ... --metadata ...
+#: Per-port ``at_or_above_criterion`` count out of 21 core cells:
+#:   port 21 (runs 42/43): rot0  5/21, rot180  7/21
+#:   port 29 (runs 44/45): rot0 21/21, rot180 21/21
+#:   port 41 (runs 46/47): rot0 21/21, rot180 21/21
+#: Only 29 and 41 clear 21/21 on BOTH faces; 21 does not.  No TRACKED product
+#: carries this per-cell gate result for set 4 -- the committed
+#: ``processed/window_refit_band_summary.csv`` carries sets 1/2 only -- so
+#: this is recorded as a documented constant, not read from a product; a
+#: data-driven check should replace it if that ever changes.  A port in this
+#: set is SEMI-QUANTITATIVE by the repo's own window-spread criterion, and
+#: every T_e read for it here is captioned.
+#:
+#: NOT the same quantity as the ES4 overlay's own
+#: ``te_semi_quantitative_core_count`` (``processed/es4_sim1d_overlay.npz``):
+#: that field's rule is broader than this one criterion -- a cell is also
+#: marked when its filled T_e is below 1 eV, OR when its port's x=0 window
+#: control fails (marking the whole core), so a port can read
+#: semi-quantitative there for a reason unrelated to its OWN core-cell window
+#: spread.  Concretely, p41's own ``te_window_spread_frac`` is NaN (the
+#: overlay never measured it directly) even though the overlay marks p41
+#: semi-quantitative through the x=0-control bit; p29's IS measured there
+#: (0.93, itself over CRITERION_DLN).  Keying this caption off the overlay
+#: field instead would assert a different, broader claim than "fails the
+#: core-cell window-spread gate on all 21 cells, both faces".
+SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS = (29, 41)
 
 ESTIMATORS = ("x0 default", "x0 family-med", "core default", "core family-med")
 

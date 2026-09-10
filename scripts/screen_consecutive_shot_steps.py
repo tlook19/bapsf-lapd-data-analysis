@@ -107,7 +107,8 @@ LEG 3 -- PERSISTENCE (``--persistence N``, off unless asked for)
     coverage clause off (the profile ends at positions 0-6 / 44-50 and the
     thin ISAT rows of runs 44-47).  At N = 200, floor 0.40 and reference ≥ 20
     the leg fires on run 43 ISAT alone, and so it does at every floor of
-    0.30/0.40/0.50 and every N of 100/200/400.  The clause makes 1160 flagged
+    0.30/0.40/0.50 and every N of 100/200/400 (superseded at the tip for
+    N = 100 — see the RETEST below).  The clause makes 1160 flagged
     steps untestable over 48 of the 64 rows, 1086 of them with no
     both-eligible shot behind them at all.
 

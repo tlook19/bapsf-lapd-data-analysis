@@ -238,10 +238,28 @@ def test_overlay_prior_te_ev_refuses_a_file_with_no_te_mean_ev(tmp_path):
         overlay_prior_te_ev(wrong, 29, WINDOW_MATCHED_MS)
 
 
-def test_p29_is_the_registered_semi_quantitative_window_spread_port():
-    # scripts/refit_window_band.py's core-cell pass over set 4 (both
-    # rotation faces, runs 44/45): 21/21 core cells clear
-    # at_or_above_criterion for p29, and p21's core cells (runs 42/43) do
-    # not fail wholesale -- only p29 is captioned.
-    assert 29 in SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS
+# scripts/refit_window_band.py's core-cell pass over ALL THREE ES4 ports
+# (both rotation faces): PYTHONPATH=src python scripts/refit_window_band.py
+# --cells core --sets 4 --ports 21,29,41 --rotation-deg {0,180} ...
+# Per-port at_or_above_criterion count out of 21 core cells (documented
+# source: this repo has no tracked product carrying the set-4 per-cell gate
+# result, per SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS's own docstring).
+ES4_CORE_WINDOW_SPREAD_AT_OR_ABOVE_CRITERION_COUNTS = {
+    21: {"rot0": 5, "rot180": 7},
+    29: {"rot0": 21, "rot180": 21},
+    41: {"rot0": 21, "rot180": 21},
+}
+CORE_CELLS_PER_PORT = 21
+
+
+def test_semi_quantitative_window_spread_ports_matches_the_whole_es4_port_set():
+    """Every ES4 port that fails 21/21 on BOTH faces is captioned, no more, no fewer."""
+    expected = {
+        port
+        for port, counts in ES4_CORE_WINDOW_SPREAD_AT_OR_ABOVE_CRITERION_COUNTS.items()
+        if counts["rot0"] == CORE_CELLS_PER_PORT
+        and counts["rot180"] == CORE_CELLS_PER_PORT
+    }
+    assert expected == {29, 41}
+    assert set(SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS) == expected
     assert 21 not in SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS
