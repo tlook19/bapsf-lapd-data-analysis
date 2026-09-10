@@ -57,6 +57,42 @@ ringing that follows each ramp.  That ringing overshoots POSITIVE first -- it
 starts near +80 V on ES3 and +21 V on ES4 -- which is why the rest bias is
 measured only past a settling margin.
 
+``--rest-bias-frame raw`` -- anchoring F in the raw frame instead
+-------------------------------------------------------------------
+The default invocation anchors F at each run's rest bias in the OFFSET frame
+(``v_rest``, ``deep.v_rest``/``shallow.v_rest`` above) -- and, because ES3 and
+ES4 each carry their OWN separately-fitted zero-offset (about -16.55 V and
+-5.07 V respectively), a shallow-set anchor read directly as a coordinate on
+the deep-set ramp is not on the same voltage scale as the ramp itself: the two
+offsets do not cancel between sets the way they would for a quantity measured
+entirely within one set.  ``--rest-bias-frame raw`` anchors F instead at each
+run's rest bias in the RAW digitizer frame (``RunSweep.v_rest_raw_frame``,
+``v_rest + v_offset_applied`` -- the same measured tail level, read before the
+zero-offset subtraction, so it needs no manifest ``voltage_start`` and no
+per-set convention at all) and reads it against the ES3 ramp's OWN voltage
+axis also converted to the raw frame (``RunSweep.v_ramp_raw_frame``).  Because
+the raw frame has no per-set anchor, a raw-frame coordinate means the same
+physical voltage on every run, which is what makes reading ES4's raw rest bias
+directly against ES3's raw ramp axis valid where the offset-frame reading is
+not.
+
+This mode changes WHICH VOLTAGE the ratio is evaluated at and at which
+voltage the extrapolating fits are anchored; it does not change WHICH SAMPLES
+enter a fit or a core-cell selection -- ``core_cells`` and the ion-branch fit
+window are decided exactly as in the default invocation (from the offset-frame
+ramp values, as always) and only the V-axis coordinates of those same samples
+switch frames.  A quantity built from a SLOPE or a RATIO taken entirely within
+one run's own trace (T_e off a single electron-retarding branch, for example)
+is frame-invariant by construction, because both frames differ only by an
+additive per-run constant; F is NOT frame-invariant precisely because it
+compares two DIFFERENT runs' own constants against each other.  Nothing here
+selects between the two frames as more correct -- the offset frame is this
+repository's working convention, and the raw frame is what the departure
+analysis above establishes is also a measured, convention-free reading of the
+same rest levels -- and the mode is reported alongside the default, never
+replacing it: default output is untouched, byte for byte, when the flag is
+left at its default.
+
 Two independent routes to the same factor
 -----------------------------------------
 (i) DIRECT, from the ES3 ramp.  The +-75 V ramp sweeps through BOTH rest
@@ -189,6 +225,7 @@ Usage
 -----
   python scripts/es4_sweep_rest_bias_factor.py <repo-root> [--output out.csv]
   python scripts/es4_sweep_rest_bias_factor.py <repo-root> --pin-vf measured
+  python scripts/es4_sweep_rest_bias_factor.py <repo-root> --rest-bias-frame raw
 """
 
 import argparse
@@ -592,6 +629,18 @@ class RunSweep:
         """The same rest level read in the raw digitizer frame, before the offset."""
         return self.v_rest + self.v_offset_applied
 
+    @property
+    def v_ramp_raw_frame(self) -> np.ndarray:
+        """The ramp branch's voltage axis read in the raw digitizer frame.
+
+        ``v_offset_applied`` is one additive constant for the whole run (the
+        zero-offset convention subtracts it uniformly before calibration), so
+        the raw-frame ramp axis is the offset-frame axis translated by that
+        same constant -- the samples it labels, and their currents in
+        ``i_ramp_abs``, are unchanged.
+        """
+        return self.v_ramp + self.v_offset_applied
+
 
 def read_run_sweep(config) -> RunSweep:
     """Average one run's plateau ramps and measure its dead-time rest bias."""
@@ -667,10 +716,25 @@ def _flyback_duration_us(
     return float(settled[0] * dt * 1e6)
 
 
-def direct_ratio(sweep: RunSweep, cell: int, v_deep: float, v_shallow: float) -> float:
-    """Ratio read straight off one measured ramp branch, with no fitted form."""
-    order = np.argsort(sweep.v_ramp)
-    v = sweep.v_ramp[order]
+def direct_ratio(
+    sweep: RunSweep,
+    cell: int,
+    v_deep: float,
+    v_shallow: float,
+    *,
+    v_ramp: np.ndarray | None = None,
+) -> float:
+    """Ratio read straight off one measured ramp branch, with no fitted form.
+
+    ``v_ramp`` overrides which voltage axis ``v_deep``/``v_shallow`` are read
+    against -- ``None`` (every existing caller) reads ``sweep.v_ramp``, the
+    offset-frame axis, exactly as before; the raw-frame mode passes
+    ``sweep.v_ramp_raw_frame``.  Either way the SAMPLES read are
+    ``sweep.i_ramp_abs[cell]``, unchanged.
+    """
+    ramp = sweep.v_ramp if v_ramp is None else v_ramp
+    order = np.argsort(ramp)
+    v = ramp[order]
     i_abs = sweep.i_ramp_abs[cell, order]
     return float(np.interp(v_deep, v, i_abs) / np.interp(v_shallow, v, i_abs))
 
@@ -847,6 +911,124 @@ def analyse_pair(
     return row | _pinned_columns(pin, f_direct, per_cell, n_cells_pin_failed)
 
 
+def analyse_pair_raw_frame(
+    deep: RunSweep,
+    shallow: RunSweep,
+    fit_v_min: float | None,
+) -> dict:
+    """Measure F with both rest biases and the extrapolating fits anchored in
+    the RAW digitizer frame, instead of the zero-offset convention frame
+    ``analyse_pair`` uses.  See the module docstring's ``--rest-bias-frame
+    raw`` section for what this changes (the V-axis coordinates the ratio and
+    the fits are read at) and what it does not (which samples are selected --
+    ``core_cells`` and the fit window are decided exactly as in
+    ``analyse_pair``, from the offset-frame ramp values, so the two modes fit
+    and interpolate over the identical samples and differ only in which
+    voltage those samples are labelled at).
+
+    This is a SEPARATE function, not a parameter on ``analyse_pair``, so the
+    default invocation's return value is untouched by construction -- nothing
+    here is reachable unless ``--rest-bias-frame raw`` is passed.  The pinned
+    (``--pin-vf measured``) mode is not offered here: the measured plasma
+    potential it pins to is a product built under the offset-frame convention,
+    and pinning it to a raw-frame fit would mix the two frames without a
+    stated conversion; ``main`` refuses that combination at argument-parsing
+    time.
+    """
+    if deep.experiment_set != DEEP_EXPERIMENT_SET:
+        raise ValueError(
+            f"Run {deep.run_id} is in experiment set {deep.experiment_set}; the deep-bias "
+            f"run must be in set {DEEP_EXPERIMENT_SET}, the only set that shares ES4's "
+            "bank voltage and ramp duration"
+        )
+    if shallow.experiment_set != SHALLOW_EXPERIMENT_SET:
+        raise ValueError(
+            f"Run {shallow.run_id} is in experiment set {shallow.experiment_set}; the "
+            f"shallow-bias run must be in set {SHALLOW_EXPERIMENT_SET}"
+        )
+    v_deep = deep.v_rest_raw_frame
+    v_shallow = shallow.v_rest_raw_frame
+    cells = core_cells(deep, shallow)
+    window_low = float(shallow.v_ramp.min()) if fit_v_min is None else float(fit_v_min)
+    in_window = (shallow.v_ramp >= window_low) & (shallow.v_ramp <= FIT_V_MAX)
+    if in_window.sum() < 4:
+        raise ValueError(
+            f"Run {shallow.run_id}: fit window [{window_low}, {FIT_V_MAX}] V holds "
+            f"{int(in_window.sum())} ramp samples; the branch does not reach it"
+        )
+    v_fit = shallow.v_ramp_raw_frame[in_window]
+
+    direct, eta34, free, linear = [], [], [], []
+    v_float_34, v_float_free, exponent_free = [], [], []
+    rms_34, rms_free, rms_linear, slope = [], [], [], []
+    for cell in cells:
+        direct.append(
+            direct_ratio(deep, cell, v_deep, v_shallow, v_ramp=deep.v_ramp_raw_frame)
+        )
+        i_fit = shallow.i_ramp_abs[cell, in_window]
+
+        fit34 = fit_power_law(v_fit, i_fit, exponent=0.75)
+        eta34.append(fit34.ratio(v_deep, v_shallow))
+        v_float_34.append(fit34.v_float)
+        rms_34.append(fit34.rms)
+
+        fitfree = fit_power_law(v_fit, i_fit, exponent=None)
+        free.append(fitfree.ratio(v_deep, v_shallow))
+        v_float_free.append(fitfree.v_float)
+        exponent_free.append(fitfree.exponent)
+        rms_free.append(fitfree.rms)
+
+        fitlin = fit_linear(v_fit, i_fit)
+        linear.append(fitlin.ratio(v_deep, v_shallow))
+        slope.append(fitlin.slope)
+        rms_linear.append(fitlin.rms)
+
+    def stat(values):
+        return float(np.mean(values)), float(np.std(values))
+
+    f_direct, f_direct_std = stat(direct)
+    f_eta34, f_eta34_std = stat(eta34)
+    f_free, f_free_std = stat(free)
+    f_linear, f_linear_std = stat(linear)
+    low, high = sorted((f_direct, f_linear))
+    return {
+        "rest_bias_frame": "raw",
+        "port": shallow.port,
+        "rotation_deg": int(shallow.rotation_deg),
+        "run_deep": deep.run_id,
+        "run_shallow": shallow.run_id,
+        "experiment_set_deep": deep.experiment_set,
+        "experiment_set_shallow": shallow.experiment_set,
+        "v_rest_deep_raw_v": v_deep,
+        "v_rest_shallow_raw_v": v_shallow,
+        "fit_v_min": window_low,
+        "fit_v_max": FIT_V_MAX,
+        "n_fit_samples": int(in_window.sum()),
+        "n_cells": int(cells.size),
+        "f_direct_up": f_direct,
+        "f_direct_up_std": f_direct_std,
+        "inv_f_direct_up": 1.0 / f_direct,
+        "f_eta34": f_eta34,
+        "f_eta34_std": f_eta34_std,
+        "v_float_eta34": float(np.mean(v_float_34)),
+        "rms_eta34_a": float(np.mean(rms_34)),
+        "f_free": f_free,
+        "f_free_std": f_free_std,
+        "v_float_free": float(np.mean(v_float_free)),
+        "exponent_free": float(np.mean(exponent_free)),
+        "rms_free_a": float(np.mean(rms_free)),
+        "f_linear": f_linear,
+        "f_linear_std": f_linear_std,
+        "linear_slope_a_per_v": float(np.mean(slope)),
+        "rms_linear_a": float(np.mean(rms_linear)),
+        "bracket_low": low,
+        "bracket_high": high,
+        "eta34_bracket_position": bracket_position(f_direct, f_linear, f_eta34),
+        "n_cells_eta34_below_linear": int(np.sum(np.array(eta34) < np.array(linear))),
+        "eta34_in_bracket": bracket_contains(f_direct, f_linear, f_eta34),
+    }
+
+
 def _pinned_columns(
     pin: PinnedVFloat,
     f_direct: float,
@@ -949,13 +1131,106 @@ def parse_args(argv=None):
         "which reads no product and changes no output)",
     )
     parser.add_argument(
+        "--rest-bias-frame",
+        choices=("offset", "raw"),
+        default="offset",
+        help="which voltage frame F is anchored in: 'offset' (default) is the "
+        "zero-offset convention frame and reproduces every prior output "
+        "byte for byte; 'raw' anchors F at each run's dead-time rest bias "
+        "and ramp axis in the raw digitizer frame instead (see the module "
+        "docstring's '--rest-bias-frame raw' section) and is incompatible "
+        "with --pin-vf measured",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("es4_sweep_rest_bias_factor.csv"),
         help="CSV path; defaults to the working directory, and a path inside "
         f"{FORBIDDEN_OUTPUT_DIR}/ is refused",
     )
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.rest_bias_frame == "raw" and args.pin_vf == "measured":
+        parser.error(
+            "--rest-bias-frame raw and --pin-vf measured cannot be combined: the "
+            "pinned plasma potential is a product built under the offset-frame "
+            "convention and pinning it to a raw-frame fit would mix the two "
+            "frames with no stated conversion"
+        )
+    return args
+
+
+def _main_raw_frame(args, configs, output: Path) -> int:
+    """The ``--rest-bias-frame raw`` report and CSV: F anchored in the raw
+    digitizer frame.  See ``analyse_pair_raw_frame`` and the module
+    docstring's '--rest-bias-frame raw' section.
+    """
+    manifest_path = args.repo_root / "config/may2026_run_manifest.toml"
+    data_dir = args.data_dir or args.repo_root / "data/may2026"
+    print(f"manifest   {manifest_path}")
+    print(f"raw runs   {data_dir}")
+    print(f"rest-bias-frame  raw (anchored on RunSweep.v_rest_raw_frame / v_ramp_raw_frame)")
+    print(f"plateau    {PLATEAU_T_MIN_MS}-{PLATEAU_T_MAX_MS} ms, whole cycles only")
+    print(f"core cells |I_i| >= {CORE_FRACTION:.2f} of profile peak on both runs of a pair")
+    print(f"fit window [fit-v-min, {FIT_V_MAX:.1f}] V on the ES4 ion branch, selected in the "
+          "offset frame (same samples as the default mode) and read in the raw frame")
+    print()
+    print("F = |I_i(ES3 rest bias)| / |I_i(ES4 rest bias)|  (>= 1), both biases and the")
+    print("extrapolating fits anchored in the RAW digitizer frame -- see the module")
+    print("docstring's '--rest-bias-frame raw' section for what this does and does not change.")
+    print()
+
+    rows = []
+    for port, rotation, run_deep, run_shallow in RUN_PAIRS:
+        deep = read_run_sweep(configs[run_deep])
+        shallow = read_run_sweep(configs[run_shallow])
+        if deep.port != port or shallow.port != port:
+            raise ValueError(f"manifest ports disagree with the pairing for port {port}")
+        rows.append(analyse_pair_raw_frame(deep, shallow, args.fit_v_min))
+        row = rows[-1]
+        print(
+            f"port {port:>2} rot {rotation:>3}  runs {run_deep}/{run_shallow}  "
+            f"cells {row['n_cells']:>2}"
+        )
+        print(
+            f"    raw-frame rest   ES3 {row['v_rest_deep_raw_v']:8.3f} V   "
+            f"ES4 {row['v_rest_shallow_raw_v']:8.3f} V"
+        )
+        print(
+            f"    fit window  [{row['fit_v_min']:.2f}, {row['fit_v_max']:.2f}] V (offset "
+            f"frame), {row['n_fit_samples']} ramp samples"
+        )
+        print(
+            f"    F_direct  {row['f_direct_up']:.4f} +- {row['f_direct_up_std']:.4f}   "
+            f"(1/F = {row['inv_f_direct_up']:.4f})"
+        )
+        print(
+            f"    F_eta34   {row['f_eta34']:.4f} +- {row['f_eta34_std']:.4f}   "
+            f"V_f {row['v_float_eta34']:9.2f} V   p 0.750   rms {row['rms_eta34_a']:.2e} A"
+        )
+        print(
+            f"    F_free    {row['f_free']:.4f} +- {row['f_free_std']:.4f}   "
+            f"V_f {row['v_float_free']:9.2f} V   p {row['exponent_free']:.3f}   "
+            f"rms {row['rms_free_a']:.2e} A"
+        )
+        print(
+            f"    F_linear  {row['f_linear']:.4f} +- {row['f_linear_std']:.4f}   "
+            f"slope {row['linear_slope_a_per_v']:.3e} A/V   rms {row['rms_linear_a']:.2e} A"
+        )
+        print(
+            f"    bracket [{row['bracket_low']:.4f}, {row['bracket_high']:.4f}] "
+            f"vs F_eta34 {row['f_eta34']:.4f}  -> "
+            f"{'INSIDE' if row['eta34_in_bracket'] else 'OUTSIDE'}"
+        )
+        print()
+
+    print("This script rescales no product either way; it writes numbers only.")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
+    print(f"wrote {output}")
+    return 0
 
 
 def main(argv=None) -> int:
@@ -967,6 +1242,9 @@ def main(argv=None) -> int:
     pin_product = (
         args.repo_root / VP_PRODUCT_RELPATH if args.pin_vf == "measured" else None
     )
+
+    if args.rest_bias_frame == "raw":
+        return _main_raw_frame(args, configs, output)
 
     print(f"manifest   {manifest_path}")
     print(f"raw runs   {data_dir}")

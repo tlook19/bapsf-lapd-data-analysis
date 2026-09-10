@@ -218,6 +218,47 @@ ISAT_DECAY_FILTER_PAD_S = 0.1e-3
 ISAT_DECAY_CUTOFF_HZ = 100.0e3
 ISAT_DECAY_BIN_S = 10.0e-6
 
+#: Runs whose LATE-AFTERGLOW Isat decay trace (the ``isat_decay_*`` /
+#: ``isat_decay_dn_*`` family ``_isat_decay_stats`` builds from
+#: ``decay_start_s`` onward) carries a probe-local current the plasma's own
+#: light does not see, registered per ``(run_id, source channel)``.
+#:
+#: Run 22 (experiment set 2, port 21, rot-0): the core ISAT-channel decay
+#: fits tau = 22.66 ms against 7.18 ms on the run's OWN reference photodiode
+#: and 6.61-9.14 ms on every neighbouring set-2 run's ISAT channel at x=0;
+#: 0.9 mA is still undecayed at 47.8 ms, the record's end.  The run's
+#: I_SWEEP channel (tau 12.52 ms, unremarkable next to run 21's 10.32 ms)
+#: and its rot-180 partner run 23 (isat tau 9.14 ms) are both normal, so the
+#: finding is specific to this run's own ISAT channel and not a set-wide or
+#: a discharge effect.
+#:
+#: DISCLOSED, never corrected: a registered run's afterglow trace is
+#: NaN-filled from ``decay_start_s`` onward rather than dropped, so a
+#: consumer sees an explicit gap (the ``*_excluded`` / ``*_excluded_reason``
+#: arrays) and the run stays in the port roster the PORTS-equality checks
+#: below require.  Nothing BEFORE ``decay_start_s`` moves: the finding is
+#: afterglow-only, and every drive-phase product (``isat_ftavg_*``, the
+#: 15.0-19.5 ms plateau window, ``processed/isat_profiles.hdf5`` itself) is
+#: built from an entirely separate code path this registry does not touch.
+LATE_AFTERGLOW_PROBE_LOCAL_CURRENT: dict[tuple[str, str], dict[str, object]] = {
+    ("22", "isat"): {
+        "reason": "probe_local_current_suspected",
+        "tau_ms": 22.657038696464106,
+        "photodiode_tau_ms": 7.1767975767679495,
+        "neighbor_tau_range_ms": (6.614529358475285, 9.136996719905085),
+        "undecayed_current_ma": 0.9,
+        "undecayed_time_ms": 47.8,
+        "source": (
+            "core ISAT-channel decay time constant 22.66 ms at x=0, against "
+            "7.18 ms on this run's own reference-photodiode decay and "
+            "6.61-9.14 ms on every neighbouring experiment-set-2 run's ISAT "
+            "channel at x=0; this run's I_SWEEP channel (tau 12.52 ms) and "
+            "its rot-180 partner run 23's ISAT channel (tau 9.14 ms) are "
+            "both unremarkable"
+        ),
+    },
+}
+
 #: Radius of the flux tube the measured profiles are averaged over, in cm.
 #: Direct caliper reading of the LAPD cathode assembly (2026-08-17): the frame
 #: opening is a 14.5 in aperture, 36.830 cm diameter, in a 15.0 in x 0.25 in
@@ -1190,6 +1231,8 @@ def _isat_decay_stats(
     source_channels = []
     source_inverted = []
     afterglow_start_ms = []
+    excluded = []
+    excluded_reason = []
     reference_time_ms = None
     source_by_run: dict[str, tuple[ChannelKind, bool]] = {}
 
@@ -1286,8 +1329,18 @@ def _isat_decay_stats(
             raise ValueError(f"Isat decay time grid differs for run {run_id}")
         mean = np.mean(retained, axis=0)
         std = np.std(retained, axis=0, ddof=1)
+        sem = std / np.sqrt(retained.shape[0])
+        registered = LATE_AFTERGLOW_PROBE_LOCAL_CURRENT.get((run_id, channel.value))
+        if registered is not None:
+            mean = np.full_like(mean, np.nan)
+            sem = np.full_like(sem, np.nan)
+            excluded.append(True)
+            excluded_reason.append(str(registered["source"]))
+        else:
+            excluded.append(False)
+            excluded_reason.append("")
         means.append(mean)
-        sems.append(std / np.sqrt(retained.shape[0]))
+        sems.append(sem)
         ports.append(int(run.config.probe.port or 0))
         run_ids.append(run_id)
         n_used.append(retained.shape[0])
@@ -1314,6 +1367,10 @@ def _isat_decay_stats(
         "source_channel": np.asarray(source_channels)[order],
         "source_inverted": np.asarray(source_inverted, dtype=np.bool_)[order],
         "afterglow_start_ms": np.asarray(afterglow_start_ms)[order],
+        # DISCLOSED late-afterglow exclusion, per LATE_AFTERGLOW_PROBE_LOCAL_CURRENT
+        # above: True/non-empty exactly where mean_a/sem_a were NaN-filled.
+        "excluded": np.asarray(excluded, dtype=np.bool_)[order],
+        "excluded_reason": np.asarray(excluded_reason)[order],
         "cutoff_hz": ISAT_DECAY_CUTOFF_HZ,
         "bin_s": ISAT_DECAY_BIN_S,
         "outlier_sigma": sigma,
@@ -2058,7 +2115,7 @@ def export_overlay(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        schema_version=np.array(25, dtype=np.int16),
+        schema_version=np.array(27, dtype=np.int16),
         experiment_set_id=np.array(experiment_set_id, dtype=np.int16),
         experiment_label=np.array(experiment_label),
         port=PORTS,
@@ -2166,6 +2223,8 @@ def export_overlay(
             dtype=np.int16,
         ),
         isat_decay_outlier_method=np.array(isat_decay["outlier_method"]),
+        isat_decay_excluded=isat_decay["excluded"],
+        isat_decay_excluded_reason=isat_decay["excluded_reason"],
         isat_decay_current_correction=np.array(
             "digitizer scale/offset, measured zero-offset subtraction, channel calibration"
         ),
@@ -2180,10 +2239,13 @@ def export_overlay(
         isat_decay_dn_source_file=np.array(str(rot0_isat_profile_path)),
         isat_decay_dn_source_channel=isat_decay_dn["source_channel"],
         isat_decay_dn_source_inverted=isat_decay_dn["source_inverted"],
+        isat_decay_dn_excluded=isat_decay_dn["excluded"],
+        isat_decay_dn_excluded_reason=isat_decay_dn["excluded_reason"],
         isat_decay_geomean_a_per_cm2=isat_decay_geomean["geomean_a_per_cm2"],
         isat_decay_geomean_sem_a_per_cm2=isat_decay_geomean["sem_a_per_cm2"],
         isat_decay_geomean_area_cm2=isat_decay_geomean["area_cm2"],
         isat_decay_geomean_pairing=isat_decay_geomean["pairing"],
+        isat_decay_geomean_excluded=isat_decay["excluded"] | isat_decay_dn["excluded"],
         isat_decay_face_convention=np.array(
             "BOTH Mach-probe faces at x = 0, on the shared isat_decay_time_ms "
             "grid, at the same ports and the same runs (isat_decay_port, "
