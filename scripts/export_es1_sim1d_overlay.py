@@ -122,7 +122,7 @@ import h5py
 import numpy as np
 from scipy.ndimage import uniform_filter1d
 
-from bapsf_lapd import ChannelKind, LapdDataset
+from bapsf_lapd import ChannelKind, LapdDataset, density_area_key_for_deadtime_source
 from bapsf_lapd.annotations import refuse_artifacts_in_window
 from bapsf_lapd.config import PORT_MAP_DEFAULT, PORT_MAPS, z_from_port
 from bapsf_lapd.filtering import butterworth_lowpass
@@ -210,14 +210,17 @@ ISAT_DECAY_BIN_S = 10.0e-6
 #: it too for the two to be the same quantity.
 FLUX_TUBE_RADIUS_CM = 18.415
 
-#: Collection area of the probe face each electrical channel sits on, as the
-#: attribute name carrying it.  Per ``bapsf_lapd.density``: at rot-0 the left
-#: face (toward the cathode, upstream) is the Isweep channel with area A_p_L,
-#: and the right face (toward the anode, downstream) is the Isat channel with
-#: area A_p_R.  The pairing is keyed off each run's OWN recorded channel rather
-#: than off which product file it came from, which is what keeps ES3 run 31 --
-#: whose two channels are exchanged between the products -- normalized by the
-#: right areas.
+#: Collection area of the probe face each electrical channel sits on under the
+#: NOMINAL wiring, as the attribute name carrying it.  Per ``bapsf_lapd.density``:
+#: at rot-0 the left face (toward the cathode, upstream) is the Isweep channel
+#: with area A_p_L, and the right face (toward the anode, downstream) is the
+#: Isat channel with area A_p_R.  The pairing is keyed off each run's OWN
+#: recorded channel rather than off which product file it came from, which is
+#: what keeps ES3 run 31 -- whose two channels are exchanged between the
+#: products -- normalized by the right areas.  Run 31's cables are also crossed
+#: at the connector, so its channels sit on the OTHER electrodes than this map
+#: names; ``_channel_area_attr`` applies that per run and is what every area
+#: lookup and pairing string here goes through.
 CHANNEL_AREA_ATTR = {"i_sweep": "ap_L_cm2", "isat": "ap_R_cm2"}
 
 #: Number of points at each end of the scan that set the background baseline.
@@ -584,6 +587,19 @@ def _rot0_isat_profiles(
     }
 
 
+def _channel_area_attr(run_id: str, channel: str) -> str:
+    """Return the area attribute of the electrode ``run_id``'s ``channel`` collected on.
+
+    ``CHANNEL_AREA_ATTR`` names the nominal wiring; a run whose cables were
+    crossed at the connector reads the other electrode on each channel, and
+    ``density_area_key_for_deadtime_source`` is the single place that knows
+    which runs those are.
+    """
+    if channel not in CHANNEL_AREA_ATTR:
+        raise ValueError(f"run {run_id}: unknown probe channel {channel}")
+    return density_area_key_for_deadtime_source(run_id, ChannelKind(channel))
+
+
 def _flow_symmetrized_profiles(
     upstream: dict,
     downstream: dict,
@@ -641,12 +657,13 @@ def _flow_symmetrized_profiles(
         densities = []
         relatives = []
         run_areas = []
+        run_area_attrs = []
         for channel, current, current_sem in zip(channels, currents, sems):
-            if channel not in CHANNEL_AREA_ATTR:
-                raise ValueError(f"run {run_id}: unknown probe channel {channel}")
-            area = float(areas_cm2[run_id][CHANNEL_AREA_ATTR[channel]])
+            area_attr = _channel_area_attr(run_id, channel)
+            area = float(areas_cm2[run_id][area_attr])
             if area <= 0.0:
                 raise ValueError(f"run {run_id}: non-positive {channel} face area")
+            run_area_attrs.append(area_attr)
             run_areas.append(area)
             densities.append(current / area)
             with np.errstate(invalid="ignore", divide="ignore"):
@@ -657,8 +674,8 @@ def _flow_symmetrized_profiles(
         # d(sqrt(ab))/sqrt(ab) = 0.5 * hypot(da/a, db/b)
         sem[index] = geomean[index] * 0.5 * np.hypot(relatives[0], relatives[1])
         pairing.append(
-            f"{channels[0]}/{CHANNEL_AREA_ATTR[channels[0]]}={run_areas[0]:.6f} cm2"
-            f" x {channels[1]}/{CHANNEL_AREA_ATTR[channels[1]]}="
+            f"{channels[0]}/{run_area_attrs[0]}={run_areas[0]:.6f} cm2"
+            f" x {channels[1]}/{run_area_attrs[1]}="
             f"{run_areas[1]:.6f} cm2"
         )
         used_areas.append(run_areas)
@@ -879,12 +896,13 @@ def _isat_decay_geomean(
         densities = []
         relatives = []
         run_areas = []
+        run_area_attrs = []
         for channel, current, current_sem in zip(channels, currents, sems):
-            if channel not in CHANNEL_AREA_ATTR:
-                raise ValueError(f"run {run_id}: unknown probe channel {channel}")
-            area = float(areas_cm2[run_id][CHANNEL_AREA_ATTR[channel]])
+            area_attr = _channel_area_attr(run_id, channel)
+            area = float(areas_cm2[run_id][area_attr])
             if area <= 0.0:
                 raise ValueError(f"run {run_id}: non-positive {channel} face area")
+            run_area_attrs.append(area_attr)
             run_areas.append(area)
             densities.append(current / area)
             with np.errstate(invalid="ignore", divide="ignore"):
@@ -895,8 +913,8 @@ def _isat_decay_geomean(
         # d(sqrt(ab))/sqrt(ab) = 0.5 * hypot(da/a, db/b)
         sem[index] = geomean[index] * 0.5 * np.hypot(relatives[0], relatives[1])
         pairing.append(
-            f"{channels[0]}/{CHANNEL_AREA_ATTR[channels[0]]}={run_areas[0]:.6f} cm2"
-            f" x {channels[1]}/{CHANNEL_AREA_ATTR[channels[1]]}="
+            f"{channels[0]}/{run_area_attrs[0]}={run_areas[0]:.6f} cm2"
+            f" x {channels[1]}/{run_area_attrs[1]}="
             f"{run_areas[1]:.6f} cm2"
         )
         used_areas.append(run_areas)

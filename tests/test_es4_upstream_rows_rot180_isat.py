@@ -26,6 +26,7 @@ from scripts.es4_upstream_rows_rot180_isat import (
     FORBIDDEN_OUTPUT_DIR,
     M_I_AMU,
     PLATEAU_MS,
+    PORT_RUNS,
     R_UP_REFERENCE,
     R_UP_REFERENCE_X_CM,
     area_key_for_electrode,
@@ -50,24 +51,45 @@ def test_area_key_follows_the_collecting_electrode():
         area_key_for_electrode(ChannelKind.V_SWEEP)
 
 
-def test_the_deadtime_source_helper_agrees_at_every_port_built_here():
+def test_the_deadtime_source_helper_agrees_on_every_run_this_instrument_reads():
     """The helper and this instrument name the same electrode area.
 
     ``density_area_key_for_deadtime_source`` used to special-case port 11 with
     an ISAT source and answer ``ap_L_cm2`` everywhere else, which named the
     I_SWEEP face's area for the ISAT face at ports 21/29/41.  It is keyed on the
-    collecting electrode now, so it returns what this instrument uses at every
-    port, port 11 included.
+    collecting electrode now, and on the run identity wherever the cables were
+    crossed at the connector, so it returns what this instrument uses on every
+    run this instrument reads -- none of which is a crossed-cable run.
     """
-    for port in (11, 21, 29, 41, 50):
+    es4_runs = sorted({run for pair in PORT_RUNS.values() for run in pair})
+    assert es4_runs == ["42", "43", "44", "45", "46", "47"]
+
+    for run_id in [*es4_runs, None]:
         for channel in (ChannelKind.ISAT, ChannelKind.I_SWEEP):
             assert (
-                density_area_key_for_deadtime_source(port, channel)
+                density_area_key_for_deadtime_source(run_id, channel)
                 == area_key_for_electrode(channel)
             )
 
     assert area_key_for_electrode(ChannelKind.ISAT) == "ap_R_cm2"
     assert area_key_for_electrode(ChannelKind.I_SWEEP) == "ap_L_cm2"
+
+
+def test_the_crossed_cable_run_is_the_one_place_the_two_conventions_part():
+    """Run 31's channels sat on the other electrodes; this instrument never sees it.
+
+    ``area_key_for_electrode`` here states the NOMINAL wiring and takes no run,
+    which is sound only because every run this instrument reads is nominally
+    wired.  The helper answers per run, and on the crossed-cable run it answers
+    the other way round.  Pinning the divergence keeps the local convention from
+    being carried to a run it does not hold for.
+    """
+    assert density_area_key_for_deadtime_source("31", ChannelKind.ISAT) == "ap_L_cm2"
+    assert density_area_key_for_deadtime_source("31", ChannelKind.I_SWEEP) == "ap_R_cm2"
+    assert density_area_key_for_deadtime_source(
+        "31", ChannelKind.ISAT
+    ) != area_key_for_electrode(ChannelKind.ISAT)
+    assert "31" not in {run for pair in PORT_RUNS.values() for run in pair}
 
 
 def test_plateau_window_selects_the_four_scoring_windows():

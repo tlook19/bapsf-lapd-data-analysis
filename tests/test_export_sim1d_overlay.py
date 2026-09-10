@@ -332,7 +332,10 @@ def _face(channel, current, sem=1.0, run_id="01", port=11):
     }
 
 
-AREAS = {"01": {"ap_L_cm2": 2.0, "ap_R_cm2": 4.0}}
+AREAS = {
+    "01": {"ap_L_cm2": 2.0, "ap_R_cm2": 4.0},
+    "31": {"ap_L_cm2": 2.0, "ap_R_cm2": 4.0},
+}
 
 
 def test_geomean_normalizes_each_face_by_its_own_channel_area():
@@ -342,7 +345,33 @@ def test_geomean_normalizes_each_face_by_its_own_channel_area():
     # sqrt((6/2) * (8/4)) = sqrt(6)
     assert combined["profiles"][0, 0, 0] == pytest.approx(np.sqrt(6.0))
     assert combined["area_cm2"].tolist() == [[2.0, 4.0]]
-    assert "ap_L_cm2" in str(combined["pairing"][0])
+    assert "i_sweep/ap_L_cm2" in str(combined["pairing"][0])
+    assert "isat/ap_R_cm2" in str(combined["pairing"][0])
+
+
+def test_geomean_gives_a_crossed_cable_run_the_electrode_each_channel_sat_on():
+    """Run 31's cables are crossed, so its channel-to-area map is inverted.
+
+    The two currents are unchanged; what moves is which calibrated area
+    normalizes each of them, and therefore each single-face density and the
+    pairing string.  The geometric mean divides by the same A_L * A_R either
+    way, so its VALUE is invariant -- that invariance is asserted here so a
+    later reader does not mistake an unmoved geomean for an unapplied swap.
+    """
+    combined = _flow_symmetrized_profiles(
+        _face("isat", 6.0, run_id="31"), _face("i_sweep", 8.0, run_id="31"), AREAS
+    )
+
+    # isat sat on the LEFT electrode (2.0) and i_sweep on the RIGHT one (4.0).
+    assert combined["area_cm2"].tolist() == [[2.0, 4.0]]
+    assert "isat/ap_L_cm2=2.000000 cm2" in str(combined["pairing"][0])
+    assert "i_sweep/ap_R_cm2=4.000000 cm2" in str(combined["pairing"][0])
+
+    nominal = _flow_symmetrized_profiles(
+        _face("isat", 6.0), _face("i_sweep", 8.0), AREAS
+    )
+    assert "isat/ap_R_cm2=4.000000 cm2" in str(nominal["pairing"][0])
+    assert combined["profiles"][0, 0, 0] == pytest.approx(nominal["profiles"][0, 0, 0])
 
 
 def test_geomean_is_symmetric_under_exchanging_which_product_holds_which_face():
@@ -508,7 +537,21 @@ def test_decay_geomean_normalizes_each_face_by_its_own_channel_area():
     # sqrt((6/2) * (8/4)) = sqrt(6), in A cm^-2 and not in amperes.
     assert combined["geomean_a_per_cm2"][0, 0] == pytest.approx(np.sqrt(6.0))
     assert combined["area_cm2"].tolist() == [[2.0, 4.0]]
-    assert "ap_L_cm2" in str(combined["pairing"][0])
+    assert "i_sweep/ap_L_cm2" in str(combined["pairing"][0])
+    assert "isat/ap_R_cm2" in str(combined["pairing"][0])
+
+
+def test_decay_geomean_gives_a_crossed_cable_run_the_inverted_channel_areas():
+    """The afterglow pair takes the same per-run electrode map as the profiles."""
+    combined = _isat_decay_geomean(
+        _decay_face("isat", 6.0, run_id="31"),
+        _decay_face("i_sweep", 8.0, run_id="31"),
+        AREAS,
+    )
+
+    assert combined["area_cm2"].tolist() == [[2.0, 4.0]]
+    assert "isat/ap_L_cm2=2.000000 cm2" in str(combined["pairing"][0])
+    assert "i_sweep/ap_R_cm2=4.000000 cm2" in str(combined["pairing"][0])
 
 
 def test_decay_geomean_is_symmetric_under_exchanging_the_two_faces():

@@ -499,6 +499,16 @@ def main() -> None:
         out_hdf.create_dataset("x_cm", data=X_CM)
         output_sets = out_hdf.create_group("experiment_sets")
 
+        # The area keys below are keyed by PHYSICAL FACE, not by channel: at
+        # rot-0 the upstream face is the left electrode (ap_L) and the
+        # downstream face the right one (ap_R), and the rotation exchanges
+        # them.  A run whose cables were crossed at the connector reads its two
+        # faces on the other two channels, and the per-run source override in
+        # bapsf_lapd.corrections already routes each face's product here, so
+        # the face-keyed area is the same either way and nothing about the swap
+        # enters this call.  tests/test_density_area_keys.py pins that the face
+        # key each run is stamped with here equals the swap-aware electrode key
+        # of the channel that product actually carried.
         if "0" in args.rotations:
             _process_rotation(
                 output_sets,
