@@ -95,6 +95,7 @@ from bapsf_lapd import (
     ChannelKind,
     LapdDataset,
     LapdRun,
+    density_area_key_for_deadtime_source,
     effective_rotation_deg,
     electrical_connections_swapped,
 )
@@ -192,8 +193,7 @@ def _interp_filled_te_to_deadtime(
 
 def process_run(
     run: LapdRun,
-    ap_R_m2: float,
-    ap_L_m2: float,
+    calib_m2: dict[str, float],
     probe_id: str,
     te_grid: np.ndarray,
     probe_a_calibration,
@@ -202,14 +202,30 @@ def process_run(
 
     te_grid: (51, n_cycles) filled T_e in eV, aligned to dead-time midpoints.
 
+    ``calib_m2`` is the probe's calibration dict (``ap_L_m2``/``ap_R_m2``, and
+    the ``_cm2`` twins) keyed by ELECTRODE, as loaded by ``_load_calibration``.
+    The area applied to each channel's dead-time current follows the
+    electrode that channel physically reached, per
+    ``density_area_key_for_deadtime_source`` -- on a nominal run ISAT reads
+    the right electrode and I_SWEEP the left one; on a run in
+    ``ELECTRICAL_SWAP_RUN_IDS`` the two cables are crossed at the connector
+    and the areas exchange with them.
+
     Returns arrays keyed by output dataset name.
     """
     sw = run.config.sweep
     n_pos = run.config.acquisition.n_positions
     n_cycles = sw.n_cycles
     n_shots = run.config.acquisition.n_shots_per_position
-    rotation_deg = effective_rotation_deg(run.config.run_id, run.config.probe.rotation_deg)
-    connections_swapped = electrical_connections_swapped(run.config.run_id)
+    run_id = run.config.run_id
+    rotation_deg = effective_rotation_deg(run_id, run.config.probe.rotation_deg)
+    connections_swapped = electrical_connections_swapped(run_id)
+    area_isat_m2 = calib_m2[
+        density_area_key_for_deadtime_source(run_id, ChannelKind.ISAT).replace("cm2", "m2")
+    ]
+    area_isweep_m2 = calib_m2[
+        density_area_key_for_deadtime_source(run_id, ChannelKind.I_SWEEP).replace("cm2", "m2")
+    ]
 
     dead_slices = inter_sweep_sample_slices(sw, run.config.acquisition, clip_s=CLIP_S)
     inter_times_s = _inter_sweep_times_s(run)
@@ -251,8 +267,8 @@ def process_run(
 
         # Per-shot density: (51, 20) — cs_k broadcast via [:, None]
         with np.errstate(all="ignore"):
-            n_e_R_shot = electron_density_m3(isat_R_shot, ap_R_m2, cs_k[:, None])
-            n_e_L_shot = electron_density_m3(isat_L_shot, ap_L_m2, cs_k[:, None])
+            n_e_R_shot = electron_density_m3(isat_R_shot, area_isat_m2, cs_k[:, None])
+            n_e_L_shot = electron_density_m3(isat_L_shot, area_isweep_m2, cs_k[:, None])
 
         # Shot-averaged density and std: (51,)
         with np.errstate(all="ignore"):
@@ -397,8 +413,7 @@ def main() -> None:
 
                 results = process_run(
                     run,
-                    ap_R_m2=calib["ap_R_m2"],
-                    ap_L_m2=calib["ap_L_m2"],
+                    calib_m2=calib,
                     probe_id=pid,
                     te_grid=te_grid,
                     probe_a_calibration=probe_a_calibration,
