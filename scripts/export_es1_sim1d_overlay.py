@@ -225,12 +225,12 @@ ISAT_DECAY_BIN_S = 10.0e-6
 #:
 #: Run 22 (experiment set 2, port 21, rot-0): the core ISAT-channel decay
 #: fits tau = 22.66 ms against 7.18 ms on the run's OWN reference photodiode
-#: and 6.61-9.14 ms on every neighbouring set-2 run (the diagnostician's
-#: ``tail_census_decay.csv``, channel=isat, pos=x0); 0.9 mA is still
-#: undecayed at 47.8 ms, the record's end.  The run's I_SWEEP channel (tau
-#: 12.52 ms, unremarkable next to run 21's 10.32 ms) and its rot-180 partner
-#: run 23 (isat tau 9.14 ms) are both normal, so the finding is specific to
-#: this run's own ISAT channel and not a set-wide or a discharge effect.
+#: and 6.61-9.14 ms on every neighbouring set-2 run's ISAT channel at x=0;
+#: 0.9 mA is still undecayed at 47.8 ms, the record's end.  The run's
+#: I_SWEEP channel (tau 12.52 ms, unremarkable next to run 21's 10.32 ms)
+#: and its rot-180 partner run 23 (isat tau 9.14 ms) are both normal, so the
+#: finding is specific to this run's own ISAT channel and not a set-wide or
+#: a discharge effect.
 #:
 #: DISCLOSED, never corrected: a registered run's afterglow trace is
 #: NaN-filled from ``decay_start_s`` onward rather than dropped, so a
@@ -249,12 +249,12 @@ LATE_AFTERGLOW_PROBE_LOCAL_CURRENT: dict[tuple[str, str], dict[str, object]] = {
         "undecayed_current_ma": 0.9,
         "undecayed_time_ms": 47.8,
         "source": (
-            "isweep-tail-zero-offset advisor consult 2026-09-10: core ISAT "
-            "tau 22.66 ms vs 7.18 ms on its own reference_photodiode and "
-            "6.61-9.14 ms on every neighbouring experiment-set-2 run "
-            "(tail_census_decay.csv, channel=isat, pos=x0); the I_SWEEP "
-            "channel (tau 12.52 ms) and the rot-180 partner run 23 (isat "
-            "tau 9.14 ms) are normal"
+            "core ISAT-channel decay time constant 22.66 ms at x=0, against "
+            "7.18 ms on this run's own reference-photodiode decay and "
+            "6.61-9.14 ms on every neighbouring experiment-set-2 run's ISAT "
+            "channel at x=0; this run's I_SWEEP channel (tau 12.52 ms) and "
+            "its rot-180 partner run 23's ISAT channel (tau 9.14 ms) are "
+            "both unremarkable"
         ),
     },
 }
@@ -2115,7 +2115,7 @@ def export_overlay(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        schema_version=np.array(25, dtype=np.int16),
+        schema_version=np.array(27, dtype=np.int16),
         experiment_set_id=np.array(experiment_set_id, dtype=np.int16),
         experiment_label=np.array(experiment_label),
         port=PORTS,

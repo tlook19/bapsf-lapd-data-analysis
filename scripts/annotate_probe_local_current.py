@@ -49,19 +49,31 @@ DISCLOSED, never corrected: nothing here masks a cell, drops a run, or
 rescales a value.  The product's ``high_shot_rejection_*`` attrs and every
 dataset are untouched.
 
-REGENERATE THE PRODUCT (writer, then this annotator; run from the repo root)
-    python scripts/plot_isat_profiles.py \
-        --source-channel isat --rotation 0 \
-        --output processed/isat_profiles.hdf5 --no-animation
+PLACE THE ANNOTATION (this annotator on the PLACED product, then the
+downstream export; run from the repo root)
+    cp processed/isat_profiles.hdf5 processed/isat_profiles.hdf5.bak
     python scripts/annotate_probe_local_current.py . \
         processed/isat_profiles.hdf5 \
-        processed/isat_profiles_probe_local_current_screen.json
+        processed/isat_profiles_probe_local_current_screen.json \
+        --allow-processed
+    PYTHONPATH=src python scripts/export_es1_sim1d_overlay.py --experiment-set 2
+    PYTHONPATH=src python scripts/augment_sim1d_overlay_isat_drive.py \
+        --experiment-set 2 --overlay processed/es2_sim1d_overlay.npz \
+        --output processed/es2_sim1d_overlay_v24.npz
+
+A raw rebuild of ``processed/isat_profiles.hdf5`` (``plot_isat_profiles.py``)
+is deliberately NOT part of this sequence: the placed file already carries
+whatever OTHER annotator state has been written onto it (the rail mask, the
+saturation screen, ...), and a rebuild starts a fresh file with none of it.
+This annotator is meant to run on the PLACED file, in place, exactly like its
+siblings; rebuild only when the writer's own inputs changed, as a separate,
+deliberate step, and re-run every annotator afterward.
 
 The annotator edits the product in place (``r+``) and writes a JSON summary
 sidecar.  It reads no raw run data -- only the registry above.  Needs h5py,
 the environment.yml env, not the dead ./.venv.
 
-Usage:  python annotate_probe_local_current.py <repo-root> <product.hdf5> <summary.json>
+Usage:  python annotate_probe_local_current.py <repo-root> <product.hdf5> <summary.json> [--allow-processed]
 """
 import argparse
 import json
@@ -78,6 +90,29 @@ from export_es1_sim1d_overlay import LATE_AFTERGLOW_PROBE_LOCAL_CURRENT  # noqa:
 #: This annotator only ever registers the ``isat`` channel's product; a
 #: registry entry for any other channel is not this product's business.
 CHANNEL = "isat"
+
+
+def refuse_processed_output(product, allow_processed: bool) -> None:
+    """Refuse to annotate a placed product unless the caller asked for it.
+
+    ``processed/`` is the transport campaign's scoring chain: a product there
+    is consumed by name, so an in-place edit of one is a measurement-side
+    change, not a scratch operation.  A ``product`` path with a ``processed``
+    directory component is therefore refused here, at argument resolution and
+    before any file is opened, unless ``--allow-processed`` is passed.  The
+    pattern follows scripts/restamp_density_area_keys.py.
+    """
+    if allow_processed:
+        return
+    if "processed" not in Path(product).resolve().parts[:-1]:
+        return
+    raise ValueError(
+        f"refusing to annotate {product}: the path lies under a processed/ "
+        "directory, which holds the placed products the transport campaign "
+        "scores against, and this pass edits its input IN PLACE. Annotate a "
+        "copy outside processed/, or pass --allow-processed to say that "
+        "editing the placed product is the intent."
+    )
 
 
 def main(argv=None):
@@ -102,7 +137,14 @@ def main(argv=None):
         type=Path,
         help="path for the JSON summary sidecar",
     )
+    parser.add_argument(
+        "--allow-processed",
+        action="store_true",
+        help="permit a product path under processed/, the placed scoring chain",
+    )
     args = parser.parse_args(argv)
+
+    refuse_processed_output(args.product, args.allow_processed)
 
     registered = {
         run_id: entry

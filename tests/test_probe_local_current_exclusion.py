@@ -1,5 +1,4 @@
-"""Run 22's late-afterglow probe-local-current exclusion (isweep-tail-zero-
-offset advisor consult, 2026-09-10).
+"""Run 22's late-afterglow probe-local-current exclusion.
 
 The finding: run 22 (experiment set 2, port 21, rot-0) carries a probe-local
 current on its ISAT channel that dominates the late-afterglow decay -- tau

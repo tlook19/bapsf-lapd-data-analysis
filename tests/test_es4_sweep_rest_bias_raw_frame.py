@@ -159,8 +159,9 @@ DATASET = LapdDataset.from_directory("data/may2026")
 
 @pytest.mark.skipif(len(DATASET) == 0, reason="local HDF5 data files are not present")
 def test_raw_frame_rest_levels_reproduce_the_advisor_reading():
-    # advisor consult isweep-tail-zero-offset 2026-09-10, vsweep_frame_check.out:
-    # run 32 (ES3 p21 rot0) dead-time rest -90.9 V raw, run 42 (ES4 p21 rot0) -24.1 V.
+    # An independent raw-frame reduction of the same shot-averaged v_sweep
+    # dead-time windows: run 32 (ES3 p21 rot0) dead-time rest -90.9 V raw,
+    # run 42 (ES4 p21 rot0) -24.4 V raw.
     configs = load_run_manifest("config/may2026_run_manifest.toml", data_dir="data/may2026")
     es3 = read_run_sweep(configs["32"])
     es4 = read_run_sweep(configs["42"])

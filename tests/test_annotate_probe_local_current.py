@@ -3,8 +3,13 @@ the registered run's group and touches nothing else.
 """
 
 import h5py
+import pytest
 
-from scripts.annotate_probe_local_current import CHANNEL, main
+from scripts.annotate_probe_local_current import (
+    CHANNEL,
+    main,
+    refuse_processed_output,
+)
 from scripts.export_es1_sim1d_overlay import LATE_AFTERGLOW_PROBE_LOCAL_CURRENT
 
 
@@ -56,3 +61,33 @@ def test_summary_json_names_exactly_the_annotated_runs(tmp_path):
     payload = json.loads(summary.read_text())
     assert payload["channel"] == CHANNEL
     assert payload["annotated_runs"] == ["22"]
+
+
+def test_a_processed_product_path_is_refused_without_the_flag(tmp_path):
+    """The guard fires at argument resolution, before any file is opened."""
+    placed = tmp_path / "processed" / "isat_profiles.hdf5"
+    placed.parent.mkdir()
+    placed.write_bytes(b"not really hdf5, the guard never opens it")
+    with pytest.raises(ValueError, match="--allow-processed"):
+        refuse_processed_output(placed, allow_processed=False)
+    assert placed.read_bytes() == b"not really hdf5, the guard never opens it"
+
+    refuse_processed_output(placed, allow_processed=True)
+    refuse_processed_output(tmp_path / "regen" / "isat_profiles.hdf5", allow_processed=False)
+
+
+def test_main_proceeds_on_a_processed_path_with_the_flag(tmp_path):
+    placed = tmp_path / "processed" / "isat_profiles.hdf5"
+    placed.parent.mkdir()
+    _write_minimal_isat_profiles(placed)
+    summary = tmp_path / "processed" / "screen.json"
+
+    with pytest.raises(ValueError, match="--allow-processed"):
+        main([str(tmp_path), str(placed), str(summary)])
+
+    main([str(tmp_path), str(placed), str(summary), "--allow-processed"])
+
+    with h5py.File(placed, "r") as hf:
+        assert bool(
+            hf["experiment_sets/2/22"].attrs["probe_local_current_suspected"]
+        ) is True
