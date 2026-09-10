@@ -146,6 +146,14 @@ from plot_interferometer_by_experiment_set import (
     _time_group,
 )
 from plot_isat_profiles import _deadtime_shot_means, _high_shot_outlier_mask
+from es4_upstream_rows_rot180_isat import (
+    CORE_CM as ES4_UPSTREAM_CORE_CM,
+    PORT_RUNS as ES4_UPSTREAM_PORT_RUNS,
+    PROBE_FROM_DIGIT as ES4_UPSTREAM_PROBE_FROM_DIGIT,
+    area_key_for_electrode as es4_upstream_area_key,
+    build_port as es4_upstream_build_port,
+    load_areas_cm2 as es4_upstream_load_areas_cm2,
+)
 
 
 MANIFEST = Path("config/may2026_run_manifest.toml")
@@ -159,6 +167,15 @@ ISAT_PROFILE_HDF5 = Path("processed/isweep_deadtime_profiles.hdf5")
 #: which reads low because it sits in the probe body's flow shadow.  Feeds the
 #: ``isat_ftavg_*`` family only.
 ROT0_ISAT_PROFILE_HDF5 = Path("processed/isat_profiles.hdf5")
+#: The rot-180 dead-time line scans from the ``isat`` channel: at rot-180 that
+#: channel collects on the UPSTREAM probe face, so this product is the second,
+#: independent measurement of the same upstream density the ``i_sweep`` chain
+#: measures at rot-0.  Read by the ES4 upstream bracket only.
+ROT180_ISAT_PROFILE_HDF5 = Path("processed/isat_rot180_deadtime_profiles.hdf5")
+#: Per-probe collecting-electrode areas, keyed ``ap_L_cm2`` (the I_SWEEP
+#: electrode) and ``ap_R_cm2`` (the ISAT electrode).  Read by the ES4 upstream
+#: bracket only; every other family gets its areas from its input product.
+AREA_CALIBRATION_TOML = Path("processed/probe_area_calibration.toml")
 ZERO_OFFSETS = Path("processed/trace_zero_offsets.toml")
 WINDOW_REFITS_HDF5 = Path("processed/sweep_window_refits.hdf5")
 PORTS = np.array([11, 21, 29, 41, 50], dtype=np.int16)
@@ -209,6 +226,70 @@ ISAT_DECAY_BIN_S = 10.0e-6
 #: model's single radial cell uses, which is why the measured target has to use
 #: it too for the two to be the same quantity.
 FLUX_TUBE_RADIUS_CM = 18.415
+
+# --------------------------------------------------------------------------
+# The ES4 upstream-face bracket (experiment set 4 only)
+# --------------------------------------------------------------------------
+#
+# At every experiment-set-4 port the probe was run twice, once at each
+# rotation, so the SAME physical upstream density has two independent
+# measurements: the ``i_sweep`` electrode at rot-0 and the ``isat`` electrode
+# at rot-180.  The density chain behind density_mean_cm3 / density_ftavg_cm3
+# reads the rot-0 ``i_sweep`` face at every set and is unchanged here.  This
+# family ADDS the rot-180 ``isat`` face beside it as a labelled two-face
+# bracket, so a consumer can see the face spread instead of inheriting one
+# face's convention silently.  Nothing in this family replaces an existing
+# field, and the family is ABSENT from every set but 4.
+#
+# The arithmetic is NOT re-implemented here: the rows come from
+# ``scripts/es4_upstream_rows_rot180_isat.py``'s build_port, the single
+# implementation, called with this exporter's own product paths and its own
+# filled-T_e row.
+
+#: The only experiment set that carries the bracket.
+ES4_UPSTREAM_SET_ID = 4
+
+#: The ports whose rot-180 partner survives that product's own exclusion
+#: masks.  p21's partner (run 43) carries a registered channel-state shot
+#: range covering the whole core band, so it has no admitted core cell and no
+#: rot-180 row is built there; p50 (run 48) is rot-0 only and has no partner.
+ES4_UPSTREAM_BRACKET_PORTS = (29, 41)
+
+#: The port whose density row is re-derived at a MEASURED plateau T_e.
+ES4_UPSTREAM_TE_REDERIVED_PORT = 21
+
+#: The measured ES4 p21 plateau T_e, in eV, and what it is a measurement of.
+#: Produced by ``scripts/es4_te_time_slope.py``: its ``core_family_med_ev``
+#: column -- the core-band (|x| <= 10 cm) mean of the per-cell
+#: window-family-median sweep T_e -- averaged over the cycles inside the
+#: window named beside it.  The primary value is quoted at the SCORING
+#: PLATEAU WINDOW, the window the transport comparison scores the drive
+#: plateau over and the window the prior it replaces is quoted at.
+ES4_UPSTREAM_P21_TE_MEASURED_EV = 0.6507
+ES4_UPSTREAM_P21_TE_MEASURED_WINDOW_MS = RAW_PLATEAU_WINDOW_MS
+ES4_UPSTREAM_P21_TE_MEASURED_FACE = "rot-0 i_sweep upstream face, run 42"
+ES4_UPSTREAM_P21_TE_MEASURED_BASIS = (
+    "core-band family-median sweep T_e (scripts/es4_te_time_slope.py, "
+    "core_family_med_ev), cycle mean over the window"
+)
+#: The SAME estimator and face over the instrument's full displayed plateau,
+#: 10.0-19.5 ms.  Carried because it is the value the p11->p21 pressure chain
+#: on record was computed at; it is a different window, not a different
+#: measurement, and is exported so that chain stays reproducible from this
+#: product rather than from a transcription.
+ES4_UPSTREAM_P21_TE_MEASURED_DISPLAY_EV = 0.6641
+ES4_UPSTREAM_P21_TE_MEASURED_DISPLAY_WINDOW_MS = (10.0, 19.5)
+#: The opposite face at the same port, same estimator, same two windows: the
+#: T_e face spread, which is the uncertainty the re-derivation inherits.
+ES4_UPSTREAM_P21_TE_MEASURED_ROT180_EV = 0.6431
+ES4_UPSTREAM_P21_TE_MEASURED_ROT180_DISPLAY_EV = 0.6531
+
+#: The sweep rest-bias factor F applied to the retained i_sweep rows.  The
+#: placed chain applies NONE -- neither the density product nor this exporter
+#: multiplies an ES4 i_sweep row by a rest-bias factor -- so the value stamped
+#: on every row of this family is 1.0 and the field exists to say so
+#: explicitly rather than leave it inferred.
+ES4_UPSTREAM_F_APPLIED = 1.0
 
 #: Collection area of the probe face each electrical channel sits on under the
 #: NOMINAL wiring, as the attribute name carrying it.  Per ``bapsf_lapd.density``:
@@ -452,6 +533,377 @@ def _flux_tube_series(
                 out[name][zi, ti] = stats[name]
             out["n_despiked"][zi, ti] = stats["n_despiked"]
     return out
+
+
+def _es4_upstream_definitions() -> dict[str, np.ndarray]:
+    """The prose fields of the ES4 upstream bracket, kept out of the row build."""
+    return {
+        "es4_upstream_definition": np.array(
+            "ADDITIVE family, experiment set 4 ONLY: labelled alternative "
+            "UPSTREAM density rows, exported as a row table.  It ADDS to the "
+            "product and replaces nothing -- density_mean_cm3, "
+            "density_ftavg_cm3, density_total_sem_cm3, te_mean_ev, "
+            "te_row_measured and every other pre-existing field are "
+            "bit-unchanged by its presence, and a consumer that does not know "
+            "these names reads exactly the product it read before.  Row r is "
+            "named by es4_upstream_row_key[r]; its port is "
+            "es4_upstream_row_port[r]; its per-sample values are "
+            "es4_upstream_density_mean_cm3[r] (the unweighted core-band mean, "
+            "the LEGACY convention of density_mean_cm3) and "
+            "es4_upstream_density_ftavg_cm3[r] (the FLUX-TUBE convention of "
+            "density_ftavg_cm3, same radius, same despike, same "
+            "centroid-folding), both in cm^-3 on es4_upstream_time_ms, which "
+            "is density_time_ms.  es4_upstream_density_core_count[r] counts "
+            "the core cells behind each sample.  NO SEM is exported for these "
+            "rows: the pre-existing density_total_sem_cm3 is the rot-0 "
+            "i_sweep chain's radial-scatter SEM plus the Probe-A area "
+            "calibration and is NOT the uncertainty of a rot-180 ISAT row.  "
+            "The face spread between a primary row and its "
+            "es4_upstream_row_bracket_partner is the quantity this family "
+            "exists to expose; it is a bracket, not an error bar."
+        ),
+        "es4_upstream_bracket_definition": np.array(
+            "THE TWO-FACE BRACKET.  At every ES4 port the probe was run twice, "
+            "once at each rotation.  The face that looks UPSTREAM is the "
+            "i_sweep electrode at rot-0 and the isat electrode at rot-180, so "
+            "the same physical upstream density has two independent "
+            "measurements.  Rows with es4_upstream_row_chain == "
+            "'deadtime_face_pair' are that pair: es4_upstream_row_face is "
+            "'rot180_isat' on the PRIMARY row (es4_upstream_row_role == "
+            "'primary') and 'rot0_isweep' on its partner "
+            "(es4_upstream_row_bracket_partner names it, and 'bracket_partner' "
+            "is its role).  Both come from ONE implementation of the row "
+            "arithmetic, scripts/es4_upstream_rows_rot180_isat.py's "
+            "build_port, called with this export's own products and its own "
+            "filled-T_e core-band row, so the two rows differ ONLY in which "
+            "face they read: identical cell-admission mask (finite and "
+            "positive on both faces, and carrying neither the rot-180 "
+            "product's rail_mask nor its state_mask), identical T_e, "
+            "identical plateau, identical area convention.  The partner row is "
+            "therefore NOT the same number as density_mean_cm3 at that port, "
+            "which comes from the full density product with its own per-cell "
+            "T_e and no dead-time admission mask; both are in the file and "
+            "both are labelled.  AREAS are keyed by the ELECTRODE that "
+            "collected, es4_upstream_row_area_key with the value in "
+            "es4_upstream_row_area_cm2: ap_R_cm2 is the RIGHT electrode, which "
+            "is what the isat channel sits on under the nominal wiring every "
+            "ES4 run carries, and ap_L_cm2 the LEFT one, which is the i_sweep "
+            "channel's.  That is the assignment the areas were themselves "
+            "produced under (scripts/calibrate_probe_areas.py accumulates "
+            "ap_R_m2 from the rot-180 isat product and ap_L_m2 from the rot-0 "
+            "i_sweep product), and it is the swap-aware answer of "
+            "density_area_key_for_deadtime_source for these runs.  PORTS: "
+            "only p29 (runs 44/45) and p41 (runs 46/47) carry the pair.  p21's "
+            "rot-180 partner (run 43) carries a registered channel-state shot "
+            "range covering the whole core band, so it has no admitted core "
+            "cell and NO rot-180 row is built there; p11 and p50 have no "
+            "rot-180 partner run at all.  A consumer must not read the absence "
+            "of a row as a null result -- it is an absent measurement."
+        ),
+        "es4_upstream_te_definition": np.array(
+            "WHICH T_e EACH ROW WAS DERIVED AT.  n_e is proportional to "
+            "I_sat / (A_p e C_s) and C_s to sqrt(T_e), so every density row "
+            "carries the T_e it was built with: es4_upstream_te_ev[r] is that "
+            "T_e per sample, and a row moves to a different T_e by the factor "
+            "sqrt(T_e_old / T_e_new) with no re-reading of the raw data.  "
+            "es4_upstream_row_te_measured[r] is True only where that T_e is a "
+            "MEASUREMENT of that port, and then es4_upstream_row_te_measured_"
+            "ev[r] is its value, es4_upstream_row_te_face[r] the probe face it "
+            "was measured on, es4_upstream_row_te_window_ms[r] the window it "
+            "is a mean over, and es4_upstream_row_te_basis[r] the estimator.  "
+            "False means the row was derived under the filled-T_e product's "
+            "PRIOR-DERIVED row for that port -- reconstructed from its "
+            "neighbours, the SOL anchors and the end-plate sentinels, and not "
+            "a measurement of that port (see te_row_provenance_definition; "
+            "ES4 p21/p29/p41/p50 are prior-derived at every sample).  Every "
+            "rot-180 ISAT row and every bracket partner is False: the face "
+            "bracket moves the FACE, not the T_e."
+        ),
+        "es4_upstream_p21_te_rederivation": np.array(
+            "THE p21 RE-DERIVATION.  The row this product has always carried "
+            "at p21 is the rot-0 i_sweep row derived under the filled-T_e "
+            "product's PRIOR-DERIVED T_e for that port, whose mean over the "
+            "scoring plateau window is te_mean_ev at p21.  The plateau T_e at "
+            "p21 has since been MEASURED from that port's own sweeps "
+            "(scripts/es4_te_time_slope.py), and it is far below the prior.  "
+            "Row 'p21_rot0_isweep_te_measured' is that same row re-derived at "
+            "the measured value: the primary, with "
+            "es4_upstream_row_te_measured True and the value, face, window and "
+            "estimator stamped on it.  Row 'p21_rot0_isweep_te_prior' is the "
+            "row as it was derived under the prior, kept beside it as the "
+            "record of what was scored before; the two differ by exactly "
+            "sqrt(T_e_prior / T_e_measured) per sample and by nothing else.  "
+            "The measured value is quoted at the SCORING PLATEAU WINDOW, the "
+            "window the prior it replaces is quoted at and the window the "
+            "transport comparison scores.  es4_upstream_p21_te_measured_"
+            "display_ev is the SAME estimator on the SAME face over the "
+            "instrument's full displayed plateau, es4_upstream_p21_te_"
+            "measured_display_window_ms -- a different window, not a different "
+            "measurement, exported because the p11->p21 electron-pressure "
+            "chain on record was computed at it.  es4_upstream_p21_te_"
+            "measured_rot180_ev and its _display counterpart are the opposite "
+            "face at the same port under the same estimator and the same two "
+            "windows: the T_e FACE SPREAD, which is the uncertainty the "
+            "re-derivation inherits and is about 1 percent of the value.  The "
+            "pre-existing te_mean_ev, te_row_measured and te_row_measured_"
+            "cells at p21 are UNCHANGED and still describe the filled-T_e "
+            "product, which is still prior-derived there: this family does not "
+            "restate that product, it records a density row built at a "
+            "different T_e."
+        ),
+        "es4_upstream_f_convention": np.array(
+            "SWEEP REST-BIAS FACTOR: NOT APPLIED.  es4_upstream_row_f_applied "
+            "is 1.0 on every row, and it is exported to say so explicitly.  "
+            "The ES4 sweep parks the swept face at a shallower rest bias than "
+            "ES3 does (-20 V against -75 V nominal), and every dead-time "
+            "ion-saturation current is collected at that parked bias, so "
+            "comparing an ES4 i_sweep row with its ES3 control needs a "
+            "channel-scale factor F.  Neither the density product behind "
+            "density_mean_cm3 nor this exporter has ever multiplied an ES4 row "
+            "by one, so the retained i_sweep rows here carry exactly what the "
+            "placed product carries and no factor is invented at export.  F is "
+            "MEASURED by scripts/es4_sweep_rest_bias_factor.py, which reports "
+            "it per port and rotation as a BRACKET between a direct read off "
+            "the ES3 ramp and an extrapolation of the ES4 one; the two ends "
+            "disagree by more than either one's spread, so the bracket is the "
+            "claim and a single central value is not available to apply.  The "
+            "ISAT face has no sweep-derived rest bias at all, which is one "
+            "reason the rot-180 ISAT row is worth having: F does not enter it."
+        ),
+    }
+
+
+def _es4_upstream_rows(
+    *,
+    te_core_mean_ev: np.ndarray,
+    te_time_ms: np.ndarray,
+    density_mean_cm3: np.ndarray,
+    density_ftavg_cm3: np.ndarray,
+    density_core_count: np.ndarray,
+    density_time_ms: np.ndarray,
+    isweep_path: Path,
+    isat_rot180_path: Path,
+    area_toml_path: Path,
+) -> dict[str, np.ndarray]:
+    """Build the ES4 upstream two-face bracket and the p21 T_e re-derivation.
+
+    Returns the ``es4_upstream_*`` fields as a row table: one row per labelled
+    density row, with the per-row provenance in the ``es4_upstream_row_*``
+    arrays and the per-sample values in ``es4_upstream_density_*``.  Every row
+    sits on ``density_time_ms``.
+
+    The two-face rows at ``ES4_UPSTREAM_BRACKET_PORTS`` come from
+    ``es4_upstream_build_port``, the single implementation of that arithmetic,
+    so the ISAT row and its bracket partner differ ONLY in which face they
+    read: same admission mask, same T_e, same areas convention, same window.
+    The partner is therefore NOT the same number as ``density_mean_cm3`` at
+    that port, which comes from the full density product with its own per-cell
+    T_e and no dead-time admission mask; both are exported and both are
+    labelled.
+
+    The p21 rows come from this export's own density row instead.  The primary
+    is that row re-derived at the MEASURED plateau T_e -- n_e is proportional
+    to 1/C_s and C_s to sqrt(T_e), so a row derived under a prior T_e rescales
+    by sqrt(T_e_prior / T_e_measured) per sample with no re-reading of the raw
+    data -- and the row as it was derived under the prior is kept beside it.
+
+    T_e for the two-face rows is this export's own filled-T_e core-band row,
+    NOT the placed overlay: an exporter may not read the product it is
+    writing.  It is the same quantity the product exports as ``te_mean_ev``.
+    """
+    ports = [int(value) for value in PORTS]
+    keys: list[str] = []
+    row_port: list[int] = []
+    role: list[str] = []
+    face: list[str] = []
+    chain: list[str] = []
+    run_id: list[str] = []
+    area_key: list[str] = []
+    area_cm2: list[float] = []
+    te_measured_flag: list[bool] = []
+    te_value: list[float] = []
+    te_basis: list[str] = []
+    te_face: list[str] = []
+    te_window: list[tuple[float, float]] = []
+    partner: list[str] = []
+    mean_cm3: list[np.ndarray] = []
+    ftavg_cm3: list[np.ndarray] = []
+    core_count: list[np.ndarray] = []
+    te_series: list[np.ndarray] = []
+
+    def te_provider(port_id, times_ms):
+        row = te_core_mean_ev[ports.index(int(port_id))]
+        return np.interp(np.asarray(times_ms, dtype=np.float64), te_time_ms, row), False
+
+    for port in ES4_UPSTREAM_BRACKET_PORTS:
+        built = es4_upstream_build_port(
+            port,
+            Path("."),
+            isweep_path=isweep_path,
+            isat_path=isat_rot180_path,
+            area_toml_path=area_toml_path,
+            te_provider=te_provider,
+        )
+        if not np.allclose(built["t_ms"], density_time_ms):
+            raise ValueError(
+                f"ES4 upstream bracket at p{port}: the dead-time axis "
+                f"{built['t_ms']} does not match the exported density axis"
+            )
+        x_cm = built["x_cm"]
+        admitted = built["admitted"]
+        core = np.abs(x_cm) <= ES4_UPSTREAM_CORE_CM
+        run_isweep, run_isat = ES4_UPSTREAM_PORT_RUNS[port]
+        faces = (
+            (
+                "rot180_isat",
+                built["n_isat_cells"],
+                run_isat,
+                built["area_isat_key"],
+                built["area_isat_cm2"],
+                "primary",
+            ),
+            (
+                "rot0_isweep",
+                built["n_isweep_cells"],
+                run_isweep,
+                built["area_isweep_key"],
+                built["area_isweep_cm2"],
+                "bracket_partner",
+            ),
+        )
+        for face_label, cells, run, key, area, row_role in faces:
+            masked = np.where(admitted, cells, np.nan)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                core_mean_m3 = np.nanmean(masked[core, :], axis=0)
+            ftavg = _flux_tube_series(masked[None, :, :], x_cm)["ftavg"][0]
+            keys.append(f"p{port}_{face_label}")
+            row_port.append(port)
+            role.append(row_role)
+            face.append(face_label)
+            chain.append("deadtime_face_pair")
+            run_id.append(run)
+            area_key.append(key)
+            area_cm2.append(float(area))
+            te_measured_flag.append(False)
+            te_value.append(float("nan"))
+            te_basis.append("filled-T_e core-band row, prior-derived at this port")
+            te_face.append("")
+            te_window.append((float("nan"), float("nan")))
+            partner.append(
+                f"p{port}_rot0_isweep" if face_label == "rot180_isat"
+                else f"p{port}_rot180_isat"
+            )
+            mean_cm3.append(core_mean_m3 * M3_TO_CM3)
+            ftavg_cm3.append(ftavg * M3_TO_CM3)
+            core_count.append(np.sum(np.isfinite(masked[core, :]), axis=0).astype(np.int64))
+            te_series.append(np.asarray(built["te_ev"], dtype=np.float64))
+
+    # ---- the p21 T_e re-derivation -----------------------------------
+    port = ES4_UPSTREAM_TE_REDERIVED_PORT
+    index = ports.index(port)
+    te_prior_row = np.interp(density_time_ms, te_time_ms, te_core_mean_ev[index])
+    rescale = np.sqrt(te_prior_row / ES4_UPSTREAM_P21_TE_MEASURED_EV)
+    run_isweep = ES4_UPSTREAM_PORT_RUNS[port][0]
+    p21_area_key = es4_upstream_area_key(ChannelKind.I_SWEEP)
+    p21_probe = ES4_UPSTREAM_PROBE_FROM_DIGIT[int(run_isweep[1])]
+    p21_area_cm2 = es4_upstream_load_areas_cm2(area_toml_path)[p21_probe][p21_area_key]
+    p21_rows = (
+        (
+            f"p{port}_rot0_isweep_te_measured",
+            "primary",
+            rescale,
+            True,
+            ES4_UPSTREAM_P21_TE_MEASURED_EV,
+            ES4_UPSTREAM_P21_TE_MEASURED_BASIS,
+            ES4_UPSTREAM_P21_TE_MEASURED_FACE,
+            ES4_UPSTREAM_P21_TE_MEASURED_WINDOW_MS,
+            np.full(density_time_ms.shape, ES4_UPSTREAM_P21_TE_MEASURED_EV),
+            f"p{port}_rot0_isweep_te_prior",
+        ),
+        (
+            f"p{port}_rot0_isweep_te_prior",
+            "retained_prior_derived",
+            np.ones_like(rescale),
+            False,
+            float("nan"),
+            "filled-T_e core-band row, prior-derived at this port",
+            "",
+            (float("nan"), float("nan")),
+            te_prior_row,
+            f"p{port}_rot0_isweep_te_measured",
+        ),
+    )
+    for (
+        key,
+        row_role,
+        factor,
+        measured,
+        value,
+        basis,
+        measured_face,
+        window,
+        te_row,
+        partner_key,
+    ) in p21_rows:
+        keys.append(key)
+        row_port.append(port)
+        role.append(row_role)
+        face.append("rot0_isweep")
+        chain.append("overlay_density_isweep")
+        run_id.append(run_isweep)
+        area_key.append(p21_area_key)
+        area_cm2.append(float(p21_area_cm2))
+        te_measured_flag.append(measured)
+        te_value.append(value)
+        te_basis.append(basis)
+        te_face.append(measured_face)
+        te_window.append(window)
+        partner.append(partner_key)
+        mean_cm3.append(density_mean_cm3[index] * factor)
+        ftavg_cm3.append(density_ftavg_cm3[index] * factor)
+        core_count.append(np.asarray(density_core_count[index], dtype=np.int64))
+        te_series.append(te_row)
+
+    return {
+        "es4_upstream_row_key": np.array(keys),
+        "es4_upstream_row_port": np.array(row_port, dtype=np.int16),
+        "es4_upstream_row_role": np.array(role),
+        "es4_upstream_row_face": np.array(face),
+        "es4_upstream_row_chain": np.array(chain),
+        "es4_upstream_row_run_id": np.array(run_id),
+        "es4_upstream_row_area_key": np.array(area_key),
+        "es4_upstream_row_area_cm2": np.array(area_cm2, dtype=np.float64),
+        "es4_upstream_row_bracket_partner": np.array(partner),
+        "es4_upstream_row_te_measured": np.array(te_measured_flag, dtype=bool),
+        "es4_upstream_row_te_measured_ev": np.array(te_value, dtype=np.float64),
+        "es4_upstream_row_te_basis": np.array(te_basis),
+        "es4_upstream_row_te_face": np.array(te_face),
+        "es4_upstream_row_te_window_ms": np.array(te_window, dtype=np.float64),
+        "es4_upstream_row_f_applied": np.full(
+            len(keys), ES4_UPSTREAM_F_APPLIED, dtype=np.float64
+        ),
+        "es4_upstream_density_mean_cm3": np.asarray(mean_cm3, dtype=np.float64),
+        "es4_upstream_density_ftavg_cm3": np.asarray(ftavg_cm3, dtype=np.float64),
+        "es4_upstream_density_core_count": np.asarray(core_count, dtype=np.int64),
+        "es4_upstream_te_ev": np.asarray(te_series, dtype=np.float64),
+        "es4_upstream_time_ms": np.asarray(density_time_ms, dtype=np.float64),
+        "es4_upstream_p21_te_measured_display_ev": np.array(
+            ES4_UPSTREAM_P21_TE_MEASURED_DISPLAY_EV
+        ),
+        "es4_upstream_p21_te_measured_display_window_ms": np.array(
+            ES4_UPSTREAM_P21_TE_MEASURED_DISPLAY_WINDOW_MS, dtype=np.float64
+        ),
+        "es4_upstream_p21_te_measured_rot180_ev": np.array(
+            ES4_UPSTREAM_P21_TE_MEASURED_ROT180_EV
+        ),
+        "es4_upstream_p21_te_measured_rot180_display_ev": np.array(
+            ES4_UPSTREAM_P21_TE_MEASURED_ROT180_DISPLAY_EV
+        ),
+        "es4_upstream_source_file_rot180_isat": np.array(str(isat_rot180_path)),
+        "es4_upstream_source_file_rot0_isweep": np.array(str(isweep_path)),
+        "es4_upstream_source_file_area_calibration": np.array(str(area_toml_path)),
+    }
 
 
 def _check_density_convention_pair(
@@ -1369,6 +1821,8 @@ def export_overlay(
     rot0_isat_profile_path: Path = ROT0_ISAT_PROFILE_HDF5,
     raw_discharge_ensemble: bool = False,
     port_map: str = PORT_MAP_DEFAULT,
+    rot180_isat_profile_path: Path = ROT180_ISAT_PROFILE_HDF5,
+    area_calibration_path: Path = AREA_CALIBRATION_TOML,
 ) -> Path:
     if port_map != PORT_MAP_DEFAULT:
         raise ValueError(PORT_MAP_REFUSAL.format(port_map=port_map))
@@ -1544,6 +1998,22 @@ def export_overlay(
         }
     density_mean_cm3 = density.mean * DENSITY_SCALE_CM3
     density_ftavg_cm3 = density_ftavg["ftavg"] * M3_TO_CM3
+    # The ES4 upstream-face bracket is exported at experiment set 4 only; every
+    # other set writes the same field set it always has.
+    es4_upstream_fields: dict[str, np.ndarray] = {}
+    if experiment_set_id == ES4_UPSTREAM_SET_ID:
+        es4_upstream_fields = _es4_upstream_rows(
+            te_core_mean_ev=te.mean,
+            te_time_ms=te.time_ms,
+            density_mean_cm3=density_mean_cm3,
+            density_ftavg_cm3=density_ftavg_cm3,
+            density_core_count=density.count,
+            density_time_ms=density.time_ms,
+            isweep_path=isat_profile_path,
+            isat_rot180_path=rot180_isat_profile_path,
+            area_toml_path=area_calibration_path,
+        )
+        es4_upstream_fields.update(_es4_upstream_definitions())
     # The two conventions are reduced independently; refuse the pair that
     # a consumer cannot put an uncertainty on.  See the helper.
     _check_density_convention_pair(
@@ -1555,7 +2025,7 @@ def export_overlay(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        schema_version=np.array(23, dtype=np.int16),
+        schema_version=np.array(25, dtype=np.int16),
         experiment_set_id=np.array(experiment_set_id, dtype=np.int16),
         experiment_label=np.array(experiment_label),
         port=PORTS,
@@ -1970,6 +2440,7 @@ def export_overlay(
         ),
         port_map=np.array(port_map),
         **discharge_raw_fields,
+        **es4_upstream_fields,
     )
     print(output_path)
     return output_path
@@ -1985,6 +2456,22 @@ def main() -> None:
         type=Path,
         default=ROT0_ISAT_PROFILE_HDF5,
         help="rot-0 Isat-channel line-scan product for the flux-tube fields",
+    )
+    parser.add_argument(
+        "--rot180-isat-profiles",
+        type=Path,
+        default=ROT180_ISAT_PROFILE_HDF5,
+        help="rot-180 Isat-channel dead-time line-scan product; the UPSTREAM "
+             "probe face at rot-180.  Read by the ES4 upstream bracket only, "
+             "and only when --experiment-set 4 is selected",
+    )
+    parser.add_argument(
+        "--area-calibration",
+        type=Path,
+        default=AREA_CALIBRATION_TOML,
+        help="per-probe collecting-electrode area calibration.  Read by the "
+             "ES4 upstream bracket only, and only when --experiment-set 4 is "
+             "selected",
     )
     parser.add_argument("--zero-offsets", type=Path, default=ZERO_OFFSETS)
     parser.add_argument("--window-refits", type=Path, default=WINDOW_REFITS_HDF5)
@@ -2025,6 +2512,8 @@ def main() -> None:
         args.rot0_isat_profiles,
         args.raw_discharge_ensemble,
         args.port_map,
+        args.rot180_isat_profiles,
+        args.area_calibration,
     )
 
 
