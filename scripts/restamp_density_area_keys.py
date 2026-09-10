@@ -44,6 +44,26 @@ Usage::
 Prints a before/after table over every run group and a per-product count of
 the rows it moved.  Exits 0 whether or not anything moved; a product already
 carrying the current answer is left byte-identical.
+
+ALSO: ``--stamp-calibration-middle-fraction``
+    A second, independent pass that stamps the root attribute
+    ``calibration_middle_fraction`` (``scripts/plot_isat_profiles.py:597``)
+    onto a product that carries NONE -- the two rot-0 products
+    (``processed/isat_profiles.hdf5``, ``processed/isweep_deadtime_profiles.hdf5``)
+    were built before that attr existed, while the two rot-180 products carry
+    it (0.5, the writer's default).  This pass never overwrites: a product
+    that already carries the attr, at any value, is refused rather than
+    silently corrected, so a genuine mismatch surfaces instead of being
+    papered over.  Given instead of the positional re-stamp, it touches ONLY
+    the file-level attribute and leaves every dataset and every group attr
+    byte-identical -- the reviewer placing the result is expected to diff the
+    two products (raw bytes, per dataset and group attr) to confirm that.
+    Subject to the same ``processed/`` OUTPUT GUARD above.
+
+    Usage::
+
+        python scripts/restamp_density_area_keys.py \\
+            --stamp-calibration-middle-fraction 0.5 <product.hdf5> [...]
 """
 
 from __future__ import annotations
@@ -62,6 +82,7 @@ AREA_KEY_ATTR = "density_area_key"
 CHANNEL_ATTR = "deadtime_source_channel"
 RUN_ATTR = "run_id"
 SETS_GROUP = "experiment_sets"
+CALIBRATION_MIDDLE_FRACTION_ATTR = "calibration_middle_fraction"
 
 
 def _text(value) -> str:
@@ -142,6 +163,27 @@ def restamp_product(path: Path) -> tuple[int, int, list[tuple[str, str, str, str
     return len(table), moved, table
 
 
+def stamp_calibration_middle_fraction(path: Path, value: float) -> bool:
+    """Stamp the root ``calibration_middle_fraction`` attr, only if absent.
+
+    Touches ONLY the file-level attribute -- no dataset, no group attr, moves.
+    A product that already carries the attr (at any value) is refused rather
+    than silently overwritten or silently left mismatched: this pass makes a
+    product UNIVERSAL, it does not correct one that disagrees.  Returns
+    whether the attr was written.
+    """
+    with h5py.File(path, "r+") as hdf:
+        if CALIBRATION_MIDDLE_FRACTION_ATTR in hdf.attrs:
+            existing = hdf.attrs[CALIBRATION_MIDDLE_FRACTION_ATTR]
+            raise ValueError(
+                f"{path}: already carries {CALIBRATION_MIDDLE_FRACTION_ATTR!r} "
+                f"= {existing!r}; this pass only stamps a product carrying "
+                "none, it never corrects one that disagrees"
+            )
+        hdf.attrs[CALIBRATION_MIDDLE_FRACTION_ATTR] = value
+    return True
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -155,9 +197,28 @@ def main() -> int:
         action="store_true",
         help="permit a product path under processed/, the placed scoring chain",
     )
+    parser.add_argument(
+        "--stamp-calibration-middle-fraction",
+        type=float,
+        default=None,
+        metavar="FRACTION",
+        help="run the calibration_middle_fraction root-attr pass instead of "
+             "the density_area_key re-stamp: stamps FRACTION onto each "
+             "product's root attrs, refusing a product that already carries "
+             "one (at any value) rather than correcting it",
+    )
     args = parser.parse_args()
 
     refuse_processed_paths(args.products, args.allow_processed)
+
+    if args.stamp_calibration_middle_fraction is not None:
+        for path in args.products:
+            stamp_calibration_middle_fraction(
+                path, args.stamp_calibration_middle_fraction
+            )
+            print(f"{path}: stamped {CALIBRATION_MIDDLE_FRACTION_ATTR} = "
+                  f"{args.stamp_calibration_middle_fraction:g}")
+        return 0
 
     total_moved = 0
     for path in args.products:

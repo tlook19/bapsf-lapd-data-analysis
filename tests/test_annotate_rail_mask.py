@@ -19,6 +19,7 @@ from scripts.annotate_rail_mask import (
     RAIL_HI,
     RAIL_LO,
     inter_sweep_times_ms,
+    refuse_processed_output,
     screen_cells,
 )
 
@@ -173,3 +174,18 @@ def test_an_unrailed_record_reads_zero_on_both_scalars():
     assert face["rail_dead"] / face["n_dead"] == 0.0
     assert face["rail_plat"] / face["n_plat"] == 0.0
     assert not face["rail_mask"].any()
+
+
+def test_a_processed_product_path_is_refused_without_the_flag(tmp_path):
+    """The guard fires at argument resolution, before any file is opened."""
+    placed = tmp_path / "processed" / "isat_rot180_deadtime_profiles.hdf5"
+    placed.parent.mkdir()
+    placed.write_bytes(b"not really hdf5, the guard never opens it")
+    with pytest.raises(ValueError, match="--allow-processed"):
+        refuse_processed_output(placed, allow_processed=False)
+    # The guard runs before the file is touched, so its (unreal) content
+    # cannot have moved either.
+    assert placed.read_bytes() == b"not really hdf5, the guard never opens it"
+
+    refuse_processed_output(placed, allow_processed=True)
+    refuse_processed_output(tmp_path / "regen" / "isat_rot180.hdf5", allow_processed=False)

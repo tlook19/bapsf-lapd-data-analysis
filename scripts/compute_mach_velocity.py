@@ -36,6 +36,15 @@ Products built before a marking existed carry that mask not at all, are treated
 as unmasked for it, and say so in the output attrs -- the absence of a mask is
 recorded, never assumed clean.
 
+Each output run group's ``upstream_source_file``/``downstream_source_file``
+attrs name the source product by its REPO-RELATIVE ``processed/<basename>``
+form, not the literal path this script opened it from: a source product
+regenerated outside ``processed/`` (a throwaway worktree, an artifacts
+directory) would otherwise bake that transient absolute path into the placed
+output.  The basename alone is taken from the opened ``h5py.File.filename``,
+so the attr names the product the pair came from, not where the invocation
+happened to read it.
+
 Usage
 -----
   MPLCONFIGDIR=.matplotlib ./.venv/bin/python scripts/compute_mach_velocity.py
@@ -212,6 +221,19 @@ def _require_inputs(paths: list[Path]) -> None:
     missing = [str(path) for path in paths if not path.exists()]
     if missing:
         sys.exit("Missing required input(s):\n  " + "\n  ".join(missing))
+
+
+def _processed_source_attr(hdf: h5py.File) -> str:
+    """The repo-relative ``processed/<basename>`` form of an opened source file.
+
+    ``h5py.File.filename`` is the literal path the caller opened it with, which
+    is the transient path of a regeneration run outside ``processed/`` (a
+    throwaway worktree, an artifacts directory) rather than the placed
+    product's own name.  Only the basename survives here, joined onto
+    ``processed/`` -- the convention every source product in this script's own
+    docstring is named by.
+    """
+    return f"processed/{Path(hdf.filename).name}"
 
 
 def _profile_entries_by_location(group: h5py.Group, rotation_deg: int) -> dict[tuple[int, float], h5py.Group]:
@@ -437,8 +459,8 @@ def _process_rotation(
             )
             out_run.attrs["upstream_area_key"] = upstream_area_key
             out_run.attrs["downstream_area_key"] = downstream_area_key
-            out_run.attrs["upstream_source_file"] = upstream_hdf.filename
-            out_run.attrs["downstream_source_file"] = downstream_hdf.filename
+            out_run.attrs["upstream_source_file"] = _processed_source_attr(upstream_hdf)
+            out_run.attrs["downstream_source_file"] = _processed_source_attr(downstream_hdf)
             out_run.attrs["mach_area_normalization"] = (
                 "(I_upstream / A_upstream) / (I_downstream / A_downstream)"
             )

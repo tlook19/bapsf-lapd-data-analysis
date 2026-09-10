@@ -75,6 +75,29 @@ RULE = (
 )
 
 
+def refuse_processed_output(product, allow_processed: bool) -> None:
+    """Refuse to annotate a placed product unless the caller asked for it.
+
+    ``processed/`` is the transport campaign's scoring chain: a product there
+    is consumed by name, so an in-place edit of one is a measurement-side
+    change, not a scratch operation.  A ``product`` path with a ``processed``
+    directory component is therefore refused here, at argument resolution and
+    before any file is opened, unless ``--allow-processed`` is passed.  The
+    pattern follows scripts/restamp_density_area_keys.py.
+    """
+    if allow_processed:
+        return
+    if "processed" not in Path(product).resolve().parts[:-1]:
+        return
+    raise ValueError(
+        f"refusing to annotate {product}: the path lies under a processed/ "
+        "directory, which holds the placed products the transport campaign "
+        "scores against, and this pass edits its input IN PLACE. Annotate a "
+        "copy outside processed/, or pass --allow-processed to say that "
+        "editing the placed product is the intent."
+    )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -96,7 +119,14 @@ def main(argv=None):
         type=Path,
         help="path for the JSON summary sidecar",
     )
+    parser.add_argument(
+        "--allow-processed",
+        action="store_true",
+        help="permit a product path under processed/, the placed scoring chain",
+    )
     args = parser.parse_args(argv)
+
+    refuse_processed_output(args.product, args.allow_processed)
 
     ds = LapdDataset.from_manifest(args.repo_root / "config/may2026_run_manifest.toml")
     summary = {}

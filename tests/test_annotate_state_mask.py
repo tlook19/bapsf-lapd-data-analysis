@@ -7,6 +7,7 @@ from scripts.annotate_state_mask import (
     STATE_REGISTRY,
     contiguous_ranges,
     ranges_text,
+    refuse_processed_output,
     state_mask_for_run,
 )
 
@@ -101,3 +102,16 @@ def test_run_43_isat_registers_both_entries_of_the_high_state():
     # the rejection tell, not only the first entry's steps.
     for token in ("759|760", "767->768", "780->781", "1.976", "2.074", "162"):
         assert token in entry["evidence"]
+
+
+def test_a_processed_product_path_is_refused_without_the_flag(tmp_path):
+    """The guard fires at argument resolution, before any file is opened."""
+    placed = tmp_path / "processed" / "isat_rot180_deadtime_profiles.hdf5"
+    placed.parent.mkdir()
+    placed.write_bytes(b"not really hdf5, the guard never opens it")
+    with pytest.raises(ValueError, match="--allow-processed"):
+        refuse_processed_output(placed, allow_processed=False)
+    assert placed.read_bytes() == b"not really hdf5, the guard never opens it"
+
+    refuse_processed_output(placed, allow_processed=True)
+    refuse_processed_output(tmp_path / "regen" / "isat_rot180.hdf5", allow_processed=False)

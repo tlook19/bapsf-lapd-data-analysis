@@ -31,8 +31,10 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from restamp_density_area_keys import (  # noqa: E402
+    CALIBRATION_MIDDLE_FRACTION_ATTR,
     refuse_processed_paths,
     restamp_product,
+    stamp_calibration_middle_fraction,
 )
 
 # One crossed-cable run and one nominal run, on both channels.
@@ -190,3 +192,35 @@ def test_processed_paths_are_refused_without_the_flag(tmp_path):
 def test_a_file_named_processed_outside_a_processed_directory_is_allowed(tmp_path):
     """The guard reads directory components, not the file name."""
     refuse_processed_paths([tmp_path / "processed.hdf5"], allow_processed=False)
+
+
+def test_calibration_middle_fraction_stamp_touches_only_the_root_attr(tmp_path):
+    """Stamping the attr onto a product carrying none moves nothing else."""
+    product = tmp_path / "isat_profiles.hdf5"
+    _write_product(product)
+    before = _snapshot(product)
+    assert "/@calibration_middle_fraction" not in before
+
+    stamped = stamp_calibration_middle_fraction(product, 0.5)
+    after = _snapshot(product)
+
+    assert stamped is True
+    changed = {key for key in after if before.get(key) != after[key]}
+    assert changed == {"/@calibration_middle_fraction"}
+    assert set(after) - set(before) == {"/@calibration_middle_fraction"}
+    with h5py.File(product, "r") as hdf:
+        assert hdf.attrs[CALIBRATION_MIDDLE_FRACTION_ATTR] == pytest.approx(0.5)
+
+
+def test_calibration_middle_fraction_stamp_refuses_a_product_that_already_carries_one(tmp_path):
+    """The pass never corrects a value that disagrees -- it only fills absence."""
+    product = tmp_path / "isat_rot180_deadtime_profiles.hdf5"
+    _write_product(product)
+    with h5py.File(product, "r+") as hdf:
+        hdf.attrs[CALIBRATION_MIDDLE_FRACTION_ATTR] = 0.5
+    before = _snapshot(product)
+
+    with pytest.raises(ValueError, match=CALIBRATION_MIDDLE_FRACTION_ATTR):
+        stamp_calibration_middle_fraction(product, 0.5)
+
+    assert _snapshot(product) == before

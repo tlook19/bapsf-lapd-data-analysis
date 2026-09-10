@@ -67,7 +67,13 @@ Inputs
                                     attrs used to place and label the runs
   processed/es4_sim1d_overlay.npz  the ES4 overlay's per-port T_e(t) prior,
                                     read-only, for the window-matched prior
-                                    comparison
+                                    comparison.  Its ``schema_version`` is
+                                    printed beside the prior on every run, and
+                                    a missing file or missing ``te_mean_ev``
+                                    array is refused with a clear message
+                                    (``overlay_prior_te_ev``) rather than
+                                    surfacing as a bare
+                                    FileNotFoundError/KeyError
   config/may2026_run_manifest.toml sweep schedule, channels, calibration
   data/may2026/*.hdf5              raw runs, opened read-only
 
@@ -143,6 +149,42 @@ TE_SANITY_MAX_EV = 30.0
 GATE_LOW_PCT_PER_MS = -1.5
 GATE_HIGH_PCT_PER_MS = -0.5
 MIN_FINITE_CYCLES = 3
+
+#: Ports whose core-cell window-family spread fails ``refit_window_band.py``'s
+#: own core-mode gate (``dln_te_window < CRITERION_DLN``,
+#: ``scripts/refit_window_band.py:134``, fixed at 0.50) on every one of its 21
+#: core cells, on BOTH rotation faces -- measured by running that script's
+#: core pass over ALL THREE ES4 ports (checked 2026-09-09; not re-run here on
+#: every invocation):
+#:   PYTHONPATH=src python scripts/refit_window_band.py --cells core \
+#:       --sets 4 --ports 21,29,41 --rotation-deg 0   --output ... --summary ... --metadata ...
+#:   PYTHONPATH=src python scripts/refit_window_band.py --cells core \
+#:       --sets 4 --ports 21,29,41 --rotation-deg 180 --output ... --summary ... --metadata ...
+#: Per-port ``at_or_above_criterion`` count out of 21 core cells:
+#:   port 21 (runs 42/43): rot0  5/21, rot180  7/21
+#:   port 29 (runs 44/45): rot0 21/21, rot180 21/21
+#:   port 41 (runs 46/47): rot0 21/21, rot180 21/21
+#: Only 29 and 41 clear 21/21 on BOTH faces; 21 does not.  No TRACKED product
+#: carries this per-cell gate result for set 4 -- the committed
+#: ``processed/window_refit_band_summary.csv`` carries sets 1/2 only -- so
+#: this is recorded as a documented constant, not read from a product; a
+#: data-driven check should replace it if that ever changes.  A port in this
+#: set is SEMI-QUANTITATIVE by the repo's own window-spread criterion, and
+#: every T_e read for it here is captioned.
+#:
+#: NOT the same quantity as the ES4 overlay's own
+#: ``te_semi_quantitative_core_count`` (``processed/es4_sim1d_overlay.npz``):
+#: that field's rule is broader than this one criterion -- a cell is also
+#: marked when its filled T_e is below 1 eV, OR when its port's x=0 window
+#: control fails (marking the whole core), so a port can read
+#: semi-quantitative there for a reason unrelated to its OWN core-cell window
+#: spread.  Concretely, p41's own ``te_window_spread_frac`` is NaN (the
+#: overlay never measured it directly) even though the overlay marks p41
+#: semi-quantitative through the x=0-control bit; p29's IS measured there
+#: (0.93, itself over CRITERION_DLN).  Keying this caption off the overlay
+#: field instead would assert a different, broader claim than "fails the
+#: core-cell window-spread gate on all 21 cells, both faces".
+SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS = (29, 41)
 
 ESTIMATORS = ("x0 default", "x0 family-med", "core default", "core family-med")
 
@@ -301,23 +343,42 @@ def runs_for_port(
 
 
 def overlay_prior_te_ev(overlay_npz_path: Path, port: int, window_ms: tuple[float, float]):
-    """Mean prior T_e (eV) for *port* over *window_ms* from the ES4 overlay.
+    """Mean prior T_e (eV) and schema_version from the ES4 overlay ``processed/es4_sim1d_overlay.npz``.
 
-    Returns NaN if the overlay carries no row for *port*, or if no
-    ``te_time_ms`` sample of that row falls in *window_ms*.  Read-only.
+    Returns ``(value, schema_version)``.  ``value`` is NaN if the overlay
+    carries no row for *port*, or if no ``te_time_ms`` sample of that row
+    falls in *window_ms*.  Read-only.
+
+    Refuses with a clear message if *overlay_npz_path* does not exist, or if
+    the file carries no ``te_mean_ev`` array -- the prior this instrument
+    prints depends on that dependency existing and carrying the expected
+    schema, and a missing file or key should say so rather than surface as a
+    bare ``FileNotFoundError``/``KeyError`` from inside ``numpy.load``.
     """
+    if not overlay_npz_path.exists():
+        raise ValueError(
+            f"the ES4 sim1d overlay {overlay_npz_path} does not exist; the "
+            "window-matched prior this instrument prints depends on it -- "
+            "regenerate it or point --overlay-npz (if given) at the right file"
+        )
     with np.load(overlay_npz_path, allow_pickle=True) as d:
+        if "te_mean_ev" not in d:
+            raise ValueError(
+                f"{overlay_npz_path} carries no 'te_mean_ev' array; it is not "
+                "the ES4 sim1d overlay this instrument expects"
+            )
+        schema_version = int(d["schema_version"]) if "schema_version" in d else None
         ports = np.asarray(d["port"])
         matches = np.flatnonzero(ports == port)
         if matches.size == 0:
-            return float("nan")
+            return float("nan"), schema_version
         row = int(matches[0])
         time_ms = np.asarray(d["te_time_ms"], dtype=float)
         te_ev = np.asarray(d["te_mean_ev"], dtype=float)[row]
     in_window = (time_ms >= window_ms[0]) & (time_ms <= window_ms[1])
     if not np.any(in_window):
-        return float("nan")
-    return float(np.nanmean(te_ev[in_window]))
+        return float("nan"), schema_version
+    return float(np.nanmean(te_ev[in_window])), schema_version
 
 
 def cell_te_estimates(run, ramp, core_idx, core_cutoff_hz):
@@ -509,7 +570,10 @@ def main(argv=None) -> int:
           f"< {MIN_FINITE_CYCLES} finite cycles -> REFUSED")
     print()
 
-    overlay_prior_ev = overlay_prior_te_ev(OVERLAY_NPZ, args.port, WINDOW_MATCHED_MS)
+    overlay_prior_ev, overlay_schema_version = overlay_prior_te_ev(
+        OVERLAY_NPZ, args.port, WINDOW_MATCHED_MS
+    )
+    print(f"overlay     {OVERLAY_NPZ}  schema_version {overlay_schema_version}")
 
     csv_rows = []
     for spec in runs:
@@ -527,6 +591,13 @@ def main(argv=None) -> int:
         cycle_ms, series, eligibility = run_plateau_series(dataset, run_id, core_idx, ix0)
 
         print(f"=== run {run_id}  p{port} rot {rot}  T_e(t) ===")
+        if port in SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS:
+            print(
+                f"  SEMI-QUANTITATIVE: p{port} fails refit_window_band.py's "
+                "core-cell window-spread gate (dln_te_window < 0.5) on all 21 "
+                "core cells, both rotation faces -- every T_e read below for "
+                "this run is semi-quantitative by that criterion"
+            )
         print(
             f"  eligibility  shots attempted={eligibility['n_shots']}  "
             f"default admitted={eligibility['n_default_admitted']}  "
