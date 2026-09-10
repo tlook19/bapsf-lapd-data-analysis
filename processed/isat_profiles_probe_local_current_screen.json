@@ -1,0 +1,20 @@
+{
+  "channel": "isat",
+  "annotated_runs": [
+    "22"
+  ],
+  "registry": {
+    "22": {
+      "reason": "probe_local_current_suspected",
+      "tau_ms": 22.657038696464106,
+      "photodiode_tau_ms": 7.1767975767679495,
+      "neighbor_tau_range_ms": [
+        6.614529358475285,
+        9.136996719905085
+      ],
+      "undecayed_current_ma": 0.9,
+      "undecayed_time_ms": 47.8,
+      "source": "core ISAT-channel decay time constant 22.66 ms at x=0, against 7.18 ms on this run's own reference-photodiode decay and 6.61-9.14 ms on every neighbouring experiment-set-2 run's ISAT channel at x=0; this run's I_SWEEP channel (tau 12.52 ms) and its rot-180 partner run 23's ISAT channel (tau 9.14 ms) are both unremarkable"
+    }
+  }
+}
