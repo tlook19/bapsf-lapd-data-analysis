@@ -65,6 +65,121 @@ LEG 2 -- POSITION BOUNDARY, TWO-CHANNEL
     moved.  Both single-channel ratios are reported beside the flag, so the
     attribution can be checked rather than trusted.
 
+LEG 3 -- PERSISTENCE (``--persistence N``, off unless asked for)
+    Both legs above fire on transients as readily as on states: shot-to-shot
+    spread at the outer positions, and two-face profile structure at the
+    boundaries common to many runs, flag dozens of (run, channel) rows.  A
+    state is a step that STAYS stepped, so this leg keeps only the flagged
+    steps that come back.
+
+    REGISTERED 2026-09-09 at N = 200 shots: a channel state that persists for
+    at least 200 consecutive shots is a state, not a burst -- five times the
+    longest transient excursion on record (run 22's clean 40-shot excursion)
+    and under half of run 43's matched step separation (456 shots).
+
+    RESULT 2026-09-09, a NULL: at N = 200 the pre-registered gate — fires on
+    run 43 ISAT only — FAILED. Run 43 ISAT is flagged (240 → 696, 456 shots
+    held, ln +0.672 / −0.546), but seven other (run, channel) rows also clear
+    200 shots: run 03 ISAT (226/245 matched, 941 open-ended), run 04 ISAT (389
+    open-ended), run 04 I_SWEEP (400/399/398 open-ended), run 26 ISAT (425),
+    run 33 I_SWEEP (252), run 34 ISAT (770 — the largest) and run 34 I_SWEEP
+    (605). Persistence alone therefore does not isolate run 43.  Of those
+    seven, only FIVE qualify by a MATCHED pair — runs 03, 26, 33, 34 ISAT and
+    34 I_SWEEP; run 04's two are OPEN-ENDED steps, a different claim.
+
+    RESULT 2026-09-09, the magnitude floor below (0.40 on both halves) and the
+    three-position reference below: with the floor and the three-position
+    reference every row but run 03 ISAT (an open-ended step at shot 79,
+    ln +1.921, whose reference holds one both-eligible shot in sixty) drops
+    out — a reference-COVERAGE gap.
+
+    RESULT 2026-09-09, the coverage clause below (a reference of at least 20
+    both-eligible shots, the step untestable otherwise): the gate PASSES.  At
+    N = 200, floor 0.40 and reference ≥ 20 the leg fires on run 43 ISAT alone,
+    and so it does at every floor of 0.30/0.40/0.50 and every N of
+    100/200/400.  The clause makes 1160 flagged steps untestable over 48 of
+    the 64 rows, 1086 of them with no both-eligible shot behind them at all.
+
+    MAGNITUDE FLOOR (``--persistent-min-ln``, REGISTERED 2026-09-09 at 0.40).
+    A PERSISTENT step is distinct from a FLAGGED one, and the difference is
+    size.  A step that only just clears the flag threshold matches almost
+    anything, because the match tolerance IS the flag threshold: two
+    independent barely-flagging steps of opposite sign pair up wherever they
+    fall, whatever separates them.  So both halves of a matched pair -- and an
+    open-ended step's single half -- must carry
+    ``|ln r| >= PERSISTENT_MIN_LN``.  The floor is set from the magnitude of
+    the only registered state, run 43's 0.55-0.67, at a factor 1.5 margin
+    below it: it says how big a state is, where the flag threshold says only
+    how finely the screen resolves one.
+
+    The floor is applied where a flagged step is CLASSIFIED, never where steps
+    are MATCHED, so the matching and consumption below do not depend on it and
+    ``--persistent-min-ln 0`` removes it.
+
+    A flagged step is placed at the shot index of the first shot on the NEW
+    level -- ``position * shots_per_position + shot + 1`` for leg 1, the first
+    shot of the upper position for leg 2 -- and carries a SIGNED level ratio:
+    leg 1's own ``ln`` ratio, and for leg 2 the two-channel step, whose sign is
+    inverted when the boundary is attributed to I_SWEEP so that both legs report
+    the ratio of the attributed channel's own level.
+
+    MATCH.  A step at shot ``j`` with ratio ``r_j`` is matched by the EARLIEST
+    later step at shot ``k`` with the opposite sign and a comparable magnitude:
+    ``|r_j + r_k| <= MATCH_TOLERANCE_LN``, i.e. the two ratios' product within
+    ln(LN_RATIO_FLAG) of zero -- the same resolution the flag threshold itself
+    is set at, so a return the screen cannot distinguish from the step is a
+    match.  The separation is ``k - j``, the number of shots held at the
+    stepped level.
+
+    A matched step is CONSUMED by its pair: every flagged step is either the
+    onset of one span or the return of one, never both.  Without that, the
+    return half of an excursion is itself an unmatched step and is reported as
+    a state running to the end of the run -- which is what a clean excursion
+    back to the run's own baseline is not.
+
+    LEVEL TEST.  The step is persistent only if the signal does not come back
+    between ``j`` and ``k``.  The level observable is the flagged channel's own
+    TWO-CHANNEL ratio ``q = ln(|s_flagged| / |s_other|)``, per shot -- leg 2's
+    profile-cancelling observable, used here because the probe moves over the
+    shots between ``j`` and ``k`` and a raw single-channel level would read the
+    profile's own excursions as returns.  The pre-step level ``q_pre`` is the
+    MEDIAN of ``q`` over the both-eligible shots of the PRE_STEP_POSITIONS
+    positions preceding the step's own position; a shot ``i`` with
+    ``j <= i < k``, eligible on both channels, is a RETURN when
+    ``|q[i] - q_pre| < ln(LN_RATIO_FLAG)``, and one
+    return anywhere in that span breaks the step.  Only the part of the profile
+    move common to the two channels cancels, so the two faces' differential
+    response to x survives here exactly as it does in leg 2: a differential
+    excursion of more than a factor LN_RATIO_FLAG toward the pre-step level
+    reads as a return, which breaks persistence rather than granting it.
+
+    Several positions, taken by MEDIAN, are what that reference needs: one
+    block of shots is whatever the shots just before the step happened to
+    read, so where the step IS the recovery from a one-position dip the block
+    is the dip's own level, the recovery reads as a step away from it, and
+    nothing in the rest of the run ever comes back to it.  Three whole
+    positions cannot be carried by one anomalous position.
+
+    COVERAGE (``--persistent-min-reference-shots``, REGISTERED 2026-09-09 at
+    20 -- one position's worth).  A reference needs coverage before a level
+    can be said to hold.  Three positions of SHOTS are not three positions of
+    both-eligible shots: in the ramp-up region, where a run's own signal is
+    still near the noise floor, the median can rest on one surviving shot, and
+    a level nothing later in the run comes back to is not a level the run
+    held -- it is a level the run barely measured.  Run 03 ISAT's step at shot
+    79 read as 941 shots of state off ONE both-eligible shot in sixty, at
+    q = 1.489, while every position from 5 on sat at 3.7-4.5.  A step whose
+    reference holds fewer both-eligible shots than the minimum is UNTESTABLE:
+    it is reported in its own list with the coverage it had, and is never
+    persistent and never open-ended-persistent.  A step in position 0 has no
+    reference at all and is untestable with a coverage of zero.
+
+    OPEN-ENDED.  A step with no matched later step and no return before the run
+    ends is reported separately as open-ended with the number of shots to the
+    end of the run; it is a persistent state only if that number is at least N
+    and its own ``|ln r|`` is at least the floor.
+    A step whose span carries a return is neither persistent nor open-ended.
+
 Writes a CSV of every flagged pair for each leg, a per-(run, channel) summary
 CSV and a JSON summary.  Reads every manifest run on both channels, so it is
 IO-bound and takes minutes.  Needs h5py and numpy: the environment.yml env, not
@@ -72,10 +187,17 @@ the dead ./.venv.
 
 Usage:
     python screen_consecutive_shot_steps.py <repo-root> <out-prefix>
+                                            [--persistence N]
+                                            [--persistent-min-ln LN]
+                                            [--persistent-min-reference-shots M]
 
 writes ``<out-prefix>_fixed_position_flags.csv``,
 ``<out-prefix>_boundary_flags.csv``, ``<out-prefix>_summary.csv`` and
-``<out-prefix>_summary.json``.
+``<out-prefix>_summary.json``.  ``--persistence`` adds a report section to
+stdout after those and changes none of the four files;
+``--persistent-min-ln`` sets leg 3's magnitude floor and
+``--persistent-min-reference-shots`` its reference coverage, both inert
+without it.
 """
 import argparse
 import csv
@@ -96,6 +218,15 @@ TAIL_S = 200e-6
 LN_RATIO_FLAG = 1.2
 SIGNIFICANCE_FACTOR = 5.0
 BLOCK_SHOTS = 4
+MATCH_TOLERANCE_LN = float(np.log(LN_RATIO_FLAG))
+RETURN_TOLERANCE_LN = float(np.log(LN_RATIO_FLAG))
+PERSISTENT_MIN_LN = 0.40
+PRE_STEP_POSITIONS = 3
+PERSISTENT_MIN_REFERENCE_SHOTS = 20
+SENSITIVITY_N = (100, 200, 400)
+SENSITIVITY_MIN_LN = (0.30, 0.40, 0.50)
+GATE_RUN_ID = "43"
+GATE_CHANNEL = "isat"
 
 FIXED_POSITION_RULE = (
     "consecutive shots at a fixed position, both eligible; flag "
@@ -115,6 +246,43 @@ ELIGIBILITY_RULE = (
     f"|signal| > {SIGNIFICANCE_FACTOR:g} x the run's own tail noise level on "
     "that channel (median over shots of the tail sample standard deviation, in "
     "volts)"
+)
+PERSISTENCE_RULE = (
+    "a flagged step at shot j is persistent when the earliest later flagged "
+    "step k of the opposite sign has the two ratios' product within "
+    f"ln {LN_RATIO_FLAG:g} of zero, no shot in [j, k) eligible on both "
+    "channels comes back to within "
+    f"ln {LN_RATIO_FLAG:g} of the pre-step two-channel level "
+    f"q = ln(|s_flagged|/|s_other|) (its median over the both-eligible shots "
+    f"of the {PRE_STEP_POSITIONS} positions preceding the step's own "
+    "position, which must themselves hold at least the reference-shot "
+    "minimum), k - j is at least N, and BOTH halves carry |ln r| at least "
+    "the floor; an open-ended step needs its own |ln r| at least the floor, "
+    "no return before the run ends, and at least N shots to that end"
+)
+PERSISTENCE_REGISTRATION = (
+    "a channel state that persists for at least 200 consecutive shots is a "
+    "state, not a burst -- five times the longest transient excursion on "
+    "record (run 22's clean 40-shot excursion) and under half of run 43's "
+    "matched step separation (456 shots)"
+)
+MIN_LN_REGISTRATION = (
+    f"a persistent step is distinct from a flagged one by SIZE: the floor "
+    f"{PERSISTENT_MIN_LN:g} is a factor 1.5 below the magnitude of the only "
+    "registered state (run 43's 0.55-0.67), where the flag threshold "
+    f"ln {LN_RATIO_FLAG:g} = {np.log(LN_RATIO_FLAG):.3f} says only how "
+    "finely the screen resolves a step, and a barely-flagging step matches "
+    "almost any other because the match tolerance IS that threshold"
+)
+MIN_REFERENCE_REGISTRATION = (
+    "a reference needs COVERAGE before a level can be said to hold: the "
+    f"{PRE_STEP_POSITIONS} positions below the step must carry at least "
+    f"{PERSISTENT_MIN_REFERENCE_SHOTS} both-eligible shots, one position's "
+    "worth, or the step is UNTESTABLE and is reported as such rather than as "
+    "a state. In the ramp-up region, where a run's own signal is still near "
+    "the noise floor, the reference can rest on a single shot that nothing "
+    "later in the run comes back to -- run 03 ISAT's step at shot 79 read as "
+    "941 shots of state off one both-eligible shot in sixty"
 )
 
 
@@ -211,6 +379,349 @@ def boundary_leg(isat_signal, isat_noise, isweep_signal, isweep_noise):
     return two_channel, isat_ratio, isweep_ratio, eligible, flagged, attributed
 
 
+def flagged_steps(fixed_ratios, fixed_flagged, boundary_step, boundary_flagged,
+                  attributed, channel):
+    """Both legs' flags for one channel as ``(shot, signed ln ratio)`` pairs.
+
+    The shot index is the first shot on the NEW level, in whole-run numbering.
+    Leg 2's two-channel step is the attributed channel's own level ratio, with
+    the sign inverted when the boundary is attributed to the denominator
+    channel.
+    """
+    n_shots = fixed_ratios.shape[1] + 1
+    steps = []
+    for position, shot in zip(*np.nonzero(fixed_flagged)):
+        steps.append((int(position) * n_shots + int(shot) + 1,
+                      float(fixed_ratios[position, shot])))
+    sign = 1.0 if channel == ChannelKind.ISAT.value else -1.0
+    for boundary in np.flatnonzero(boundary_flagged & (attributed == channel)):
+        steps.append(((int(boundary) + 1) * n_shots,
+                      sign * float(boundary_step[boundary])))
+    steps.sort()
+    return steps
+
+
+def level_observable(signal, other_signal):
+    """Per-shot two-channel level ``ln(|signal| / |other_signal|)``, flattened.
+
+    The profile move common to the two channels cancels; their differential
+    response to position does not.
+    """
+    with np.errstate(all="ignore"):
+        return np.log(np.abs(signal) / np.abs(other_signal)).reshape(-1)
+
+
+def both_eligible_samples(signal, noise, other_signal, other_noise):
+    """True per shot where both channels clear the significance floor."""
+    return (eligible_samples(signal, noise)
+            & eligible_samples(other_signal, other_noise)).reshape(-1)
+
+
+def _pre_step_level(level, eligible, shot, shots_per_position):
+    """Median two-channel level over the positions preceding ``shot``.
+
+    The reference is the both-eligible shots of the ``PRE_STEP_POSITIONS``
+    positions BELOW the step's own position, so that no single position can
+    carry it -- a step that is the recovery from a one-position dip would
+    otherwise be referenced to the dip.
+
+    Returns ``(reference, coverage)``: the median, and how many both-eligible
+    shots it was taken over.  The reference is ``None`` when the coverage is
+    zero.  The coverage is returned whatever it is, because how many shots a
+    reference rests on is what says whether a level can be held against it at
+    all -- the caller applies the minimum.
+    """
+    position = shot // shots_per_position
+    start = max(0, position - PRE_STEP_POSITIONS) * shots_per_position
+    window = np.arange(start, position * shots_per_position)
+    usable = window[eligible[window] & np.isfinite(level[window])]
+    if usable.size == 0:
+        return None, 0
+    return float(np.median(level[usable])), int(usable.size)
+
+
+def _returns_to_level(level, eligible, pre_level, start, stop):
+    """First shot in ``[start, stop)`` that comes back to the pre-step level."""
+    for shot in range(start, min(stop, level.size)):
+        if not eligible[shot] or not np.isfinite(level[shot]):
+            continue
+        if abs(level[shot] - pre_level) < RETURN_TOLERANCE_LN:
+            return shot
+    return None
+
+
+def persistence_leg(steps, level, eligible, shots_per_position,
+                    min_reference_shots):
+    """Match every flagged step to its return, and classify what it found.
+
+    Returns ``(pairs, open_ended, untestable)``.  A pair is a step matched by
+    an opposite-sign step of comparable magnitude with no return to the
+    pre-step level in between; an open-ended step has neither a match nor a
+    return before the run ends; an untestable step is one whose reference does
+    not carry ``min_reference_shots`` both-eligible shots, and is neither.
+    Untestable is decided here, before the level test, because a level test
+    against a reference that thin is not a test.
+
+    The pairs and open-ended lists are not filtered by N or by the magnitude
+    floor: the caller applies both, so the separation distribution measures N's
+    margin and the floor can be swept without re-matching.
+    """
+    total_shots = int(level.size)
+    pairs = []
+    open_ended = []
+    untestable = []
+    consumed = set()
+    for index, (shot, ratio) in enumerate(steps):
+        if index in consumed:
+            continue
+        pre_level, coverage = _pre_step_level(level, eligible, shot,
+                                              shots_per_position)
+        if pre_level is None or coverage < min_reference_shots:
+            untestable.append({
+                "shot_step": shot,
+                "position": shot // shots_per_position,
+                "ln_step": ratio,
+                "reference_shots": coverage,
+            })
+            continue
+        match = None
+        for other in range(index + 1, len(steps)):
+            if other in consumed:
+                continue
+            if abs(ratio + steps[other][1]) <= MATCH_TOLERANCE_LN:
+                match = other
+                break
+        stop = total_shots if match is None else steps[match][0]
+        if _returns_to_level(level, eligible, pre_level, shot, stop) is not None:
+            continue
+        if match is None:
+            open_ended.append({
+                "shot_step": shot,
+                "ln_step": ratio,
+                "shots_to_end": total_shots - shot,
+            })
+        else:
+            consumed.add(match)
+            pairs.append({
+                "shot_step": shot,
+                "shot_return": steps[match][0],
+                "separation": steps[match][0] - shot,
+                "ln_step": ratio,
+                "ln_return": steps[match][1],
+            })
+    return pairs, open_ended, untestable
+
+
+def over_min_ln(entry, min_ln):
+    """Whether a matched pair or an open-ended step clears the magnitude floor.
+
+    Both halves of a pair must clear it; an open-ended step has only its own.
+    """
+    magnitudes = [abs(entry["ln_step"])]
+    if "ln_return" in entry:
+        magnitudes.append(abs(entry["ln_return"]))
+    return min(magnitudes) >= min_ln
+
+
+def persistent_rows(persistence, n_shots, min_ln):
+    """The (run, channel) rows holding a state that lasts at least ``n_shots``.
+
+    A matched pair counts by its separation, an open-ended step by its shots to
+    the end of the run; both must also clear the magnitude floor ``min_ln``.
+    """
+    rows = []
+    for row in persistence:
+        pairs = [p for p in row["pairs"]
+                 if p["separation"] >= n_shots and over_min_ln(p, min_ln)]
+        opens = [o for o in row["open_ended"]
+                 if o["shots_to_end"] >= n_shots and over_min_ln(o, min_ln)]
+        if pairs or opens:
+            rows.append((row["run_id"], row["channel"], pairs, opens))
+    return rows
+
+
+def gate_verdict(persistence, n_shots, min_ln, min_reference_shots):
+    """The pre-registered verdict line: run 43 ISAT alone, and nothing else.
+
+    ``min_reference_shots`` is named in the passing line but not applied here:
+    the coverage clause is decided in ``persistence_leg``, so the rows this
+    reads have already had the untestable steps taken out of them.
+    """
+    rows = persistent_rows(persistence, n_shots, min_ln)
+    names = [(run_id, channel) for run_id, channel, _, _ in rows]
+    others = [name for name in names if name != (GATE_RUN_ID, GATE_CHANNEL)]
+    if (GATE_RUN_ID, GATE_CHANNEL) not in names:
+        return (f"GATE FAIL: run {GATE_RUN_ID} {GATE_CHANNEL.upper()} not "
+                f"flagged")
+    if others:
+        listed = ", ".join(
+            f"run {run_id} {channel.upper()} ({'; '.join(described)})"
+            for run_id, channel, described in _row_descriptions(rows, others)
+        )
+        return f"GATE FAIL: also fires on {listed}"
+    return (f"GATE PASS: fires on run {GATE_RUN_ID} {GATE_CHANNEL.upper()} "
+            f"only (N = {n_shots}, floor {min_ln:.2f}, "
+            f"reference ≥ {min_reference_shots})")
+
+
+def _row_descriptions(rows, wanted):
+    """Each wanted row's firing entries, matched pairs then open-ended steps.
+
+    Every entry carries the separation that fired it and the ln ratios behind
+    it, so a failing gate names what it found rather than only where.
+    """
+    for run_id, channel, pairs, opens in rows:
+        if (run_id, channel) not in wanted:
+            continue
+        described = [
+            f"{p['separation']} shots, ln {p['ln_step']:+.3f}/"
+            f"{p['ln_return']:+.3f}"
+            for p in pairs
+        ]
+        described += [
+            f"{o['shots_to_end']} shots to end, ln {o['ln_step']:+.3f}"
+            for o in opens
+        ]
+        yield run_id, channel, described
+
+
+def _separation_line(separations, label):
+    """One min/median/max line over a list of separations, or that it is empty."""
+    if separations:
+        return (f"  {label}: {len(separations)} pair(s), separation min "
+                f"{min(separations)}, median {int(np.median(separations))}, "
+                f"max {max(separations)} shots")
+    return f"  {label}: no pairs"
+
+
+def _sensitivity_table(persistence):
+    """Hit counts over N x floor, with the gate row marked where it fires."""
+    header = "  " + " ".join(f"floor {floor:.2f}"
+                             for floor in SENSITIVITY_MIN_LN)
+    lines = [f"{'':>10}{header}"]
+    for n_shots in SENSITIVITY_N:
+        cells = []
+        for floor in SENSITIVITY_MIN_LN:
+            rows = persistent_rows(persistence, n_shots, floor)
+            names = [(run_id, channel) for run_id, channel, _, _ in rows]
+            fires = (GATE_RUN_ID, GATE_CHANNEL) in names
+            cells.append(f"{len(rows):>7d}{'*' if fires else ' '}  ")
+        lines.append(f"  N = {n_shots:>4d} " + " ".join(cells).rstrip())
+    lines.append(f"  * = run {GATE_RUN_ID} {GATE_CHANNEL.upper()} among them")
+    return lines
+
+
+def _report_untestable(persistence):
+    """Print the steps no reference could carry, and where they sit."""
+    steps = [(row, step) for row in persistence for step in row["untestable"]]
+    print(f"\nuntestable steps (reference too thin): {len(steps)}")
+    for row, step in steps:
+        print(f"  run {row['run_id']} {row['channel']} shot "
+              f"{step['shot_step']} (position {step['position']}, "
+              f"ln {step['ln_step']:+.3f}): "
+              f"untestable: {step['reference_shots']} reference shots")
+    if not steps:
+        return
+    positions = [step["position"] for _, step in steps]
+    rows_hit = {(row["run_id"], row["channel"]) for row, _ in steps}
+    no_reference = sum(1 for _, step in steps if step["reference_shots"] == 0)
+    print(f"  over {len(rows_hit)} (run, channel) row(s); step position min "
+          f"{min(positions)}, median {int(np.median(positions))}, "
+          f"max {max(positions)}; {no_reference} with no both-eligible shot "
+          "behind them at all")
+    counts = {position: positions.count(position)
+              for position in sorted(set(positions))}
+    print("  steps per position: "
+          + " ".join(f"{position}:{count}"
+                     for position, count in counts.items()))
+
+
+def _report_persistence(persistence, n_shots, min_ln, min_reference_shots):
+    """Print leg 3: the rows, the separation distributions and the gate."""
+    print(f"\n=== LEG 3 -- PERSISTENCE (N = {n_shots} shots, "
+          f"floor ln {min_ln:.2f}, reference ≥ {min_reference_shots} shots) ===")
+    print(f"registration: {PERSISTENCE_REGISTRATION}")
+    print(f"floor registration: {MIN_LN_REGISTRATION}")
+    print(f"coverage registration: {MIN_REFERENCE_REGISTRATION}")
+    print(f"rule: {PERSISTENCE_RULE}")
+
+    for row in persistence:
+        long_enough = [p for p in row["pairs"] if p["separation"] >= n_shots]
+        persistent = [p for p in long_enough if over_min_ln(p, min_ln)]
+        opens = [o for o in row["open_ended"]
+                 if o["shots_to_end"] >= n_shots and over_min_ln(o, min_ln)]
+        if not persistent and not opens:
+            continue
+        print(f"\nrun {row['run_id']} {row['channel']}: "
+              f"{len(row['pairs'])} matched pair(s), "
+              f"{len(long_enough)} over N, "
+              f"{len(persistent)} persistent, "
+              f"{len(row['open_ended'])} open-ended, "
+              f"{len(opens)} of them persistent")
+        for pair in persistent:
+            print(f"  persistent {pair['shot_step']} -> {pair['shot_return']} "
+                  f"separation {pair['separation']} "
+                  f"(ln {pair['ln_step']:+.3f} / {pair['ln_return']:+.3f})")
+        for step in opens:
+            print(f"  open-ended at shot {step['shot_step']} "
+                  f"(ln {step['ln_step']:+.3f}), "
+                  f"{step['shots_to_end']} shots to end -- persistent")
+
+    pairs = [p for row in persistence for p in row["pairs"]]
+    over_floor = [p for p in pairs if over_min_ln(p, min_ln)]
+    off_43 = [p["separation"] for row in persistence for p in row["pairs"]
+              if row["run_id"] != GATE_RUN_ID and over_min_ln(p, min_ln)]
+    print(f"\nmatched opposite-sign pairs: {len(pairs)}")
+    print(_separation_line([p["separation"] for p in pairs], "all pairs"))
+    print(_separation_line([p["separation"] for p in over_floor],
+                           f"over the floor (ln {min_ln:.2f} on both halves)"))
+    if off_43:
+        print(f"  largest separation over the floor off run {GATE_RUN_ID}: "
+              f"{max(off_43)} shots")
+    else:
+        print(f"  largest separation over the floor off run {GATE_RUN_ID}: "
+              f"no pairs")
+
+    _report_untestable(persistence)
+
+    print(f"\n{gate_verdict(persistence, n_shots, min_ln, min_reference_shots)}")
+    for floor in SENSITIVITY_MIN_LN:
+        print(f"sensitivity (not a gate), N = {n_shots}, floor {floor:.2f}: "
+              f"{gate_verdict(persistence, n_shots, floor, min_reference_shots)}")
+    print("\nsensitivity (not a gate), hit counts over N x floor "
+          f"(reference ≥ {min_reference_shots} throughout):")
+    for line in _sensitivity_table(persistence):
+        print(line)
+
+
+def _persistence_shots(text):
+    """``--persistence`` takes a positive whole number of shots."""
+    shots = int(text)
+    if shots <= 0:
+        raise argparse.ArgumentTypeError(
+            f"persistence needs a positive number of shots, got {text}")
+    return shots
+
+
+def _persistent_min_ln(text):
+    """``--persistent-min-ln`` takes a non-negative ln magnitude; 0 is no floor."""
+    floor = float(text)
+    if not floor >= 0.0:
+        raise argparse.ArgumentTypeError(
+            f"the persistence floor is a non-negative ln magnitude, got {text}")
+    return floor
+
+
+def _min_reference_shots(text):
+    """``--persistent-min-reference-shots`` takes a whole number; 0 is no clause."""
+    shots = int(text)
+    if shots < 0:
+        raise argparse.ArgumentTypeError(
+            "the reference coverage is a non-negative number of shots, "
+            f"got {text}")
+    return shots
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description=__doc__,
@@ -227,6 +738,37 @@ def main(argv=None):
         type=Path,
         help="path prefix for the two flag CSVs, the summary CSV and the JSON",
     )
+    parser.add_argument(
+        "--persistence",
+        type=_persistence_shots,
+        default=None,
+        metavar="N",
+        help="also run leg 3: keep only flagged steps that stay stepped for at "
+             "least N consecutive shots, and print the pre-registered gate. "
+             "Off by default; the four written files do not depend on it",
+    )
+    parser.add_argument(
+        "--persistent-min-ln",
+        type=_persistent_min_ln,
+        default=PERSISTENT_MIN_LN,
+        metavar="LN",
+        help="leg 3's magnitude floor: a persistent step needs |ln ratio| at "
+             f"least this on both halves of its matched pair (default "
+             f"{PERSISTENT_MIN_LN:g}, the registered value; 0 removes the "
+             "floor). Inert without --persistence",
+    )
+    parser.add_argument(
+        "--persistent-min-reference-shots",
+        type=_min_reference_shots,
+        default=PERSISTENT_MIN_REFERENCE_SHOTS,
+        metavar="M",
+        help="leg 3's reference coverage: a step whose three preceding "
+             "positions hold fewer than M both-eligible shots is untestable "
+             "rather than persistent (default "
+             f"{PERSISTENT_MIN_REFERENCE_SHOTS:d}, the registered value, one "
+             "position's worth; 0 removes the clause). Inert without "
+             "--persistence",
+    )
     args = parser.parse_args(argv)
 
     ds = LapdDataset.from_manifest(args.repo_root / "config/may2026_run_manifest.toml")
@@ -235,13 +777,16 @@ def main(argv=None):
     fixed_rows = []
     boundary_rows = []
     summary_rows = []
+    persistence = []
     for run_id in run_ids:
         run = ds.run(run_id)
         per_channel = {}
+        per_channel_flags = {}
         for kind in (ChannelKind.ISAT, ChannelKind.I_SWEEP):
             signal, noise = plateau_signal_and_noise(run, kind)
             per_channel[kind] = (signal, noise)
             ratios, pair_eligible, flagged = fixed_position_leg(signal, noise)
+            per_channel_flags[kind] = (ratios, flagged)
             n_shots = signal.shape[1]
             for position, shot in zip(*np.nonzero(flagged)):
                 fixed_rows.append({
@@ -296,6 +841,28 @@ def main(argv=None):
             row["boundaries_flagged_attributed_here"] = int(
                 (flagged & (attributed == row["channel"])).sum()
             )
+
+        if args.persistence is not None:
+            others = {ChannelKind.ISAT: ChannelKind.I_SWEEP,
+                      ChannelKind.I_SWEEP: ChannelKind.ISAT}
+            for kind in (ChannelKind.ISAT, ChannelKind.I_SWEEP):
+                signal, noise = per_channel[kind]
+                other_signal, other_noise = per_channel[others[kind]]
+                ratios, fixed_flagged = per_channel_flags[kind]
+                steps = flagged_steps(ratios, fixed_flagged, two_channel,
+                                      flagged, attributed, kind.value)
+                pairs, open_ended, untestable = persistence_leg(
+                    steps,
+                    level_observable(signal, other_signal),
+                    both_eligible_samples(signal, noise,
+                                          other_signal, other_noise),
+                    signal.shape[1],
+                    args.persistent_min_reference_shots,
+                )
+                persistence.append({"run_id": run_id, "channel": kind.value,
+                                    "pairs": pairs,
+                                    "open_ended": open_ended,
+                                    "untestable": untestable})
 
     fixed_csv = args.out_prefix.with_name(
         args.out_prefix.name + "_fixed_position_flags.csv")
@@ -356,6 +923,11 @@ def main(argv=None):
     print(f"wrote {boundary_csv}")
     print(f"wrote {summary_csv}")
     print(f"wrote {summary_json}")
+
+    if args.persistence is not None:
+        _report_persistence(persistence, args.persistence,
+                            args.persistent_min_ln,
+                            args.persistent_min_reference_shots)
 
 
 if __name__ == "__main__":
