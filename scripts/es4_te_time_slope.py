@@ -67,7 +67,13 @@ Inputs
                                     attrs used to place and label the runs
   processed/es4_sim1d_overlay.npz  the ES4 overlay's per-port T_e(t) prior,
                                     read-only, for the window-matched prior
-                                    comparison
+                                    comparison.  Its ``schema_version`` is
+                                    printed beside the prior on every run, and
+                                    a missing file or missing ``te_mean_ev``
+                                    array is refused with a clear message
+                                    (``overlay_prior_te_ev``) rather than
+                                    surfacing as a bare
+                                    FileNotFoundError/KeyError
   config/may2026_run_manifest.toml sweep schedule, channels, calibration
   data/may2026/*.hdf5              raw runs, opened read-only
 
@@ -301,23 +307,42 @@ def runs_for_port(
 
 
 def overlay_prior_te_ev(overlay_npz_path: Path, port: int, window_ms: tuple[float, float]):
-    """Mean prior T_e (eV) for *port* over *window_ms* from the ES4 overlay.
+    """Mean prior T_e (eV) and schema_version from the ES4 overlay ``processed/es4_sim1d_overlay.npz``.
 
-    Returns NaN if the overlay carries no row for *port*, or if no
-    ``te_time_ms`` sample of that row falls in *window_ms*.  Read-only.
+    Returns ``(value, schema_version)``.  ``value`` is NaN if the overlay
+    carries no row for *port*, or if no ``te_time_ms`` sample of that row
+    falls in *window_ms*.  Read-only.
+
+    Refuses with a clear message if *overlay_npz_path* does not exist, or if
+    the file carries no ``te_mean_ev`` array -- the prior this instrument
+    prints depends on that dependency existing and carrying the expected
+    schema, and a missing file or key should say so rather than surface as a
+    bare ``FileNotFoundError``/``KeyError`` from inside ``numpy.load``.
     """
+    if not overlay_npz_path.exists():
+        raise ValueError(
+            f"the ES4 sim1d overlay {overlay_npz_path} does not exist; the "
+            "window-matched prior this instrument prints depends on it -- "
+            "regenerate it or point --overlay-npz (if given) at the right file"
+        )
     with np.load(overlay_npz_path, allow_pickle=True) as d:
+        if "te_mean_ev" not in d:
+            raise ValueError(
+                f"{overlay_npz_path} carries no 'te_mean_ev' array; it is not "
+                "the ES4 sim1d overlay this instrument expects"
+            )
+        schema_version = int(d["schema_version"]) if "schema_version" in d else None
         ports = np.asarray(d["port"])
         matches = np.flatnonzero(ports == port)
         if matches.size == 0:
-            return float("nan")
+            return float("nan"), schema_version
         row = int(matches[0])
         time_ms = np.asarray(d["te_time_ms"], dtype=float)
         te_ev = np.asarray(d["te_mean_ev"], dtype=float)[row]
     in_window = (time_ms >= window_ms[0]) & (time_ms <= window_ms[1])
     if not np.any(in_window):
-        return float("nan")
-    return float(np.nanmean(te_ev[in_window]))
+        return float("nan"), schema_version
+    return float(np.nanmean(te_ev[in_window])), schema_version
 
 
 def cell_te_estimates(run, ramp, core_idx, core_cutoff_hz):
@@ -509,7 +534,10 @@ def main(argv=None) -> int:
           f"< {MIN_FINITE_CYCLES} finite cycles -> REFUSED")
     print()
 
-    overlay_prior_ev = overlay_prior_te_ev(OVERLAY_NPZ, args.port, WINDOW_MATCHED_MS)
+    overlay_prior_ev, overlay_schema_version = overlay_prior_te_ev(
+        OVERLAY_NPZ, args.port, WINDOW_MATCHED_MS
+    )
+    print(f"overlay     {OVERLAY_NPZ}  schema_version {overlay_schema_version}")
 
     csv_rows = []
     for spec in runs:

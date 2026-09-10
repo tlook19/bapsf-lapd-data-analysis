@@ -212,10 +212,26 @@ def test_runs_for_port_override_refuses_an_absent_run_id():
 
 
 def test_overlay_prior_te_ev_reads_the_p29_window_matched_row():
-    prior = overlay_prior_te_ev(OVERLAY_NPZ, 29, WINDOW_MATCHED_MS)
+    prior, schema_version = overlay_prior_te_ev(OVERLAY_NPZ, 29, WINDOW_MATCHED_MS)
     # On record: 1.58-1.74 eV for the ES4 overlay's p29 plateau.
     assert 1.5 <= prior <= 1.8
+    assert schema_version == 23
 
 
 def test_overlay_prior_te_ev_nan_for_a_port_the_overlay_does_not_carry():
-    assert math.isnan(overlay_prior_te_ev(OVERLAY_NPZ, 9999, WINDOW_MATCHED_MS))
+    prior, schema_version = overlay_prior_te_ev(OVERLAY_NPZ, 9999, WINDOW_MATCHED_MS)
+    assert math.isnan(prior)
+    assert schema_version == 23
+
+
+def test_overlay_prior_te_ev_refuses_a_missing_file(tmp_path):
+    missing = tmp_path / "es4_sim1d_overlay.npz"
+    with pytest.raises(ValueError, match=str(missing)):
+        overlay_prior_te_ev(missing, 29, WINDOW_MATCHED_MS)
+
+
+def test_overlay_prior_te_ev_refuses_a_file_with_no_te_mean_ev(tmp_path):
+    wrong = tmp_path / "not_the_overlay.npz"
+    np.savez(wrong, port=np.array([29]), te_time_ms=np.array([1.0]))
+    with pytest.raises(ValueError, match="te_mean_ev"):
+        overlay_prior_te_ev(wrong, 29, WINDOW_MATCHED_MS)
