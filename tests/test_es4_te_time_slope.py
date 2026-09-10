@@ -1,10 +1,13 @@
-"""Arithmetic and gate coverage for the ES4 p21 T_e(t) plateau-slope instrument.
+"""Arithmetic and gate coverage for the ES4 T_e(t) plateau-slope instrument.
 
 The raw-sweep path (``cell_te_estimates`` / ``run_plateau_series``) needs real
 digitizer data and is exercised by running the script, not here. What is unit
 tested is the closed-form arithmetic underneath it: the OLS slope/SE, its
-percent-of-plateau-mean conversion, the pre-registered gate, and the output
-refusal.
+percent-of-plateau-mean conversion, the pre-registered gates (slope and
+excess bin), the port/run lookup and its output-path guard, the windowed
+mean, and the overlay-prior read -- the last two need only the processed
+fixtures already provisioned for the raw-sweep path (``langmuir_sweeps.hdf5``,
+``es4_sim1d_overlay.npz``), not the raw digitizer files.
 """
 
 import math
@@ -13,11 +16,19 @@ import numpy as np
 import pytest
 
 from scripts.es4_te_time_slope import (
+    DEFAULT_PORT,
     FORBIDDEN_OUTPUT_DIR,
+    SWEEPS_H5,
+    WINDOW_MATCHED_MS,
+    OVERLAY_NPZ,
     checked_output_path,
+    excess_bin_verdict,
     gate_verdict,
     ols_slope_se,
+    overlay_prior_te_ev,
     pct_per_ms,
+    runs_for_port,
+    windowed_mean_ev,
 )
 
 
@@ -113,3 +124,98 @@ def test_output_inside_the_product_directory_is_refused(tmp_path):
     (tmp_path / FORBIDDEN_OUTPUT_DIR).mkdir()
     with pytest.raises(ValueError, match=FORBIDDEN_OUTPUT_DIR):
         checked_output_path(tmp_path / FORBIDDEN_OUTPUT_DIR / ".." / FORBIDDEN_OUTPUT_DIR / "f.csv")
+
+
+# The output-path guard's trigger set: every new run-selecting flag
+# (--port, --runs, --plateau-window-ms) feeds only *args.output* into
+# checked_output_path, so a census of what triggers/does not trigger the
+# guard is unaffected by which port or runs were selected -- exercised here
+# with filenames that plausibly vary by port (the shape a --port-aware
+# default might have taken) to make that explicit.
+@pytest.mark.parametrize(
+    "relative, triggers",
+    [
+        ("processed/es4_te_time_slope_p21.csv", True),
+        ("processed/es4_te_time_slope_p29.csv", True),
+        ("sub/processed/out.csv", True),
+        ("processed_nearby/out.csv", False),  # "processed" substring, not a path part
+        ("p29_out.csv", False),
+        ("out/p21_p29_bins.csv", False),
+    ],
+)
+def test_output_guard_trigger_set(tmp_path, relative, triggers):
+    path = tmp_path / relative
+    if triggers:
+        with pytest.raises(ValueError, match=FORBIDDEN_OUTPUT_DIR):
+            checked_output_path(path)
+    else:
+        assert checked_output_path(path) == path.resolve()
+
+
+@pytest.mark.parametrize(
+    "value_ev, n_finite, n_total, expected",
+    [
+        (0.55, 10, 10, "<= 0.6 eV"),
+        (0.6, 10, 10, "<= 0.6 eV"),
+        (1.0, 10, 10, ">= 1 eV"),
+        (1.75, 10, 10, ">= 1 eV"),
+        (0.8, 10, 10, "between (undetermined)"),
+    ],
+)
+def test_excess_bin_verdict_bins_the_value(value_ev, n_finite, n_total, expected):
+    assert excess_bin_verdict(value_ev, n_finite, n_total) == expected
+
+
+def test_excess_bin_verdict_refuses_fewer_than_three_finite_cycles():
+    assert excess_bin_verdict(0.5, 2, 8) == "REFUSED (2 of 8 cycles)"
+    assert excess_bin_verdict(float("nan"), 5, 8) == "REFUSED (5 of 8 cycles)"
+
+
+def test_windowed_mean_ev_selects_the_window_and_refuses_empty():
+    cycle_ms = np.array([10.0, 12.0, 15.0, 17.0, 19.0])
+    values = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    assert windowed_mean_ev(cycle_ms, values, (15.0, 19.5)) == pytest.approx(4.0)
+    assert windowed_mean_ev(cycle_ms, values, (10.0, 19.5)) == pytest.approx(3.0)
+    assert math.isnan(windowed_mean_ev(cycle_ms, values, (100.0, 200.0)))
+
+
+def test_runs_for_port_default_reproduces_the_original_p21_pair():
+    specs = runs_for_port(SWEEPS_H5, DEFAULT_PORT)
+    assert [s["run_id"] for s in specs] == ["42", "43"]
+    assert [s["port"] for s in specs] == [21, 21]
+    assert [s["rotation_deg"] for s in specs] == [0.0, 180.0]
+
+
+def test_runs_for_port_p29_gives_runs_44_and_45():
+    specs = runs_for_port(SWEEPS_H5, 29)
+    assert [s["run_id"] for s in specs] == ["44", "45"]
+    assert [s["port"] for s in specs] == [29, 29]
+    assert [s["rotation_deg"] for s in specs] == [0.0, 180.0]
+
+
+def test_runs_for_port_refuses_a_port_with_no_runs():
+    with pytest.raises(ValueError, match="port 9999"):
+        runs_for_port(SWEEPS_H5, 9999)
+
+
+def test_runs_for_port_override_uses_the_named_runs_and_their_own_attrs():
+    specs = runs_for_port(SWEEPS_H5, 21, override_run_ids=("45", "44"))
+    # Order follows the override, not a re-sort; port/rotation come from the
+    # file's own attrs for whatever run id was named, not the --port value.
+    assert [s["run_id"] for s in specs] == ["45", "44"]
+    assert [s["port"] for s in specs] == [29, 29]
+
+
+def test_runs_for_port_override_refuses_an_absent_run_id():
+    with pytest.raises(ValueError, match="99"):
+        runs_for_port(SWEEPS_H5, 21, override_run_ids=("99",))
+
+
+def test_overlay_prior_te_ev_reads_the_p29_window_matched_row():
+    prior = overlay_prior_te_ev(OVERLAY_NPZ, 29, WINDOW_MATCHED_MS)
+    # On record: 1.58-1.74 eV for the ES4 overlay's p29 plateau.
+    assert 1.5 <= prior <= 1.8
+
+
+def test_overlay_prior_te_ev_nan_for_a_port_the_overlay_does_not_carry():
+    assert math.isnan(overlay_prior_te_ev(OVERLAY_NPZ, 9999, WINDOW_MATCHED_MS))
