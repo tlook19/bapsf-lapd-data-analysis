@@ -1,0 +1,14 @@
+{
+  "43": {
+    "set_id": "4",
+    "port": 21,
+    "channel": "isat",
+    "state_mask_shots": "240-695,760-767,781-1019",
+    "state_factor": 1.76,
+    "state_factor_applied": false,
+    "state_mask_positions": "12-34,38-50",
+    "shots_per_position": 20,
+    "cells_excluded": 720,
+    "cells_total": 1020
+  }
+}

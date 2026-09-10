@@ -297,3 +297,35 @@ def test_state_rule_is_the_absence_note_when_neither_face_carries_a_mask(tmp_pat
     assert prov["state_mask_upstream_present"] is False
     assert prov["state_mask_downstream_present"] is False
     assert "no channel state is registered" in prov["state_exclusion_rule"]
+
+
+@pytest.mark.parametrize("face", ["upstream", "downstream"])
+def test_the_registered_run_43_mask_is_honoured_on_either_face(tmp_path, face):
+    """Run 43's own registration, projected onto cells, on each face in turn.
+
+    The registration is two entries of one state, so the cells it excludes have
+    a gap: positions 35-37 (x = +10, +11 and +12 cm) lie between the entries and
+    must survive whichever face carries the mask.  The mask is built from the
+    registry rather than from a hand-written slice, so what is checked here is
+    the shipped shot ranges and not a restatement of them.
+    """
+    from scripts.annotate_state_mask import STATE_REGISTRY, state_mask_for_run
+
+    entry = STATE_REGISTRY[("43", "isat")]
+    mask, covered = state_mask_for_run(N_X, N_WINDOWS, 20, entry["shot_ranges"])
+    gap = np.flatnonzero(~covered)
+
+    assert covered[12:35].all() and covered[38:].all()
+    assert not covered[35:38].any()
+
+    results, prov = _run(tmp_path, **{f"{face}_state": mask})
+    unmasked = _run(tmp_path)[0]
+
+    assert prov["state_cells_excluded"] == int(mask.sum())
+    assert prov[f"state_cells_excluded_{face}"] == int(mask.sum())
+    assert np.array_equal(results["state_excluded_cells"], mask)
+    for name in MASKED_DATASETS:
+        assert np.isnan(results[name][mask]).all(), name
+        # Untouched means equal to the unmasked run cell for cell, not merely
+        # finite: the mask must not move a value it does not exclude.
+        assert np.array_equal(results[name][gap], unmasked[name][gap]), name

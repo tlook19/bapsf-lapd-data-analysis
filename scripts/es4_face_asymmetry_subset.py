@@ -54,22 +54,45 @@ ruling; this instrument only reports where each corrected half-difference falls
 against the range the nine ES1-ES3 pairs already span,
 ``MACH_FACE_ASYMMETRY_M_RANGE``, which it imports rather than restates.
 
+The membership gate is that range's UPPER edge alone.  A magnitude at or below
+the largest |M| the nine pairs reach is inside; there is no lower edge.  The
+nine happen not to reach zero, but a face asymmetry that the correction leaves
+indistinguishable from zero is a SMALLER asymmetry than any of them and not a
+different kind of thing, so reading the set's smallest observed value as a floor
+the quantity must clear would exclude a pair for agreeing with the convention
+too well.
+
 F is a measurement with a spread, so every port is evaluated three times: at F's
 central value and at both ends of its spread, with the spread applied to BOTH
 rotations together (that is what moves the half-difference furthest, since the
 two ln F terms enter with the same sign after the rotation flip).  A verdict
-that does not survive all three points is not a verdict.
+that does not survive all three points is not a verdict.  Half the distance
+between the low and high readings is the pair's BAR, printed beside its central
+value: the corrected half-difference is a measurement, and F's spread is what
+sets its width.
 
 The masked pair
 ---------------
 Run 43 -- ES4 port 21 at rot 180 -- carries a registered channel-state mask over
 its ISAT face (``scripts/annotate_state_mask.py``), and the Mach product already
-carries it as NaN.  The mask covers the core of the profile, so that pair has no
+carries it as NaN.  The registration has two entries and between them they cover
+the core of the profile and its whole far-positive side, so that pair has no
 admitted cell at ``x = 0`` and its statistic cannot be read where the declared
 one is read.  It is not silently dropped and it is not silently substituted:
 when ``x = 0`` is empty the pair falls back to the cells that survive on BOTH
-rotations, and every line it appears on is LABELLED with the reduction actually
-used.  A pair with no admitted cell at all is refused outright.
+rotations -- for run 43 the low-state cells that lie outside the mask, which are
+the two ends of the profile -- and every line it appears on is LABELLED with the
+reduction and the cut actually used, both because that is what was read and
+because a number read there sits beside the declared statistic rather than among
+it.  A pair with no admitted cell at all is refused outright.
+
+That fallback carries one registered cut, ``EDGE_CUT_CM``: positions at
+|x| >= 23 cm are excluded from it.  Both faces are at the 0.1-1 mA floor out
+there, and at x = -23 and -24 cm both runs of the pair carry an unexplained
+x5-10 feature in ISAT against I_SWEEP, so a ratio taken there is a ratio of two
+floor-level currents with a feature neither face explains.  Left in, those 15
+cells carry the figure on their own.  The cut is on the EDGE-CELL reduction
+alone; the declared ``x = 0`` reduction is untouched by it.
 
 Controls
 --------
@@ -123,9 +146,30 @@ X_TARGET_CM = 0.0
 #: Tolerance on matching ``X_TARGET_CM`` against the product's own ``x_cm``, cm.
 X_MATCH_TOL_CM = 1.0e-6
 
+#: Outermost |x| admitted to the edge-cell reduction, cm (strict: a position at
+#: or beyond this is excluded).  REGISTERED CUT, and it applies to the edge-cell
+#: reduction ONLY -- the declared ``x = 0`` reduction is untouched by it.
+#: Positions at |x| >= 23 cm sit at the 0.1-1 mA floor on BOTH faces, and at
+#: x = -23 and -24 cm both runs of the pair carry an unexplained x5-10 feature in
+#: ISAT against I_SWEEP.  A ratio taken there is a ratio of two floor-level
+#: currents with a feature neither face explains, so those positions are excluded
+#: from the edge-cell figure by registration rather than left to dominate it:
+#: they are 15 of the 75 cells that survive the mask and they carry the figure
+#: from about +0.008 M to about -0.17 M on their own.
+EDGE_CUT_CM = 23.0
+
 #: Label of the declared reduction, and of the fallback used when it is empty.
+#: The fallback's cells are the ones a placed cell mask leaves, inside the
+#: registered edge cut: for the one pair that needs it they are the low-state
+#: cells at the two ends of the profile, so the label names them, states the cut
+#: applied, and says the reading sits beside the declared set.
 X0_LABEL = f"x = {X_TARGET_CM:.0f} cm"
-FALLBACK_LABEL = "kept cells outside the mask"
+EDGE_CELLS_LABEL = f"edge cells |x| < {EDGE_CUT_CM:.0f} cm, beside the set"
+
+#: The membership gate: the largest |M| the nine ES1-ES3 pairs reach.  Inclusive,
+#: because it IS an observed pair.  There is deliberately no lower edge; see
+#: ``gate_verdict``.
+GATE_HIGH_M = max(MACH_FACE_ASYMMETRY_M_RANGE)
 
 #: Experiment set whose pairs are re-tested, and the ports it visits twice.
 ES4_SET_ID = "4"
@@ -268,12 +312,19 @@ def choose_reduction(ln_rot0, ln_rot180, x_cm) -> Reduction | None:
     """Cells the pair's half-difference is averaged over, or ``None`` if empty.
 
     Prefers the declared reduction -- the single row at ``x = 0`` -- and falls
-    back to every cell finite on BOTH rotations only when that row is empty,
+    back to the cells finite on BOTH rotations only when that row is empty,
     which is what a placed cell mask does to a pair.  The fallback is a
     different reduction and carries a different label so it can never be read as
     the declared one.  Both rotations must be finite in a cell: averaging each
     rotation over its own surviving cells would difference two different
     regions of the profile.
+
+    ``EDGE_CUT_CM`` is applied to the fallback and to the fallback ALONE.  The
+    declared reduction is read at ``x = 0``, which no cut of this kind can
+    reach, so gating it here would be dead code that looked like policy; the
+    edge-cell figure, on the other hand, is an average over whatever the mask
+    leaves, and without the cut it is carried by positions whose two faces are
+    both at the current floor.
     """
     finite_both = np.isfinite(ln_rot0) & np.isfinite(ln_rot180)
     n_candidate = int(finite_both.size)
@@ -286,9 +337,11 @@ def choose_reduction(ln_rot0, ln_rot180, x_cm) -> Reduction | None:
             n_admitted=int(x0_mask.sum()),
             n_candidate=n_candidate,
         )
+    inside_cut = np.abs(np.asarray(x_cm)) < EDGE_CUT_CM
+    finite_both = finite_both & inside_cut[:, None]
     if finite_both.any():
         return Reduction(
-            label=FALLBACK_LABEL,
+            label=EDGE_CELLS_LABEL,
             mask=finite_both,
             n_admitted=int(finite_both.sum()),
             n_candidate=n_candidate,
@@ -301,17 +354,32 @@ def half_difference_ln(ln_rot0, ln_rot180, reduction: Reduction) -> float:
     return float(np.mean((ln_rot0[reduction.mask] - ln_rot180[reduction.mask]) / 2.0))
 
 
-def gate_verdict(half_difference_m, gate_range=MACH_FACE_ASYMMETRY_M_RANGE) -> str:
+def gate_verdict(half_difference_m, gate_high=GATE_HIGH_M) -> str:
     """Where a half-difference falls against the ES1-ES3 range, as a sentence.
 
     The range is a magnitude range, so the sign of the half-difference does not
-    enter; the ends are inclusive because they ARE observed ES1-ES3 pairs.
+    enter, and only its UPPER edge gates membership; that edge is inclusive
+    because it IS an observed ES1-ES3 pair.  There is no lower edge: a corrected
+    value indistinguishable from zero is a smaller face asymmetry than any of
+    the nine, which is inside the range and not below it.
     """
-    low, high = gate_range
     magnitude = abs(half_difference_m)
-    if low <= magnitude <= high:
+    if magnitude <= gate_high:
         return "joins as a labelled ES4 member"
-    return f"outside the range ({magnitude:.4f} not in [{low:.3f}, {high:.3f}])"
+    return f"outside the range ({magnitude:.4f} above {gate_high:.3f})"
+
+
+def f_half_bracket_m(row) -> float:
+    """Half the distance between the low-F and high-F readings, in M.
+
+    F's spread is applied to both rotations together, so the low and high points
+    are the two ends of what the factor's own uncertainty does to the corrected
+    half-difference; half their separation is the bar quoted beside the central
+    value.
+    """
+    low = row["points"]["low"]["half_difference_m"]
+    high = row["points"]["high"]["half_difference_m"]
+    return (high - low) / 2.0
 
 
 def refusal_verdict(n_candidate: int) -> str:
@@ -468,11 +536,10 @@ def write_csv(path: Path, rows) -> None:
         "half_difference_m_raw",
         "half_difference_ln_corrected",
         "half_difference_m_corrected",
-        "gate_low_m",
+        "f_half_bracket_m",
         "gate_high_m",
         "verdict",
     ]
-    low, high = MACH_FACE_ASYMMETRY_M_RANGE
     with path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fields)
         writer.writeheader()
@@ -488,8 +555,7 @@ def write_csv(path: Path, rows) -> None:
                 "n_candidate_cells": row["n_candidate"],
                 "half_difference_ln_raw": row["raw_ln"],
                 "half_difference_m_raw": row["raw_m"],
-                "gate_low_m": low,
-                "gate_high_m": high,
+                "gate_high_m": GATE_HIGH_M,
             }
             if row["refused"]:
                 writer.writerow(
@@ -500,10 +566,12 @@ def write_csv(path: Path, rows) -> None:
                         "f_rot180": "",
                         "half_difference_ln_corrected": "",
                         "half_difference_m_corrected": "",
+                        "f_half_bracket_m": "",
                         "verdict": refusal_verdict(row["n_candidate"]),
                     }
                 )
                 continue
+            bar = f_half_bracket_m(row)
             for point in F_POINTS:
                 entry = row["points"][point]
                 writer.writerow(
@@ -514,6 +582,7 @@ def write_csv(path: Path, rows) -> None:
                         "f_rot180": entry["f_rot180"],
                         "half_difference_ln_corrected": entry["half_difference_ln"],
                         "half_difference_m_corrected": entry["half_difference_m"],
+                        "f_half_bracket_m": bar,
                         "verdict": entry["verdict"],
                     }
                 )
@@ -548,13 +617,19 @@ def main(argv=None) -> int:
     args = parse_args(argv)
     output = checked_output_path(args.output)
     factors = read_rest_bias_factors(args.rest_bias_csv)
-    gate_low, gate_high = MACH_FACE_ASYMMETRY_M_RANGE
 
     print(f"mach product   {args.mach_hdf5}")
     print(f"rest-bias CSV  {args.rest_bias_csv}  (column f_direct_up +- f_direct_up_std)")
     print(f"plateau        {PLATEAU_T_MIN_S * 1e3:.0f}-{PLATEAU_T_MAX_S * 1e3:.0f} ms")
     print(f"statistic      half of the rot0-rot180 difference of ln(J_up/J_dn), M = ln R / {MACH_K}")
-    print(f"gate range     |M| in [{gate_low:.3f}, {gate_high:.3f}]  (the nine ES1-ES3 pairs)")
+    print(f"gate           |M| <= {GATE_HIGH_M:.3f}, the largest of the nine ES1-ES3 pairs; "
+          "NO lower edge --")
+    print("               a corrected value indistinguishable from zero is a smaller face")
+    print("               asymmetry than any of the nine, which puts it inside the range")
+    print(f"edge cut       |x| < {EDGE_CUT_CM:.0f} cm, on the edge-cell reduction ONLY "
+          f"(x = 0 reductions untouched):")
+    print("               beyond it both faces sit at the 0.1-1 mA floor and both runs")
+    print("               carry an unexplained x5-10 ISAT/I_SWEEP feature at x = -23/-24 cm")
     print()
     print("The correction multiplies the SWEPT face's current by F, which is upstream")
     print("at one rotation and downstream at the other, so it does not cancel out of the")
@@ -588,7 +663,7 @@ def main(argv=None) -> int:
                 continue
             print(
                 f"  p{row['port']:<2}  runs {row['run_rot0']}/{row['run_rot180']}  "
-                f"{row['reduction']:<26}  {row['n_admitted']:>3} of "
+                f"{row['reduction']:<38}  {row['n_admitted']:>3} of "
                 f"{row['n_candidate']:<4} cells  half-difference "
                 f"{row['raw_ln']:+.4f} ln = {row['raw_m']:+.4f} M"
             )
@@ -619,6 +694,11 @@ def main(argv=None) -> int:
                     f"{entry['half_difference_ln']:+.4f} ln = "
                     f"{entry['half_difference_m']:+.4f} M"
                 )
+            print(
+                f"    bar       {row['points']['central']['half_difference_m']:+.4f} "
+                f"+- {f_half_bracket_m(row):.4f} M   (the F half-bracket: half the "
+                "low-to-high spread)"
+            )
             for point in F_POINTS:
                 entry = row["points"][point]
                 print(f"    GATE  F {point:<7}  {entry['verdict']}")

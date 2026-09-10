@@ -23,8 +23,10 @@ from bapsf_lapd.density import MACH_FACE_ASYMMETRY_M_RANGE, MACH_K
 from scripts.es4_face_asymmetry_subset import (
     CONTROL_HALF_DIFFERENCES_M,
     CONTROL_TOL_M,
-    FALLBACK_LABEL,
+    EDGE_CELLS_LABEL,
+    EDGE_CUT_CM,
     FORBIDDEN_OUTPUT_DIR,
+    GATE_HIGH_M,
     X0_LABEL,
     FaceFactor,
     PairRefused,
@@ -32,6 +34,7 @@ from scripts.es4_face_asymmetry_subset import (
     checked_output_path,
     choose_reduction,
     corrected_ln_ratio,
+    f_half_bracket_m,
     gate_verdict,
     half_difference_ln,
     plateau_ln_ratio,
@@ -206,18 +209,57 @@ def test_a_spread_reaching_zero_is_refused_rather_than_clipped():
         factor.at("middle")
 
 
-def test_the_gate_reads_magnitudes_and_includes_both_ends():
-    """Both ends are observed ES1-ES3 pairs, so both are inside."""
+def test_the_gate_reads_magnitudes_against_the_upper_edge_only():
+    """The largest of the nine is the only edge, and it is inclusive."""
     low, high = MACH_FACE_ASYMMETRY_M_RANGE
+    assert GATE_HIGH_M == high
     joins = "joins as a labelled ES4 member"
-    assert gate_verdict(low) == joins
     assert gate_verdict(high) == joins
+    assert gate_verdict(-high) == joins
+    assert gate_verdict(low) == joins
     assert gate_verdict(-(low + high) / 2) == joins
-    below = gate_verdict(low / 2)
     above = gate_verdict(-2 * high)
-    assert below.startswith("outside the range") and f"{low / 2:.4f}" in below
     assert above.startswith("outside the range") and f"{2 * high:.4f}" in above
+    assert f"{high:.3f}" in above
     assert refusal_verdict(255) == "REFUSED (0 of 255)"
+
+
+def test_a_value_indistinguishable_from_zero_is_inside_not_below():
+    """There is no lower edge: the nine pairs' smallest value is not a floor.
+
+    The previous form gated on ``low <= |M| <= high`` and put anything under the
+    smallest observed ES1-ES3 asymmetry OUTSIDE, which excluded a pair for
+    agreeing with the convention better than any of the nine did.
+    """
+    low, _ = MACH_FACE_ASYMMETRY_M_RANGE
+    joins = "joins as a labelled ES4 member"
+    assert gate_verdict(0.0) == joins
+    assert gate_verdict(-0.0) == joins
+    assert gate_verdict(low / 100) == joins
+    # The value that made the old form fire: p29 at the high end of F.
+    assert gate_verdict(-0.0013) == joins
+    assert low / 2 < low
+    assert gate_verdict(low / 2) == joins
+
+
+def test_the_f_half_bracket_is_half_the_low_to_high_spread(tmp_path):
+    """The printed bar is half the distance between the two F end readings."""
+    path = _synthetic_product(tmp_path)
+    factors = _factors(1.20, 0.10, 1.50, 0.20)
+    with h5py.File(path, "r") as handle:
+        row = analyse_es4_pair(handle["experiment_sets"], 21, factors, X_CM)
+
+    low = row["points"]["low"]["half_difference_m"]
+    high = row["points"]["high"]["half_difference_m"]
+    bar = f_half_bracket_m(row)
+    assert bar == pytest.approx((high - low) / 2.0)
+    # The correction is additive in ln, so the bar follows from the factors
+    # alone and does not depend on the raw half-difference at all.
+    expected = (
+        (math.log(1.30) + math.log(1.70)) - (math.log(1.10) + math.log(1.30))
+    ) / 4.0 / MACH_K
+    assert bar == pytest.approx(expected)
+    assert bar > 0.0
 
 
 def test_a_masked_core_falls_back_to_the_surviving_cells(tmp_path):
@@ -231,7 +273,7 @@ def test_a_masked_core_falls_back_to_the_surviving_cells(tmp_path):
         ln180 = plateau_ln_ratio(runs["43"])
         reduction = choose_reduction(ln0, ln180, X_CM)
 
-    assert reduction.label == FALLBACK_LABEL
+    assert reduction.label == EDGE_CELLS_LABEL
     # Two surviving x rows over the two in-window samples.
     assert reduction.n_admitted == 2 * int(IN_WINDOW.sum())
     assert reduction.n_candidate == X_CM.size * int(IN_WINDOW.sum())
@@ -248,6 +290,76 @@ def test_a_masked_core_falls_back_to_the_surviving_cells(tmp_path):
             plateau_ln_ratio(runs["42"]), plateau_ln_ratio(runs["43"]), X_CM
         )
     assert empty is None
+
+
+def test_the_edge_reduction_is_exactly_the_cells_outside_the_mask(tmp_path):
+    """Run 43's shape: core and one whole side masked, one edge left.
+
+    The extended registration masks the core AND the far-positive side, so the
+    cells the pair is read on are the low-state ones that remain.  The reduction
+    must be exactly those and nothing else -- a cell the product marked unusable
+    must not come back in through the fallback, and the half-difference must be
+    the one the surviving cells give.
+    """
+    mask = np.zeros((X_CM.size, TIMES_S.size), dtype=bool)
+    mask[1, :] = True   # the core, x = 0
+    mask[2, :] = True   # one whole side, x = +1
+    path = _synthetic_product(tmp_path, rot180_mask=mask)
+    with h5py.File(path, "r") as handle:
+        runs = handle["experiment_sets"]["4"]
+        ln0 = plateau_ln_ratio(runs["42"])
+        ln180 = plateau_ln_ratio(runs["43"])
+        reduction = choose_reduction(ln0, ln180, X_CM)
+        value = half_difference_ln(ln0, ln180, reduction)
+
+    assert reduction.label == EDGE_CELLS_LABEL
+    # The reduction mask is already restricted to the plateau window, so it has
+    # one column per in-window sample.
+    survivors = np.zeros_like(reduction.mask)
+    survivors[0, :] = True
+    assert survivors.shape == (X_CM.size, int(IN_WINDOW.sum()))
+    assert np.array_equal(reduction.mask, survivors)
+    assert reduction.n_admitted == int(IN_WINDOW.sum())
+    assert reduction.n_candidate == X_CM.size * int(IN_WINDOW.sum())
+    assert not reduction.mask[1].any() and not reduction.mask[2].any()
+    assert value == pytest.approx(RAW_HALF_DIFFERENCE_LN)
+
+
+def test_the_registered_edge_cut_removes_exactly_the_outer_positions():
+    """``|x| < EDGE_CUT_CM`` on the edge-cell reduction, and nothing else.
+
+    The grid and the surviving positions are run 43's: the extended mask leaves
+    x = -25 ... -14 and +10 ... +12, and the cut must take the three positions
+    at |x| >= 23 cm and leave the other twelve untouched.  It is checked as a
+    set difference rather than by a count, so a cut that removed the wrong
+    positions could not pass by removing the right number of them.
+    """
+    x_cm = np.linspace(-25.0, 25.0, 51)
+    survivors = ((x_cm >= -25) & (x_cm <= -14)) | ((x_cm >= 10) & (x_cm <= 12))
+    ln = np.where(survivors[:, None], 0.5, np.nan) * np.ones((x_cm.size, 5))
+
+    reduction = choose_reduction(ln, ln, x_cm)
+
+    assert reduction.label == EDGE_CELLS_LABEL
+    assert f"{EDGE_CUT_CM:.0f}" in EDGE_CELLS_LABEL
+    admitted = set(x_cm[reduction.mask.any(axis=1)])
+    offered = set(x_cm[survivors])
+    assert offered - admitted == {-25.0, -24.0, -23.0}
+    assert admitted == {x for x in offered if abs(x) < EDGE_CUT_CM}
+    assert reduction.n_admitted == 12 * 5
+    # The cut narrows what is READ, never what was on offer.
+    assert reduction.n_candidate == x_cm.size * 5
+
+
+def test_the_edge_cut_does_not_touch_the_declared_reduction():
+    """A cell at x = 0 is admitted whatever the cut is; only the fallback cuts."""
+    x_cm = np.linspace(-25.0, 25.0, 51)
+    ln = np.full((x_cm.size, 5), 0.5)
+
+    reduction = choose_reduction(ln, ln, x_cm)
+
+    assert reduction.label == X0_LABEL
+    assert set(x_cm[reduction.mask.any(axis=1)]) == {0.0}
 
 
 def test_an_output_inside_the_product_directory_is_refused(tmp_path):
