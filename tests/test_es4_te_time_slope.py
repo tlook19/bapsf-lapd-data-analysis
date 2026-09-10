@@ -18,6 +18,7 @@ import pytest
 from scripts.es4_te_time_slope import (
     DEFAULT_PORT,
     FORBIDDEN_OUTPUT_DIR,
+    SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS,
     SWEEPS_H5,
     WINDOW_MATCHED_MS,
     OVERLAY_NPZ,
@@ -235,3 +236,12 @@ def test_overlay_prior_te_ev_refuses_a_file_with_no_te_mean_ev(tmp_path):
     np.savez(wrong, port=np.array([29]), te_time_ms=np.array([1.0]))
     with pytest.raises(ValueError, match="te_mean_ev"):
         overlay_prior_te_ev(wrong, 29, WINDOW_MATCHED_MS)
+
+
+def test_p29_is_the_registered_semi_quantitative_window_spread_port():
+    # scripts/refit_window_band.py's core-cell pass over set 4 (both
+    # rotation faces, runs 44/45): 21/21 core cells clear
+    # at_or_above_criterion for p29, and p21's core cells (runs 42/43) do
+    # not fail wholesale -- only p29 is captioned.
+    assert 29 in SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS
+    assert 21 not in SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS

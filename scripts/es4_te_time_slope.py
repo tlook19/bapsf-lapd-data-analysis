@@ -150,6 +150,23 @@ GATE_LOW_PCT_PER_MS = -1.5
 GATE_HIGH_PCT_PER_MS = -0.5
 MIN_FINITE_CYCLES = 3
 
+#: Ports whose core-cell window-family spread fails ``refit_window_band.py``'s
+#: own core-mode gate (``dln_te_window < 0.5``) on every one of its 21 core
+#: cells, on BOTH rotation faces -- measured by running that script's core
+#: pass over set 4 (checked 2026-09-09; not re-run here on every invocation):
+#:   PYTHONPATH=src python scripts/refit_window_band.py --cells core \
+#:       --sets 4 --ports 29 --rotation-deg 0   --output ... --summary ... --metadata ...
+#:   PYTHONPATH=src python scripts/refit_window_band.py --cells core \
+#:       --sets 4 --ports 29 --rotation-deg 180 --output ... --summary ... --metadata ...
+#: 21/21 core cells clear ``at_or_above_criterion`` on both rot0 (run 44) and
+#: rot180 (run 45).  No TRACKED product carries this per-cell gate result for
+#: set 4 -- the committed ``processed/window_refit_band_summary.csv`` carries
+#: sets 1/2 only -- so this is recorded as a documented constant, not read
+#: from a product; a data-driven check should replace it if that ever
+#: changes.  A port in this set is SEMI-QUANTITATIVE by the repo's own
+#: window-spread criterion, and every T_e read for it here is captioned.
+SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS = (29,)
+
 ESTIMATORS = ("x0 default", "x0 family-med", "core default", "core family-med")
 
 FORBIDDEN_OUTPUT_DIR = "processed"
@@ -555,6 +572,13 @@ def main(argv=None) -> int:
         cycle_ms, series, eligibility = run_plateau_series(dataset, run_id, core_idx, ix0)
 
         print(f"=== run {run_id}  p{port} rot {rot}  T_e(t) ===")
+        if port in SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS:
+            print(
+                f"  SEMI-QUANTITATIVE: p{port} fails refit_window_band.py's "
+                "core-cell window-spread gate (dln_te_window < 0.5) on all 21 "
+                "core cells, both rotation faces -- every T_e read below for "
+                "this run is semi-quantitative by that criterion"
+            )
         print(
             f"  eligibility  shots attempted={eligibility['n_shots']}  "
             f"default admitted={eligibility['n_default_admitted']}  "
