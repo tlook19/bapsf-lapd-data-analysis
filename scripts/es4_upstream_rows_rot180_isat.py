@@ -83,8 +83,10 @@ PORT COVERAGE
 -------------
 p29 (runs 44/45) and p41 (runs 46/47) are the ports this instrument is for.
 p21 (runs 42/43) is reported for its EDGE cells only and labelled: the run-43
-state mask removes scan positions 12-34, which is the whole core band, so p21
-has no admitted core cell and its core gates refuse rather than report a number.
+state mask removes 20 of the 21 core positions, leaving one admitted core
+position (x = +10.0 cm, 4 of 84 core cells, ratio ISAT180/isweep0 = 1.017) --
+too few to form the core-band mean or the chord line integral, so the core
+gates refuse rather than report a number.
 p50 (run 48) is rot-0 only -- there is no rot-180 partner and no ISAT upstream
 row to build -- and is not touched.
 
@@ -382,11 +384,50 @@ def chord_line_average_cm3(path: Path, set_id: int, chord_port: int, window_ms=P
 # the row build
 # --------------------------------------------------------------------------
 
-def build_port(port: int, repo: Path, window_ms=PLATEAU_MS) -> dict:
-    """Both upstream density rows at one port, with masks, ratio and spread."""
+def build_port(
+    port: int,
+    repo: Path,
+    window_ms=PLATEAU_MS,
+    *,
+    isweep_path: Path | None = None,
+    isat_path: Path | None = None,
+    area_toml_path: Path | None = None,
+    te_provider=None,
+) -> dict:
+    """Both upstream density rows at one port, with masks, ratio and spread.
+
+    THE SINGLE IMPLEMENTATION of the ES4 two-face row arithmetic.  The overlay
+    exporter's ES4 route calls this function rather than carrying a second copy
+    (``scripts/export_es1_sim1d_overlay.py``), so the promoted rows and this
+    instrument's printed rows are the same numbers by construction.
+
+    The keyword arguments exist for that caller and default to this
+    instrument's own behaviour when omitted:
+
+    ``isweep_path`` / ``isat_path`` / ``area_toml_path``
+        the three inputs, so a caller that selects its products on the command
+        line is not silently answered from ``repo``'s defaults.
+    ``te_provider``
+        ``f(port, t_ms) -> (te_ev, te_row_measured)``, the per-port T_e in eV at
+        the dead-time window midpoints and whether that row is a measurement.
+        Defaults to reading the placed overlay, which is what this instrument
+        does; the exporter passes its own filled-T_e core-band row instead,
+        because an exporter may not read the product it is writing.
+
+    In addition to the reduced plateau rows the returned dict carries the
+    per-cell density grids (``n_isat_cells`` / ``n_isweep_cells``), the
+    admission mask and the dead-time axis, which is what a per-sample consumer
+    needs and what ``plateau_profile`` here collapses.
+    """
     run0, run180 = PORT_RUNS[port]
-    isweep = read_face(repo / ISWEEP_ROT0_HDF5, "4", run0)
-    isat = read_face(repo / ISAT_ROT180_HDF5, "4", run180)
+    isweep_path = repo / ISWEEP_ROT0_HDF5 if isweep_path is None else Path(isweep_path)
+    isat_path = repo / ISAT_ROT180_HDF5 if isat_path is None else Path(isat_path)
+    area_toml_path = repo / AREA_TOML if area_toml_path is None else Path(area_toml_path)
+    if te_provider is None:
+        def te_provider(port_id, times_ms):
+            return read_overlay_te(repo / OVERLAY_NPZ, port_id, times_ms)
+    isweep = read_face(isweep_path, "4", run0)
+    isat = read_face(isat_path, "4", run180)
 
     if not np.array_equal(isweep["x_cm"], isat["x_cm"]):
         raise ValueError(f"port {port}: the two products disagree on the scan axis")
@@ -410,14 +451,14 @@ def build_port(port: int, repo: Path, window_ms=PLATEAU_MS) -> dict:
     probe = PROBE_FROM_DIGIT[int(run180[1])]
     if PROBE_FROM_DIGIT[int(run0[1])] != probe:
         raise ValueError(f"port {port}: the rotation pair is not the same probe")
-    areas = load_areas_cm2(repo / AREA_TOML)[probe]
+    areas = load_areas_cm2(area_toml_path)[probe]
     area_isat_m2 = areas[area_key_for_electrode(ChannelKind.ISAT)] * 1e-4
     area_isweep_m2 = areas[area_key_for_electrode(ChannelKind.I_SWEEP)] * 1e-4
     # The area key the placed product stamps, against the helper's live answer.
     stamped_isat = str(isat["attrs"].get("density_area_key", ""))
     helper_isat = density_area_key_for_deadtime_source(run180, ChannelKind.ISAT)
 
-    te_ev, te_measured = read_overlay_te(repo / OVERLAY_NPZ, port, t_ms)
+    te_ev, te_measured = te_provider(port, t_ms)
     cs = ion_sound_speed_m_s(te_ev, M_I_AMU)
 
     n_isat = electron_density_m3(isat["isat_a"], area_isat_m2, cs[None, :])
@@ -461,6 +502,15 @@ def build_port(port: int, repo: Path, window_ms=PLATEAU_MS) -> dict:
     core = np.abs(x_cm) <= CORE_CM
     admitted_core_cells = admitted[:, window][core]
     return {
+        "n_isat_cells": n_isat,
+        "n_isweep_cells": n_isweep,
+        "admitted": admitted,
+        "t_ms": t_ms,
+        "window": window,
+        "te_ev": te_ev,
+        "isweep_path": str(isweep_path),
+        "isat_path": str(isat_path),
+        "area_toml_path": str(area_toml_path),
         "port": port,
         "run_isweep": run0,
         "run_isat": run180,
@@ -594,7 +644,9 @@ def report_port(record: dict, repo: Path) -> list[dict]:
           f"admitted, {record['core_positions_admitted']} of {record['core_positions_total']} positions")
     if not is_core_port:
         print("  LABEL      p21 is reported for its EDGE cells only: the run-43 state mask "
-              "removes the whole core band, so the core gates refuse.")
+              "removes 20 of the 21 core positions, leaving one")
+        print("             admitted core position (x = +10.0 cm) -- too few to form the "
+              "core-band mean or the chord line integral, so the core gates refuse.")
 
     # A T_e move rescales the whole row; print the sensitivity as a worked factor.
     te_mid = float(np.median(te))
