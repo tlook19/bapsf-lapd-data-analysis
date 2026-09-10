@@ -306,10 +306,11 @@ def regenerate(
     if not from_raw:
         found = sorted(checkpoints.glob("di_set*_port*.npz"))
         if not found:
-            raise SystemExit(
+            print(
                 f"no per-(set, port) checkpoints under {checkpoints}; regenerate "
                 "them, or pass --from-raw to refit from the raw traces"
             )
+            raise SystemExit(2)
         for path in found:
             shutil.copy2(path, work_dir / path.name)
 

@@ -79,13 +79,13 @@ LEG 3 -- PERSISTENCE (``--persistence N``, off unless asked for)
 
     RESULT 2026-09-09, a NULL: at N = 200 the pre-registered gate — fires on
     run 43 ISAT only — FAILED. Run 43 ISAT is flagged (240 → 696, 456 shots
-    held, ln +0.672 / −0.546), but seven other (run, channel) rows also clear
+    held, ln +0.672 / -0.546), but seven other (run, channel) rows also clear
     200 shots: run 03 ISAT (226/245 matched, 941 open-ended), run 04 ISAT (389
     open-ended), run 04 I_SWEEP (400/399/398 open-ended), run 26 ISAT (425),
     run 33 I_SWEEP (252), run 34 ISAT (770 — the largest) and run 34 I_SWEEP
     (605). Persistence alone therefore does not isolate run 43.  Of those
-    seven, only FIVE qualify by a MATCHED pair — runs 03, 26, 33, 34 ISAT and
-    34 I_SWEEP; run 04's two are OPEN-ENDED steps, a different claim.
+    seven, only FIVE qualify by a MATCHED pair — runs 03, 26, 34 ISAT and
+    33, 34 I_SWEEP; run 04's two are OPEN-ENDED steps, a different claim.
 
     RESULT 2026-09-09, the magnitude floor below (0.40 on both halves) and the
     three-position reference below: with the floor and the three-position
@@ -94,11 +94,16 @@ LEG 3 -- PERSISTENCE (``--persistence N``, off unless asked for)
     out — a reference-COVERAGE gap.
 
     RESULT 2026-09-09, the coverage clause below (a reference of at least 20
-    both-eligible shots, the step untestable otherwise): the gate PASSES.  At
-    N = 200, floor 0.40 and reference ≥ 20 the leg fires on run 43 ISAT alone,
-    and so it does at every floor of 0.30/0.40/0.50 and every N of
-    100/200/400.  The clause makes 1160 flagged steps untestable over 48 of
-    the 64 rows, 1086 of them with no both-eligible shot behind them at all.
+    both-eligible shots, the step untestable otherwise): the gate PASSES.  The
+    PASS has a SCOPE: it reads as no other TESTABLE row holds a ≥ 200-shot
+    state of |ln| ≥ 0.40, not that no other row shows one -- 1160 of the 1510
+    flagged steps (77%) are untestable, 1079 of them untestable even with the
+    coverage clause off (the profile ends at positions 0-6 / 44-50 and the
+    thin ISAT rows of runs 44-47).  At N = 200, floor 0.40 and reference ≥ 20
+    the leg fires on run 43 ISAT alone, and so it does at every floor of
+    0.30/0.40/0.50 and every N of 100/200/400.  The clause makes 1160 flagged
+    steps untestable over 48 of the 64 rows, 1086 of them with no
+    both-eligible shot behind them at all.
 
     MAGNITUDE FLOOR (``--persistent-min-ln``, REGISTERED 2026-09-09 at 0.40).
     A PERSISTENT step is distinct from a FLAGGED one, and the difference is
