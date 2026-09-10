@@ -10,9 +10,10 @@ pinned here is the comparison and its verdict, not the fitting.
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from scripts.refit_window_band import write_product
-from scripts.verify_window_band_product import compare_band_products, exit_code
+from scripts.verify_window_band_product import compare_band_products, exit_code, regenerate
 
 RTOL = 1.0e-6
 
@@ -108,6 +109,24 @@ def test_a_flipped_nan_mask_fails_however_small_the_tolerance_would_allow(tmp_pa
     assert result.failure is not None
     assert "dln_te_window" in result.failure
     assert "NaN mask" in result.failure
+
+
+def test_missing_checkpoints_exits_2_not_1(tmp_path):
+    # Reserved exit code 2 is "the placed product, or the checkpoints the
+    # check needs, are missing" -- an empty checkpoints directory is the
+    # latter, and must not fall through to the generic failure code 1.
+    empty_checkpoints = tmp_path / "no_checkpoints_here"
+    empty_checkpoints.mkdir()
+
+    with pytest.raises(SystemExit) as excinfo:
+        regenerate(
+            out_dir=tmp_path / "out",
+            work_dir=tmp_path / "work",
+            from_raw=False,
+            checkpoints=empty_checkpoints,
+        )
+
+    assert excinfo.value.code == 2
 
 
 def _compare_asymmetric(tmp_path, placed_dln, new_dln):
