@@ -81,10 +81,18 @@ admitted cell at ``x = 0`` and its statistic cannot be read where the declared
 one is read.  It is not silently dropped and it is not silently substituted:
 when ``x = 0`` is empty the pair falls back to the cells that survive on BOTH
 rotations -- for run 43 the low-state cells that lie outside the mask, which are
-the two ends of the profile -- and every line it appears on is LABELLED ``edge
-cells, beside the set``, both because that is the reduction actually used and
+the two ends of the profile -- and every line it appears on is LABELLED with the
+reduction and the cut actually used, both because that is what was read and
 because a number read there sits beside the declared statistic rather than among
 it.  A pair with no admitted cell at all is refused outright.
+
+That fallback carries one registered cut, ``EDGE_CUT_CM``: positions at
+|x| >= 23 cm are excluded from it.  Both faces are at the 0.1-1 mA floor out
+there, and at x = -23 and -24 cm both runs of the pair carry an unexplained
+x5-10 feature in ISAT against I_SWEEP, so a ratio taken there is a ratio of two
+floor-level currents with a feature neither face explains.  Left in, those 15
+cells carry the figure on their own.  The cut is on the EDGE-CELL reduction
+alone; the declared ``x = 0`` reduction is untouched by it.
 
 Controls
 --------
@@ -138,12 +146,25 @@ X_TARGET_CM = 0.0
 #: Tolerance on matching ``X_TARGET_CM`` against the product's own ``x_cm``, cm.
 X_MATCH_TOL_CM = 1.0e-6
 
+#: Outermost |x| admitted to the edge-cell reduction, cm (strict: a position at
+#: or beyond this is excluded).  REGISTERED CUT, and it applies to the edge-cell
+#: reduction ONLY -- the declared ``x = 0`` reduction is untouched by it.
+#: Positions at |x| >= 23 cm sit at the 0.1-1 mA floor on BOTH faces, and at
+#: x = -23 and -24 cm both runs of the pair carry an unexplained x5-10 feature in
+#: ISAT against I_SWEEP.  A ratio taken there is a ratio of two floor-level
+#: currents with a feature neither face explains, so those positions are excluded
+#: from the edge-cell figure by registration rather than left to dominate it:
+#: they are 15 of the 75 cells that survive the mask and they carry the figure
+#: from about +0.008 M to about -0.17 M on their own.
+EDGE_CUT_CM = 23.0
+
 #: Label of the declared reduction, and of the fallback used when it is empty.
-#: The fallback's cells are the ones a placed cell mask leaves: for the one pair
-#: that needs it they are the low-state cells at the two ends of the profile, so
-#: the label names them and says the reading sits beside the declared set.
+#: The fallback's cells are the ones a placed cell mask leaves, inside the
+#: registered edge cut: for the one pair that needs it they are the low-state
+#: cells at the two ends of the profile, so the label names them, states the cut
+#: applied, and says the reading sits beside the declared set.
 X0_LABEL = f"x = {X_TARGET_CM:.0f} cm"
-EDGE_CELLS_LABEL = "edge cells, beside the set"
+EDGE_CELLS_LABEL = f"edge cells |x| < {EDGE_CUT_CM:.0f} cm, beside the set"
 
 #: The membership gate: the largest |M| the nine ES1-ES3 pairs reach.  Inclusive,
 #: because it IS an observed pair.  There is deliberately no lower edge; see
@@ -291,12 +312,19 @@ def choose_reduction(ln_rot0, ln_rot180, x_cm) -> Reduction | None:
     """Cells the pair's half-difference is averaged over, or ``None`` if empty.
 
     Prefers the declared reduction -- the single row at ``x = 0`` -- and falls
-    back to every cell finite on BOTH rotations only when that row is empty,
+    back to the cells finite on BOTH rotations only when that row is empty,
     which is what a placed cell mask does to a pair.  The fallback is a
     different reduction and carries a different label so it can never be read as
     the declared one.  Both rotations must be finite in a cell: averaging each
     rotation over its own surviving cells would difference two different
     regions of the profile.
+
+    ``EDGE_CUT_CM`` is applied to the fallback and to the fallback ALONE.  The
+    declared reduction is read at ``x = 0``, which no cut of this kind can
+    reach, so gating it here would be dead code that looked like policy; the
+    edge-cell figure, on the other hand, is an average over whatever the mask
+    leaves, and without the cut it is carried by positions whose two faces are
+    both at the current floor.
     """
     finite_both = np.isfinite(ln_rot0) & np.isfinite(ln_rot180)
     n_candidate = int(finite_both.size)
@@ -309,6 +337,8 @@ def choose_reduction(ln_rot0, ln_rot180, x_cm) -> Reduction | None:
             n_admitted=int(x0_mask.sum()),
             n_candidate=n_candidate,
         )
+    inside_cut = np.abs(np.asarray(x_cm)) < EDGE_CUT_CM
+    finite_both = finite_both & inside_cut[:, None]
     if finite_both.any():
         return Reduction(
             label=EDGE_CELLS_LABEL,
@@ -596,6 +626,10 @@ def main(argv=None) -> int:
           "NO lower edge --")
     print("               a corrected value indistinguishable from zero is a smaller face")
     print("               asymmetry than any of the nine, which puts it inside the range")
+    print(f"edge cut       |x| < {EDGE_CUT_CM:.0f} cm, on the edge-cell reduction ONLY "
+          f"(x = 0 reductions untouched):")
+    print("               beyond it both faces sit at the 0.1-1 mA floor and both runs")
+    print("               carry an unexplained x5-10 ISAT/I_SWEEP feature at x = -23/-24 cm")
     print()
     print("The correction multiplies the SWEPT face's current by F, which is upstream")
     print("at one rotation and downstream at the other, so it does not cancel out of the")
@@ -629,7 +663,7 @@ def main(argv=None) -> int:
                 continue
             print(
                 f"  p{row['port']:<2}  runs {row['run_rot0']}/{row['run_rot180']}  "
-                f"{row['reduction']:<26}  {row['n_admitted']:>3} of "
+                f"{row['reduction']:<38}  {row['n_admitted']:>3} of "
                 f"{row['n_candidate']:<4} cells  half-difference "
                 f"{row['raw_ln']:+.4f} ln = {row['raw_m']:+.4f} M"
             )

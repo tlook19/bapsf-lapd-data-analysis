@@ -24,6 +24,7 @@ from scripts.es4_face_asymmetry_subset import (
     CONTROL_HALF_DIFFERENCES_M,
     CONTROL_TOL_M,
     EDGE_CELLS_LABEL,
+    EDGE_CUT_CM,
     FORBIDDEN_OUTPUT_DIR,
     GATE_HIGH_M,
     X0_LABEL,
@@ -322,6 +323,43 @@ def test_the_edge_reduction_is_exactly_the_cells_outside_the_mask(tmp_path):
     assert reduction.n_candidate == X_CM.size * int(IN_WINDOW.sum())
     assert not reduction.mask[1].any() and not reduction.mask[2].any()
     assert value == pytest.approx(RAW_HALF_DIFFERENCE_LN)
+
+
+def test_the_registered_edge_cut_removes_exactly_the_outer_positions():
+    """``|x| < EDGE_CUT_CM`` on the edge-cell reduction, and nothing else.
+
+    The grid and the surviving positions are run 43's: the extended mask leaves
+    x = -25 ... -14 and +10 ... +12, and the cut must take the three positions
+    at |x| >= 23 cm and leave the other twelve untouched.  It is checked as a
+    set difference rather than by a count, so a cut that removed the wrong
+    positions could not pass by removing the right number of them.
+    """
+    x_cm = np.linspace(-25.0, 25.0, 51)
+    survivors = ((x_cm >= -25) & (x_cm <= -14)) | ((x_cm >= 10) & (x_cm <= 12))
+    ln = np.where(survivors[:, None], 0.5, np.nan) * np.ones((x_cm.size, 5))
+
+    reduction = choose_reduction(ln, ln, x_cm)
+
+    assert reduction.label == EDGE_CELLS_LABEL
+    assert f"{EDGE_CUT_CM:.0f}" in EDGE_CELLS_LABEL
+    admitted = set(x_cm[reduction.mask.any(axis=1)])
+    offered = set(x_cm[survivors])
+    assert offered - admitted == {-25.0, -24.0, -23.0}
+    assert admitted == {x for x in offered if abs(x) < EDGE_CUT_CM}
+    assert reduction.n_admitted == 12 * 5
+    # The cut narrows what is READ, never what was on offer.
+    assert reduction.n_candidate == x_cm.size * 5
+
+
+def test_the_edge_cut_does_not_touch_the_declared_reduction():
+    """A cell at x = 0 is admitted whatever the cut is; only the fallback cuts."""
+    x_cm = np.linspace(-25.0, 25.0, 51)
+    ln = np.full((x_cm.size, 5), 0.5)
+
+    reduction = choose_reduction(ln, ln, x_cm)
+
+    assert reduction.label == X0_LABEL
+    assert set(x_cm[reduction.mask.any(axis=1)]) == {0.0}
 
 
 def test_an_output_inside_the_product_directory_is_refused(tmp_path):
