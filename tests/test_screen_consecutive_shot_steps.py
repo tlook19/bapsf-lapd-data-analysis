@@ -11,13 +11,19 @@ from scripts.screen_consecutive_shot_steps import (
     GATE_CHANNEL,
     GATE_RUN_ID,
     LN_RATIO_FLAG,
+    PERSISTENT_MIN_LN,
+    PRE_STEP_POSITIONS,
     SIGNIFICANCE_FACTOR,
     _persistence_shots,
+    _persistent_min_ln,
+    _pre_step_level,
+    _returns_to_level,
     boundary_leg,
     eligible_samples,
     fixed_position_leg,
     flagged_steps,
     gate_verdict,
+    over_min_ln,
     persistence_leg,
     persistent_rows,
 )
@@ -146,6 +152,7 @@ def test_the_boundary_blocks_are_the_last_and_first_shots():
 # ---------------------------------------------------------------- leg 3
 
 TOTAL_SHOTS = 1000
+SHOTS_PER_POSITION = 20
 STEP_SHOT = 40
 LN_STEP = 0.8
 
@@ -161,6 +168,10 @@ def _step_pair(return_shot):
     return [(STEP_SHOT, LN_STEP), (return_shot, -LN_STEP)]
 
 
+def _leg3(steps, level, eligible):
+    return persistence_leg(steps, level, eligible, SHOTS_PER_POSITION)
+
+
 def _row(run_id, channel, pairs=(), open_ended=()):
     return {"run_id": run_id, "channel": channel,
             "pairs": list(pairs), "open_ended": list(open_ended)}
@@ -169,27 +180,26 @@ def _row(run_id, channel, pairs=(), open_ended=()):
 def test_a_matched_pair_one_shot_short_of_n_is_not_persistent():
     n = 200
     level, eligible = _stepped_series(STEP_SHOT + n - 1)
-    pairs, open_ended = persistence_leg(_step_pair(STEP_SHOT + n - 1),
-                                        level, eligible)
+    pairs, open_ended = _leg3(_step_pair(STEP_SHOT + n - 1), level, eligible)
 
     assert not open_ended
     assert [pair["separation"] for pair in pairs] == [n - 1]
-    assert not persistent_rows([_row("77", "isat", pairs)], n)
+    assert not persistent_rows([_row("77", "isat", pairs)], n, 0.0)
 
 
 def test_a_matched_pair_at_n_is_persistent():
     n = 200
     level, eligible = _stepped_series(STEP_SHOT + n)
-    pairs, _ = persistence_leg(_step_pair(STEP_SHOT + n), level, eligible)
+    pairs, _ = _leg3(_step_pair(STEP_SHOT + n), level, eligible)
 
     assert [pair["separation"] for pair in pairs] == [n]
-    rows = persistent_rows([_row("77", "isat", pairs)], n)
+    rows = persistent_rows([_row("77", "isat", pairs)], n, 0.0)
     assert [(run_id, channel) for run_id, channel, _, _ in rows] == [("77", "isat")]
 
 
 def test_a_step_that_never_comes_back_is_open_ended():
     level, eligible = _stepped_series(TOTAL_SHOTS)
-    pairs, open_ended = persistence_leg([(STEP_SHOT, LN_STEP)], level, eligible)
+    pairs, open_ended = _leg3([(STEP_SHOT, LN_STEP)], level, eligible)
 
     assert not pairs
     assert len(open_ended) == 1
@@ -202,7 +212,7 @@ def test_a_return_to_the_pre_step_level_inside_the_span_breaks_persistence():
     level, eligible = _stepped_series(return_shot)
     # One shot back at the pre-step level: the channel did not stay stepped.
     level[STEP_SHOT + 100] = 0.0
-    pairs, open_ended = persistence_leg(_step_pair(return_shot), level, eligible)
+    pairs, open_ended = _leg3(_step_pair(return_shot), level, eligible)
 
     assert not pairs
     # The broken step consumes nothing, so the step that would have closed it
@@ -215,7 +225,7 @@ def test_a_shot_that_is_not_eligible_cannot_report_a_return():
     level, eligible = _stepped_series(return_shot)
     level[STEP_SHOT + 100] = 0.0
     eligible[STEP_SHOT + 100] = False
-    pairs, _ = persistence_leg(_step_pair(return_shot), level, eligible)
+    pairs, _ = _leg3(_step_pair(return_shot), level, eligible)
 
     assert [pair["separation"] for pair in pairs] == [400]
 
@@ -226,10 +236,123 @@ def test_the_return_half_of_an_excursion_is_not_a_fresh_open_ended_state():
     # to the end of the run.
     return_shot = STEP_SHOT + 40
     level, eligible = _stepped_series(return_shot)
-    pairs, open_ended = persistence_leg(_step_pair(return_shot), level, eligible)
+    pairs, open_ended = _leg3(_step_pair(return_shot), level, eligible)
 
     assert [pair["separation"] for pair in pairs] == [40]
     assert not open_ended
+
+
+# ------------------------------------------- leg 3: the pre-step reference
+
+DIP_POSITION = 4
+LEG3_POSITIONS = 10
+DIP_LEVEL = -0.5
+
+
+def _positioned(levels):
+    """A whole-run level series built from one value per position."""
+    level = np.repeat(np.asarray(levels, dtype=float), SHOTS_PER_POSITION)
+    return level, np.ones(level.size, dtype=bool)
+
+
+def test_a_one_position_dip_cannot_be_the_pre_step_reference():
+    # Run 26's shape: the level dips for a single position and the flagged step
+    # is the RECOVERY from it.  Referenced to the dip -- which is exactly what
+    # the block of shots just before the step reads -- the recovery is a state
+    # the run never comes back from.
+    levels = [0.0] * LEG3_POSITIONS
+    levels[DIP_POSITION] = DIP_LEVEL
+    level, eligible = _positioned(levels)
+    step_shot = (DIP_POSITION + 1) * SHOTS_PER_POSITION
+
+    assert _returns_to_level(level, eligible, DIP_LEVEL, step_shot,
+                             level.size) is None
+    # Three positions, taken by median, read the level the dip interrupted.
+    assert _pre_step_level(level, eligible, step_shot,
+                           SHOTS_PER_POSITION) == 0.0
+    pairs, open_ended = _leg3([(step_shot, -DIP_LEVEL)], level, eligible)
+    assert not pairs and not open_ended
+
+
+def test_the_pre_step_reference_reaches_back_exactly_three_positions():
+    levels = [0.0, 1.0, 2.0, 3.0, 4.0] + [0.0] * (LEG3_POSITIONS - 5)
+    level, eligible = _positioned(levels)
+
+    # Positions 2, 3 and 4 -- median 3.0.  Two positions would read 3.5, four
+    # would read 2.5, and the step's own position 5 is never part of it.
+    assert PRE_STEP_POSITIONS == 3
+    assert _pre_step_level(level, eligible, 5 * SHOTS_PER_POSITION,
+                           SHOTS_PER_POSITION) == 3.0
+
+
+def test_the_pre_step_reference_reads_only_both_eligible_shots():
+    levels = [0.0, 0.0, 2.0, 9.0, 9.0] + [0.0] * (LEG3_POSITIONS - 5)
+    level, eligible = _positioned(levels)
+    eligible[3 * SHOTS_PER_POSITION:5 * SHOTS_PER_POSITION] = False
+
+    assert _pre_step_level(level, eligible, 5 * SHOTS_PER_POSITION,
+                           SHOTS_PER_POSITION) == 2.0
+
+
+def test_a_step_with_no_position_behind_it_is_untestable_not_persistent():
+    level, eligible = _positioned([0.0] * LEG3_POSITIONS)
+
+    assert _pre_step_level(level, eligible, 5, SHOTS_PER_POSITION) is None
+    pairs, open_ended = _leg3([(5, LN_STEP)], level, eligible)
+    assert not pairs and not open_ended
+
+
+# ------------------------------------------------ leg 3: the magnitude floor
+
+
+def test_the_floor_is_carried_by_both_halves_of_a_matched_pair():
+    # Run 34 ISAT's shape: a step that clears the flag threshold and a return
+    # that only just does.  The pair matches; it is not a state.
+    pair = {"separation": 770, "ln_step": -0.301, "ln_return": +0.196}
+    row = _row("34", "isat", [pair])
+
+    assert over_min_ln(pair, 0.19)
+    assert not over_min_ln(pair, 0.20)
+    assert persistent_rows([row], 200, 0.19)
+    assert not persistent_rows([row], 200, 0.20)
+    assert not persistent_rows([row], 200, PERSISTENT_MIN_LN)
+
+
+def test_the_registered_state_clears_the_registered_floor():
+    pair = {"separation": 456, "ln_step": +0.672, "ln_return": -0.546}
+    rows = persistent_rows([_row(GATE_RUN_ID, GATE_CHANNEL, [pair])],
+                           200, PERSISTENT_MIN_LN)
+
+    assert [(run_id, channel) for run_id, channel, _, _ in rows] == [
+        (GATE_RUN_ID, GATE_CHANNEL)
+    ]
+
+
+def test_an_open_ended_step_carries_the_floor_on_its_one_half():
+    step = {"shots_to_end": 400, "ln_step": +0.35}
+    row = _row("44", "isat", (), [step])
+
+    assert persistent_rows([row], 200, 0.30)
+    assert not persistent_rows([row], 200, PERSISTENT_MIN_LN)
+    # N and the floor are independent: a big enough step that is too short is
+    # not a state either.
+    assert not persistent_rows(
+        [_row("44", "isat", (), [{"shots_to_end": 199, "ln_step": +9.0}])],
+        200, PERSISTENT_MIN_LN)
+
+
+def test_a_floor_of_zero_keeps_every_entry_the_leg_reported():
+    # The floor filters what persistence_leg already found; it never re-matches.
+    # At zero the leg's own N test is the whole of the classification.
+    pairs = [{"separation": 200, "ln_step": +0.01, "ln_return": -0.01}]
+    opens = [{"shots_to_end": 200, "ln_step": -0.02}]
+    rows = persistent_rows([_row("44", "isat", pairs, opens)], 200, 0.0)
+
+    assert [(run_id, channel) for run_id, channel, _, _ in rows] == [
+        ("44", "isat")
+    ]
+    assert rows[0][2] == pairs
+    assert rows[0][3] == opens
 
 
 def test_flagged_steps_place_and_sign_both_legs():
@@ -253,29 +376,51 @@ def test_flagged_steps_place_and_sign_both_legs():
     assert isweep == [(1 * n_shots + 2 + 1, -0.4), (2 * n_shots, -0.5)]
 
 
-def test_the_gate_reads_run_43_isat_alone_as_a_pass():
-    hit = _row(GATE_RUN_ID, GATE_CHANNEL, [{"separation": 456}])
-    quiet = _row("44", "isat", [{"separation": 12}])
+_GATE_PAIR = {"separation": 456, "ln_step": +0.672, "ln_return": -0.546}
 
-    assert gate_verdict([hit, quiet], 200) == (
+
+def test_the_gate_reads_run_43_isat_alone_as_a_pass():
+    hit = _row(GATE_RUN_ID, GATE_CHANNEL, [_GATE_PAIR])
+    quiet = _row("44", "isat",
+                 [{"separation": 12, "ln_step": +0.9, "ln_return": -0.9}])
+
+    assert gate_verdict([hit, quiet], 200, PERSISTENT_MIN_LN) == (
         f"GATE PASS: fires on run {GATE_RUN_ID} {GATE_CHANNEL.upper()} "
-        "only (N = 200)"
+        "only (N = 200, floor 0.40)"
     )
 
 
-def test_the_gate_names_every_other_row_that_fires():
-    hit = _row(GATE_RUN_ID, GATE_CHANNEL, [{"separation": 456}])
-    other = _row("34", "isat", [{"separation": 770}],
-                 [{"shots_to_end": 389}])
+def test_the_gate_names_every_other_row_with_its_ln_ratios():
+    hit = _row(GATE_RUN_ID, GATE_CHANNEL, [_GATE_PAIR])
+    other = _row("34", "isat",
+                 [{"separation": 770, "ln_step": -0.801, "ln_return": +0.752}],
+                 [{"shots_to_end": 389, "ln_step": -1.200}])
 
-    assert gate_verdict([hit, other], 200) == (
-        "GATE FAIL: also fires on run 34 ISAT (770/389)"
+    assert gate_verdict([hit, other], 200, PERSISTENT_MIN_LN) == (
+        "GATE FAIL: also fires on run 34 ISAT "
+        "(770 shots, ln -0.801/+0.752; 389 shots to end, ln -1.200)"
     )
 
 
 def test_the_gate_fails_when_run_43_is_absent():
-    assert gate_verdict([_row("34", "isat", [{"separation": 770}])], 200) == (
+    other = _row("34", "isat",
+                 [{"separation": 770, "ln_step": -0.801, "ln_return": +0.752}])
+
+    assert gate_verdict([other], 200, PERSISTENT_MIN_LN) == (
         f"GATE FAIL: run {GATE_RUN_ID} {GATE_CHANNEL.upper()} not flagged"
+    )
+
+
+def test_a_row_the_floor_removes_no_longer_fails_the_gate():
+    hit = _row(GATE_RUN_ID, GATE_CHANNEL, [_GATE_PAIR])
+    marginal = _row("34", "isat",
+                    [{"separation": 770, "ln_step": -0.301,
+                      "ln_return": +0.196}])
+
+    assert gate_verdict([hit, marginal], 200, 0.0).startswith("GATE FAIL")
+    assert gate_verdict([hit, marginal], 200, PERSISTENT_MIN_LN) == (
+        f"GATE PASS: fires on run {GATE_RUN_ID} {GATE_CHANNEL.upper()} "
+        "only (N = 200, floor 0.40)"
     )
 
 
@@ -284,6 +429,14 @@ def test_persistence_needs_a_positive_number_of_shots():
     for bad in ("0", "-1"):
         with pytest.raises(argparse.ArgumentTypeError):
             _persistence_shots(bad)
+
+
+def test_the_floor_is_a_non_negative_ln_magnitude():
+    assert _persistent_min_ln("0.40") == 0.40
+    assert _persistent_min_ln("0") == 0.0
+    for bad in ("-0.1", "nan"):
+        with pytest.raises(argparse.ArgumentTypeError):
+            _persistent_min_ln(bad)
 
 
 def _synthetic_main(monkeypatch, tmp_path, argv_extra):
@@ -336,4 +489,27 @@ def test_the_default_invocation_writes_what_it_wrote_before_persistence(
     assert persistence_files == default_files
     assert persistence_stdout.startswith(default_stdout)
     assert "LEG 3 -- PERSISTENCE" not in default_stdout
-    assert "LEG 3 -- PERSISTENCE (N = 40 shots)" in persistence_stdout
+    assert ("LEG 3 -- PERSISTENCE (N = 40 shots, floor ln 0.40)"
+            in persistence_stdout)
+
+
+def test_the_floor_is_inert_without_persistence_and_reported_with_it(
+        monkeypatch, tmp_path, capsys):
+    default_files = _synthetic_main(monkeypatch, tmp_path,
+                                    ["--persistent-min-ln", "0.9"])
+    capsys.readouterr()
+    persistence_files = _synthetic_main(
+        monkeypatch, tmp_path,
+        ["--persistence", "40", "--persistent-min-ln", "0.9"])
+    persistence_stdout = capsys.readouterr().out
+
+    # The four written files never depend on leg 3, floor or no floor.
+    assert persistence_files == default_files
+    assert ("LEG 3 -- PERSISTENCE (N = 40 shots, floor ln 0.90)"
+            in persistence_stdout)
+    # The synthetic state steps by ln(1.9) = 0.64, so a 0.9 floor removes it
+    # while the registered 0.40 keeps it.
+    assert "GATE FAIL: run 43 ISAT not flagged" in persistence_stdout
+    _synthetic_main(monkeypatch, tmp_path, ["--persistence", "40"])
+    assert "GATE PASS: fires on run 43 ISAT only (N = 40, floor 0.40)" in (
+        capsys.readouterr().out)
