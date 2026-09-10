@@ -18,6 +18,7 @@ import pytest
 from scripts.es4_te_time_slope import (
     DEFAULT_PORT,
     FORBIDDEN_OUTPUT_DIR,
+    SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS,
     SWEEPS_H5,
     WINDOW_MATCHED_MS,
     OVERLAY_NPZ,
@@ -212,10 +213,53 @@ def test_runs_for_port_override_refuses_an_absent_run_id():
 
 
 def test_overlay_prior_te_ev_reads_the_p29_window_matched_row():
-    prior = overlay_prior_te_ev(OVERLAY_NPZ, 29, WINDOW_MATCHED_MS)
+    prior, schema_version = overlay_prior_te_ev(OVERLAY_NPZ, 29, WINDOW_MATCHED_MS)
     # On record: 1.58-1.74 eV for the ES4 overlay's p29 plateau.
     assert 1.5 <= prior <= 1.8
+    assert schema_version == 23
 
 
 def test_overlay_prior_te_ev_nan_for_a_port_the_overlay_does_not_carry():
-    assert math.isnan(overlay_prior_te_ev(OVERLAY_NPZ, 9999, WINDOW_MATCHED_MS))
+    prior, schema_version = overlay_prior_te_ev(OVERLAY_NPZ, 9999, WINDOW_MATCHED_MS)
+    assert math.isnan(prior)
+    assert schema_version == 23
+
+
+def test_overlay_prior_te_ev_refuses_a_missing_file(tmp_path):
+    missing = tmp_path / "es4_sim1d_overlay.npz"
+    with pytest.raises(ValueError, match=str(missing)):
+        overlay_prior_te_ev(missing, 29, WINDOW_MATCHED_MS)
+
+
+def test_overlay_prior_te_ev_refuses_a_file_with_no_te_mean_ev(tmp_path):
+    wrong = tmp_path / "not_the_overlay.npz"
+    np.savez(wrong, port=np.array([29]), te_time_ms=np.array([1.0]))
+    with pytest.raises(ValueError, match="te_mean_ev"):
+        overlay_prior_te_ev(wrong, 29, WINDOW_MATCHED_MS)
+
+
+# scripts/refit_window_band.py's core-cell pass over ALL THREE ES4 ports
+# (both rotation faces): PYTHONPATH=src python scripts/refit_window_band.py
+# --cells core --sets 4 --ports 21,29,41 --rotation-deg {0,180} ...
+# Per-port at_or_above_criterion count out of 21 core cells (documented
+# source: this repo has no tracked product carrying the set-4 per-cell gate
+# result, per SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS's own docstring).
+ES4_CORE_WINDOW_SPREAD_AT_OR_ABOVE_CRITERION_COUNTS = {
+    21: {"rot0": 5, "rot180": 7},
+    29: {"rot0": 21, "rot180": 21},
+    41: {"rot0": 21, "rot180": 21},
+}
+CORE_CELLS_PER_PORT = 21
+
+
+def test_semi_quantitative_window_spread_ports_matches_the_whole_es4_port_set():
+    """Every ES4 port that fails 21/21 on BOTH faces is captioned, no more, no fewer."""
+    expected = {
+        port
+        for port, counts in ES4_CORE_WINDOW_SPREAD_AT_OR_ABOVE_CRITERION_COUNTS.items()
+        if counts["rot0"] == CORE_CELLS_PER_PORT
+        and counts["rot180"] == CORE_CELLS_PER_PORT
+    }
+    assert expected == {29, 41}
+    assert set(SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS) == expected
+    assert 21 not in SEMI_QUANTITATIVE_WINDOW_SPREAD_PORTS

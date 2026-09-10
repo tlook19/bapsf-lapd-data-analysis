@@ -4,9 +4,11 @@ What this measures
 ------------------
 Between voltage ramps the Langmuir sweep supply parks the probe at a fixed
 negative rest bias, and it is that dead-time current -- not the ramp -- that
-every ion-saturation product is built from.  ES4 sweeps a nominal +-20 V ramp
-on a 3 ohm sense resistor while ES3 sweeps +-75 V on 1 ohm, so the two sets
-park at DIFFERENT rest biases.  Ion current on a probe grows with the sheath,
+every ion-saturation product is built from.  ES4 runs 42-48 sweep a nominal
++-20 V ramp on a 3 ohm sense resistor while ES3 sweeps +-75 V on 1 ohm, so
+those two sets park at DIFFERENT rest biases (run 41, ES4's p11 run, sweeps
++-75 V on 1 ohm like its ES3 control run 31, and is not part of the RUN_PAIRS
+this script processes).  Ion current on a probe grows with the sheath,
 so a dead-time current collected at the shallower bias is not on the same scale
 as one collected at the deeper bias, and comparing the two sets cell for cell
 needs a factor

@@ -12,6 +12,7 @@ from compute_mach_velocity import (
     _compute_run,
     _face_rail_mask,
     _face_state_mask,
+    _processed_source_attr,
     _rail_rule,
     _state_rule,
 )
@@ -101,6 +102,32 @@ MASKED_DATASETS = (
     "upstream_current_density_a_m2",
     "downstream_current_density_a_m2",
 )
+
+
+def test_source_file_attr_is_the_repo_relative_processed_basename(tmp_path):
+    """A source opened from OUTSIDE processed/ still stamps processed/<name>.
+
+    A source product regenerated in a throwaway worktree or an artifacts
+    directory opens under some transient absolute path; the stamped attr must
+    name the placed product's own convention, not wherever this invocation
+    happened to read it from.
+    """
+    outside = tmp_path / "some" / "other" / "place" / "isweep_deadtime_profiles.hdf5"
+    outside.parent.mkdir(parents=True)
+    with h5py.File(outside, "w") as f:
+        f.create_dataset("x", data=[1])
+    with h5py.File(outside, "r") as f:
+        assert _processed_source_attr(f) == "processed/isweep_deadtime_profiles.hdf5"
+
+    # Opened by its ordinary repo-relative path, the result is unchanged.
+    import os
+    old_cwd = os.getcwd()
+    try:
+        os.chdir(outside.parent)
+        with h5py.File("isweep_deadtime_profiles.hdf5", "r") as f:
+            assert _processed_source_attr(f) == "processed/isweep_deadtime_profiles.hdf5"
+    finally:
+        os.chdir(old_cwd)
 
 
 def test_no_mask_excludes_nothing_and_is_recorded(tmp_path):

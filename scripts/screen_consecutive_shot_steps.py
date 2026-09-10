@@ -77,7 +77,8 @@ LEG 3 -- PERSISTENCE (``--persistence N``, off unless asked for)
     longest transient excursion on record (run 22's clean 40-shot excursion)
     and under half of run 43's matched step separation (456 shots).
 
-    RESULT 2026-09-09, a NULL: at N = 200 the pre-registered gate — fires on
+    RESULT 2026-09-09 (as of b3fb118), a NULL: at N = 200 the pre-registered
+    gate — fires on
     run 43 ISAT only — FAILED. Run 43 ISAT is flagged (240 → 696, 456 shots
     held, ln +0.672 / -0.546), but seven other (run, channel) rows also clear
     200 shots: run 03 ISAT (226/245 matched, 941 open-ended), run 04 ISAT (389
@@ -86,14 +87,19 @@ LEG 3 -- PERSISTENCE (``--persistence N``, off unless asked for)
     (605). Persistence alone therefore does not isolate run 43.  Of those
     seven, only FIVE qualify by a MATCHED pair — runs 03, 26, 34 ISAT and
     33, 34 I_SWEEP; run 04's two are OPEN-ENDED steps, a different claim.
+    This seven-row list is COMMIT-SCOPED and reproduces only at b3fb118: the
+    reference-widening and coverage-clause commits below landed the same
+    day and moved it -- see the retest below.
 
-    RESULT 2026-09-09, the magnitude floor below (0.40 on both halves) and the
+    RESULT 2026-09-09 (as of b3fb118), the magnitude floor below (0.40 on
+    both halves) and the
     three-position reference below: with the floor and the three-position
     reference every row but run 03 ISAT (an open-ended step at shot 79,
     ln +1.921, whose reference holds one both-eligible shot in sixty) drops
     out — a reference-COVERAGE gap.
 
-    RESULT 2026-09-09, the coverage clause below (a reference of at least 20
+    RESULT 2026-09-09 (as of b3fb118), the coverage clause below (a reference
+    of at least 20
     both-eligible shots, the step untestable otherwise): the gate PASSES.  The
     PASS has a SCOPE: it reads as no other TESTABLE row holds a ≥ 200-shot
     state of |ln| ≥ 0.40, not that no other row shows one -- 1160 of the 1510
@@ -101,9 +107,28 @@ LEG 3 -- PERSISTENCE (``--persistence N``, off unless asked for)
     coverage clause off (the profile ends at positions 0-6 / 44-50 and the
     thin ISAT rows of runs 44-47).  At N = 200, floor 0.40 and reference ≥ 20
     the leg fires on run 43 ISAT alone, and so it does at every floor of
-    0.30/0.40/0.50 and every N of 100/200/400.  The clause makes 1160 flagged
+    0.30/0.40/0.50 and every N of 100/200/400 (superseded at the tip for
+    N = 100 — see the RETEST below).  The clause makes 1160 flagged
     steps untestable over 48 of the 64 rows, 1086 of them with no
     both-eligible shot behind them at all.
+
+    RETEST 2026-09-10 (as of 632bda1, the tip this repro was run against): the
+    RAW N = 200 list (no magnitude floor, no coverage clause --
+    ``--persistent-min-ln 0 --persistent-min-reference-shots 0``) no longer
+    reads as the seven-row list above.  It now surfaces EIGHT (run, channel)
+    rows beside run 43 ISAT: run 03 ISAT, run 06 ISAT, run 24 ISAT, run 25
+    I_SWEEP, run 26 I_SWEEP, run 33 I_SWEEP, run 34 ISAT and run 34 I_SWEEP.
+    FOUR are shared with the b3fb118 list (03 ISAT, 33 I_SWEEP, 34 ISAT, 34
+    I_SWEEP); THREE dropped out (04 ISAT, 04 I_SWEEP, 26 ISAT); FOUR are new
+    (06 ISAT, 24 ISAT, 25 I_SWEEP, 26 I_SWEEP).  At the REGISTERED N = 200,
+    the gate itself is UNCHANGED at this tip: ``GATE PASS: fires on run 43
+    ISAT only`` re-verified at floor 0.30/0.40/0.50, all still N = 200.  NOT
+    re-verified here, and NOT to be assumed from the paragraph above: the
+    sensitivity table's own N = 100 row, at this tip, reads 2 hits (run 43
+    among them) rather than 1 at every floor 0.30-0.50 -- a second row now
+    also clears N = 100 with reference ≥ 20, which the "every N of
+    100/200/400" phrasing above no longer describes.  N = 200 and N = 400
+    still read 1 hit.
 
     MAGNITUDE FLOOR (``--persistent-min-ln``, REGISTERED 2026-09-09 at 0.40).
     A PERSISTENT step is distinct from a FLAGGED one, and the difference is
