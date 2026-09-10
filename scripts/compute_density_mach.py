@@ -36,7 +36,10 @@ rot=0 → Isweep (A_p_L) faces upstream; Isat (A_p_R) faces downstream.
 rot=180 → Isweep (A_p_L) faces downstream; Isat (A_p_R) faces upstream.
 
 Probe A (ports 11/50) has no interferometer; its area is estimated from
-probe B.  Mach numbers are not computed for probe A.
+probe B.  Mach numbers are not computed for probe A EXCEPT on a run in
+``ELECTRICAL_SWAP_RUN_IDS`` (run 31): there the crossed cables put ISAT on
+the upstream face, so the same log-ratio the other probes use applies and
+Mach is computed like any other run.
 
 Constants (edit at top of file)
 --------------------------------
@@ -62,6 +65,8 @@ HDF5 output layout
       n_e_L_m3                     (51, n_cycles) float64
       n_e_L_m3_std                 (51, n_cycles) float64
       mach                         (51, n_cycles) float64  NaN for probe A
+                                                            except run 31
+                                                            (crossed cables)
       mach_std                     (51, n_cycles) float64
       cs_m_s                       (51, n_cycles) float64  from filled T_e
       velocity_km_s                (51, n_cycles) float64
