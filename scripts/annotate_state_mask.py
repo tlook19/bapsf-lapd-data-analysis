@@ -18,8 +18,10 @@ the stretch also covers cells that never railed and whose values are therefore
 wrong-but-plausible.  Both masks are carried, and a consumer honours both.
 
 REGISTERED STATES
-    ``STATE_REGISTRY`` below.  A state is registered per (run, channel) with the
-    inclusive SHOT range it spans and the measured level factor between the two
+    ``STATE_REGISTRY`` below.  A state is registered per (run, channel) as the
+    inclusive SHOT RANGES it spans -- a channel can enter the same state more
+    than once inside one run, so a registration carries a tuple of ranges rather
+    than a single one -- together with the measured level factor between the two
     states.  The factor is recorded for disclosure: nothing here divides it out,
     and no product value is corrected anywhere.  The evidence for a registration
     is a level step in the plateau-window signal that the run's other Langmuir
@@ -34,14 +36,39 @@ REGISTERED STATES
     x = -13...-10 cm against the low-state side at |x| = 10...16 cm), reads
     1.65.
 
+    The same channel enters the high state a SECOND time later in the same run,
+    over shots 760-767 and again from shot 781 to the end of the record.  The
+    step screen fires on all three transitions of that entry: the position
+    boundary 759|760 (ISAT x1.720 against I_SWEEP x1.013, attributed to ISAT),
+    the within-position step 767->768 back down (x0.505) and the within-position
+    step 780->781 back up (x2.060).  Its level factor is NOT the first entry's:
+    the tail-removed plateau blocks either side of the two within-position steps
+    read x1.976 at x = +13 cm (shots 760-767 against 768-779) and x2.074 at
+    x = +14 cm (shots 781-799 against shot 780), against the 1.76 the registry
+    carries, which was measured at the first entry's own steps.  The product's
+    own tell is the one-sided 3-sigma high-shot rejection it is built with: at
+    x = +13 cm that rejection removes 8 of the position's 20 shots in 18 of the
+    20 dead-time windows and 9 in the other two, 162 summed over the 20 windows,
+    against 6 or fewer summed over all 20 windows at every neighbouring
+    position -- it took this entry's 8 high shots for outliers, and left
+    x = +14 ... +25 cm, where every shot of the position is high and none stands
+    out, entirely unrejected.  With those 8 shots out of the ensemble first the
+    same rejection finds 4 over the 20 windows there, at most 2 in any one.
+
 PROJECTION ONTO CELLS
     Cells are the (position, inter-sweep dead-time window) cells the product
     averages, and the product averages the shots of a position together.  A cell
-    is masked when ANY shot of its position lies in the registered range, on all
-    dead-time windows: a position that spans the step carries the two states
-    mixed into one average, which is no more usable than a position wholly
-    inside the range.  For run 43 the range 240-695 covers positions 12-34
-    inclusive, position 34 being the mixed one.
+    is masked when ANY shot of its position lies in ANY of the registered
+    ranges, on all dead-time windows: a position that spans a step carries the
+    two states mixed into one average, which is no more usable than a position
+    wholly inside a range.  For run 43 the three ranges cover positions 12-34
+    and 38-50 inclusive -- 240-695 covers 12-34 with position 34 mixed, 760-767
+    covers position 38 alone, also mixed, and 781-1019 covers 39-50 with
+    position 39 mixed.  The covered positions are NOT contiguous: 35, 36 and 37
+    (x = +10, +11 and +12 cm) lie between the two entries and are not masked, so
+    every place this pass records which shots or positions it covered writes
+    them as a comma-separated list of ranges and never as a first-to-last span,
+    which would claim the gap as well.
 
     Only runs with a registered state carry a ``state_mask``.  A run without one
     is NOT written an all-False mask, for the same reason the rail mask returns
@@ -85,27 +112,43 @@ from bapsf_lapd import LapdDataset  # noqa: E402
 
 STATE_MASK_DATASET = "state_mask"
 
-# (run_id, channel) -> inclusive shot range and the measured level factor of the
-# masked state relative to the rest of the same run.  The factor is DISCLOSED,
-# never applied.
+# (run_id, channel) -> the inclusive shot ranges the state spans and the measured
+# level factor of the masked state relative to the rest of the same run.  A
+# channel can enter the same state more than once in a run, so the ranges are a
+# tuple; the factor is DISCLOSED, never applied.
 STATE_REGISTRY = {
     ("43", "isat"): {
-        "shot_first": 240,
-        "shot_last": 695,
+        "shot_ranges": ((240, 695), (760, 767), (781, 1019)),
         "factor": 1.76,
         "evidence": (
-            "plateau-window signal steps x1.852 at shot 240 (x1.75 once the "
-            "x = -14 -> -13 profile move on that position boundary is removed) "
-            "and x0.568 at shot 696, with I_SWEEP, the reference photodiode and "
-            "the tail noise unchanged and the tail DC offset halving at 240"
+            "first entry, shots 240-695: plateau-window signal steps x1.852 at "
+            "shot 240 (x1.75 once the x = -14 -> -13 profile move on that "
+            "position boundary is removed) and x0.568 at shot 696, with "
+            "I_SWEEP, the reference photodiode and the tail noise unchanged and "
+            "the tail DC offset halving at 240. Second entry, shots 760-767 and "
+            "781-1019: the step screen fires at the 759|760 position boundary "
+            "(ISAT x1.720 against I_SWEEP x1.013, attributed to ISAT) and at "
+            "the within-position steps 767->768 (x0.505) and 780->781 (x2.060); "
+            "the tail-removed plateau blocks either side of those two "
+            "within-position steps read x1.976 at x = +13 cm and x2.074 at "
+            "x = +14 cm, so this entry's level factor is NOT the 1.76 recorded "
+            "for the first. The product's own tell is its one-sided 3-sigma "
+            "high-shot rejection, which at x = +13 cm removes 8 of the 20 shots "
+            "in 18 of the 20 dead-time windows and 9 in the other two, 162 "
+            "summed over the 20 windows, against 6 or fewer summed over all 20 "
+            "at every neighbouring position, and leaves x = +14 ... +25 cm, "
+            "wholly high, unrejected; with those 8 shots out of the ensemble "
+            "the same rejection finds 4 over the 20 windows, at most 2 in any "
+            "one"
         ),
     },
 }
 
 RULE = (
-    "cell excluded when any shot of its position lies in the run's registered "
-    "channel-state shot range; the channel sits at a different level over that "
-    "range, so the cells are not comparable with the rest of the run. Cells are "
+    "cell excluded when any shot of its position lies in one of the run's "
+    "registered channel-state shot ranges; the channel sits at a different "
+    "level over those ranges, so the cells are not comparable with the rest of "
+    "the run. Cells are "
     "the (position, inter-sweep dead-time window) cells this product averages, "
     "and every dead-time window of a covered position is excluded. The recorded "
     "state factor is disclosed, not applied: no value is corrected"
@@ -119,17 +162,42 @@ NOTE = (
 )
 
 
-def state_mask_for_run(n_positions, n_windows, n_shots_per_position,
-                       shot_first, shot_last):
-    """Per-(position, window) mask for one registered shot range.
+def ranges_text(ranges):
+    """Inclusive integer ranges written as ``"a-b,c-d"``.
 
-    A position is covered when any of its shots lies in ``[shot_first,
-    shot_last]`` inclusive; every dead-time window of a covered position is
-    masked.
+    Every recorded shot or position set goes through this rather than through a
+    first-to-last span: a registration's coverage can have gaps, and a span
+    would claim the gaps too.
+    """
+    return ",".join(f"{int(first)}-{int(last)}" for first, last in ranges)
+
+
+def contiguous_ranges(indices):
+    """Integer indices grouped into inclusive ``(first, last)`` runs, sorted."""
+    ranges = []
+    for index in sorted(int(value) for value in indices):
+        if ranges and index == ranges[-1][1] + 1:
+            ranges[-1][1] = index
+        else:
+            ranges.append([index, index])
+    return [(first, last) for first, last in ranges]
+
+
+def state_mask_for_run(n_positions, n_windows, n_shots_per_position,
+                       shot_ranges):
+    """Per-(position, window) mask for a registration's shot ranges.
+
+    A position is covered when any of its shots lies in ANY of the inclusive
+    ranges in ``shot_ranges``; every dead-time window of a covered position is
+    masked.  The ranges of one registration are the separate stretches over
+    which the same channel state was recorded, so their coverage is unioned and
+    the covered positions need not be contiguous.
     """
     starts = np.arange(n_positions) * n_shots_per_position
     stops = starts + n_shots_per_position - 1
-    covered = (stops >= shot_first) & (starts <= shot_last)
+    covered = np.zeros(n_positions, dtype=bool)
+    for shot_first, shot_last in shot_ranges:
+        covered |= (stops >= shot_first) & (starts <= shot_last)
     mask = np.zeros((n_positions, n_windows), dtype=bool)
     mask[covered, :] = True
     return mask, covered
@@ -179,11 +247,12 @@ def main(argv=None):
                 n_positions, n_windows = g["isat_a_raw"].shape
                 n_shots = ds.run(run_id).shots_per_position()
                 mask, covered = state_mask_for_run(
-                    n_positions, n_windows, n_shots,
-                    entry["shot_first"], entry["shot_last"],
+                    n_positions, n_windows, n_shots, entry["shot_ranges"],
                 )
-                positions = np.flatnonzero(covered)
-                shots = f"{entry['shot_first']}-{entry['shot_last']}"
+                positions = ranges_text(
+                    contiguous_ranges(np.flatnonzero(covered))
+                )
+                shots = ranges_text(entry["shot_ranges"])
 
                 if STATE_MASK_DATASET in g:
                     del g[STATE_MASK_DATASET]
@@ -195,15 +264,13 @@ def main(argv=None):
                 g.attrs["state_factor_applied"] = False
                 g.attrs["state_mask_evidence"] = entry["evidence"]
                 g.attrs["state_screened_channel"] = channel
-                g.attrs["state_mask_positions"] = (
-                    f"{int(positions[0])}-{int(positions[-1])}"
-                )
+                g.attrs["state_mask_positions"] = positions
                 g.attrs["state_shots_per_position"] = int(n_shots)
                 g.attrs["state_cells_excluded"] = int(mask.sum())
                 g.attrs["state_cells_total"] = int(mask.size)
 
                 print(f"state-masked run {run_id} ({channel}): shots {shots} -> "
-                      f"positions {int(positions[0])}-{int(positions[-1])}, "
+                      f"positions {positions}, "
                       f"{int(mask.sum())} of {int(mask.size)} cells, "
                       f"disclosed factor {entry['factor']:g}", flush=True)
                 annotated.append(run_id)
@@ -214,8 +281,7 @@ def main(argv=None):
                     "state_mask_shots": shots,
                     "state_factor": float(entry["factor"]),
                     "state_factor_applied": False,
-                    "positions_first": int(positions[0]),
-                    "positions_last": int(positions[-1]),
+                    "state_mask_positions": positions,
                     "shots_per_position": int(n_shots),
                     "cells_excluded": int(mask.sum()),
                     "cells_total": int(mask.size),
