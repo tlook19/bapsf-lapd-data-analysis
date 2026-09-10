@@ -14,7 +14,11 @@ EFFECTIVE_ROTATION_OVERRIDES: dict[str, float] = {
 }
 
 # Dead-time face comparisons indicate the electrical connections were swapped
-# for this specific run, not for every p11 run.
+# for this specific run, not for every p11 run.  The swap is read as the two
+# probe cables being CROSSED AT THE CONNECTOR: on such a run the channel
+# labelled ISAT carries the LEFT electrode and the channel labelled I_SWEEP the
+# RIGHT one.  Both the face a channel looked at and the electrode area it
+# collected on therefore exchange, and they exchange together.
 ELECTRICAL_SWAP_RUN_IDS: frozenset[str] = frozenset({"31"})
 
 
@@ -38,10 +42,13 @@ def effective_deadtime_source(
 ) -> tuple[ChannelKind, bool, bool]:
     """Return the channel/polarity to use for dead-time current products.
 
-    For runs in ``ELECTRICAL_SWAP_RUN_IDS``, the physical upstream face is
-    recorded on ``ISAT`` and the downstream face on ``I_SWEEP``.  Swap both
-    nominal face products so rot-0 upstream (``-I_SWEEP``) sources ``ISAT`` and
-    rot-0 downstream (``ISAT``) sources polarity-inverted ``I_SWEEP``.
+    For runs in ``ELECTRICAL_SWAP_RUN_IDS`` the cables are crossed at the
+    connector, so at rot-0 the physical upstream (left) face is recorded on
+    ``ISAT`` and the downstream (right) face on ``I_SWEEP``.  Swap both nominal
+    face products so rot-0 upstream (``-I_SWEEP``) sources ``ISAT`` and rot-0
+    downstream (``ISAT``) sources polarity-inverted ``I_SWEEP``.  The electrode
+    area that goes with the sourced channel exchanges too --
+    ``density_area_key_for_deadtime_source`` applies that half.
     """
     del port  # reserved for future geometry-specific connection fixes
     if electrical_connections_swapped(run_id) and requested_channel == ChannelKind.I_SWEEP:
@@ -52,7 +59,7 @@ def effective_deadtime_source(
 
 
 def density_area_key_for_deadtime_source(
-    port: int | None,
+    run_id: str | None,
     source_channel: ChannelKind,
 ) -> str:
     """Return the calibration TOML area key of the electrode that collected.
@@ -60,21 +67,38 @@ def density_area_key_for_deadtime_source(
     The face areas are keyed by ELECTRODE, not by which face happened to look
     upstream: ``scripts/calibrate_probe_areas.py`` accumulates ``ap_R_m2`` from
     the rot-180 ISAT product and ``ap_L_m2`` from the rot-0 I_SWEEP product, so
-    ``ap_R_cm2`` is the ISAT electrode's area and ``ap_L_cm2`` the I_SWEEP
-    electrode's.  A density built from a dead-time current reproduces the
-    calibration that defined the areas only under this assignment, and it holds
-    at every port and in both rotations.
+    ``ap_R_cm2`` is the RIGHT electrode's area and ``ap_L_cm2`` the LEFT one's.
+    A density built from a dead-time current reproduces the calibration that
+    defined the areas only under this assignment, and no port and no rotation
+    enters it.
 
-    ``port`` is accepted for call-site symmetry with ``effective_deadtime_source``
-    and does not enter the answer.  The port-11 wiring-swap run, whose upstream
-    row sources ISAT, still gets ``ap_R_cm2`` because ISAT is its collecting
-    channel.
+    Which electrode a channel collected on is fixed by the wiring, not by the
+    channel label.  Under the nominal wiring ISAT sits on the right electrode
+    and I_SWEEP on the left, so ISAT takes ``ap_R_cm2`` and I_SWEEP
+    ``ap_L_cm2``.  On a run in ``ELECTRICAL_SWAP_RUN_IDS`` the two cables are
+    crossed at the connector -- inferred from dead-time face comparisons and
+    read as a connector swap -- so the channel labelled ISAT read the LEFT
+    electrode and the channel labelled I_SWEEP the RIGHT one, and the two area
+    keys exchange with them.
 
-    Raises ``ValueError`` for a channel that has no calibrated face area.
+    ``run_id`` names the run whose channel is being asked about; ``None`` means
+    no run is known and answers under the nominal wiring.  Every
+    product-writing caller passes the run, so that a swapped run is never
+    stamped as if it were unswapped.  The first argument used to be the probe
+    port, so a non-string, non-``None`` ``run_id`` is refused rather than
+    silently answering the nominal rule.
+
+    Raises ``ValueError`` for a channel that has no calibrated face area, and
+    ``TypeError`` for a ``run_id`` that is neither a string nor ``None``.
     """
-    del port  # the collecting electrode, not the port, sets the area
+    if run_id is not None and not isinstance(run_id, str):
+        raise TypeError(
+            "density_area_key_for_deadtime_source takes the run id first, not "
+            f"the port; got {run_id!r}"
+        )
+    swapped = run_id is not None and electrical_connections_swapped(run_id)
     if source_channel == ChannelKind.ISAT:
-        return "ap_R_cm2"
+        return "ap_L_cm2" if swapped else "ap_R_cm2"
     if source_channel == ChannelKind.I_SWEEP:
-        return "ap_L_cm2"
+        return "ap_R_cm2" if swapped else "ap_L_cm2"
     raise ValueError(f"no calibrated face area for channel {source_channel!r}")

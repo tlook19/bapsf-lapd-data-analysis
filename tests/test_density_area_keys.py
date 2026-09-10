@@ -4,20 +4,25 @@
 ``processed/probe_area_calibration.toml`` is the area of the electrode whose
 current a dead-time product carries.  The areas were produced per electrode --
 ``scripts/calibrate_probe_areas.py`` accumulates ``ap_R_m2`` from the rot-180
-ISAT product and ``ap_L_m2`` from the rot-0 I_SWEEP product -- so the answer is
-``ap_R_cm2`` for an ISAT source and ``ap_L_cm2`` for an I_SWEEP source, with no
-port and no rotation entering it.
+ISAT product and ``ap_L_m2`` from the rot-0 I_SWEEP product -- so ``ap_R_cm2``
+is the right electrode's area and ``ap_L_cm2`` the left one's, with no port and
+no rotation entering it.
 
-Two levels are checked.  The first is closed-form and reads nothing: every
-(port, source) pair the manifest can produce, plus the port-11 wiring-swap run
-whose ISAT-sourced upstream row keeps ``ap_R_cm2`` because ISAT is the channel
-that collected it.  The second reads the placed Mach product, which stamps the
-face-to-area assignment per run independently of this helper, and requires the
-two to agree run by run: the ISAT electrode is the UPSTREAM face at rot-180 and
-the DOWNSTREAM face at rot-0, so the helper's ISAT answer must equal
-``upstream_area_key`` on every rot-180 run and ``downstream_area_key`` on every
-rot-0 run, and the I_SWEEP answer the other way round.  That second level skips
-when the product is not in the checkout, and refuses to pass vacuously.
+Which electrode a channel sat on is fixed by the WIRING.  Under the nominal
+wiring ISAT is the right electrode and I_SWEEP the left.  On a run in
+``ELECTRICAL_SWAP_RUN_IDS`` the two cables were crossed at the connector -- the
+channel labelled ISAT read the LEFT electrode and the channel labelled I_SWEEP
+the RIGHT one -- so the two answers exchange on that run and on no other.
+
+Two levels are checked.  The first is closed-form and reads nothing: every run
+in the manifest through the source-channel resolver the products actually call,
+and the crossed-cable run explicitly, both of its rows.  The second reads the
+placed Mach product, which stamps the face-to-area assignment per run
+independently of this helper, and requires the two to agree run by run.  Under
+the nominal wiring the ISAT electrode is the UPSTREAM face at rot-180 and the
+DOWNSTREAM face at rot-0; a crossed-cable run inverts that, because its ISAT
+channel sits on the other electrode.  That second level skips when the product
+is not in the checkout, and refuses to pass vacuously.
 """
 
 from pathlib import Path
@@ -27,6 +32,7 @@ import pytest
 
 from bapsf_lapd import (
     ChannelKind,
+    ELECTRICAL_SWAP_RUN_IDS,
     LapdDataset,
     density_area_key_for_deadtime_source,
     effective_deadtime_source,
@@ -36,54 +42,76 @@ from bapsf_lapd import (
 MANIFEST = "config/may2026_run_manifest.toml"
 MACH_PRODUCT = Path("processed/mach_velocity.hdf5")
 
-# The electrode each analysis channel collects on, and therefore its area key.
+# The electrode each analysis channel collects on under the nominal wiring, and
+# therefore its area key.
 ELECTRODE_AREA_KEY = {
     ChannelKind.ISAT: "ap_R_cm2",
     ChannelKind.I_SWEEP: "ap_L_cm2",
 }
 
+# The same map on a run whose cables were crossed at the connector.
+CROSSED_ELECTRODE_AREA_KEY = {
+    ChannelKind.ISAT: "ap_L_cm2",
+    ChannelKind.I_SWEEP: "ap_R_cm2",
+}
 
-def test_every_manifest_port_and_source_takes_the_electrode_key():
-    """No port moves the answer: only which channel collected the current."""
+
+def expected_area_key(run_id: str | None, channel: ChannelKind) -> str:
+    """The area key ``channel`` must take on ``run_id``, stated independently."""
+    if run_id is not None and run_id in ELECTRICAL_SWAP_RUN_IDS:
+        return CROSSED_ELECTRODE_AREA_KEY[channel]
+    return ELECTRODE_AREA_KEY[channel]
+
+
+def test_every_manifest_run_and_source_takes_its_electrode_key():
+    """No port moves the answer: only which channel collected, and the wiring."""
     dataset = LapdDataset.from_manifest(MANIFEST)
 
     ports = sorted({int(dataset.config(r).probe.port or 0) for r in dataset.run_ids()})
     assert ports == [11, 21, 29, 41, 50]
 
-    for port in ports:
-        for source, expected in ELECTRODE_AREA_KEY.items():
-            assert density_area_key_for_deadtime_source(port, source) == expected
+    # With no run named, the nominal wiring is the answer.
+    for source, expected in ELECTRODE_AREA_KEY.items():
+        assert density_area_key_for_deadtime_source(None, source) == expected
 
     # Every run in the manifest, through the source-channel resolver that the
-    # products actually call, including the two rotation-override runs.
+    # products actually call, including the two rotation-override runs and the
+    # crossed-cable run.
+    swapped_seen = 0
     for run_id in dataset.run_ids():
         config = dataset.config(run_id)
         port = config.probe.port
         for requested in (ChannelKind.ISAT, ChannelKind.I_SWEEP):
             source, _, _ = effective_deadtime_source(run_id, port, requested, False)
             assert (
-                density_area_key_for_deadtime_source(port, source)
-                == ELECTRODE_AREA_KEY[source]
+                density_area_key_for_deadtime_source(run_id, source)
+                == expected_area_key(run_id, source)
             )
+        if run_id in ELECTRICAL_SWAP_RUN_IDS:
+            swapped_seen += 1
+    assert swapped_seen == len(ELECTRICAL_SWAP_RUN_IDS)
 
 
-def test_the_port_11_wiring_swap_run_keeps_the_isat_electrode_area():
-    """Run 31's upstream row sources ISAT, so it keeps ``ap_R_cm2``.
+def test_the_crossed_cable_run_takes_the_other_electrode_on_each_channel():
+    """Run 31's ISAT channel read the LEFT electrode, so its rows exchange areas.
 
-    This is the case the helper used to special-case by port.  It is now a
-    consequence of the electrode rule rather than an exception to it, and the
-    answer is unchanged.
+    Its upstream row sources ISAT and therefore takes ``ap_L_cm2``, and its
+    downstream row sources I_SWEEP and takes ``ap_R_cm2`` -- the reverse of a
+    nominally wired run, and the only run in the set for which that is true.
     """
     source, invert, overridden = effective_deadtime_source(
         "31", 11, ChannelKind.I_SWEEP, True
     )
     assert (source, invert, overridden) == (ChannelKind.ISAT, False, True)
-    assert density_area_key_for_deadtime_source(11, source) == "ap_R_cm2"
+    assert density_area_key_for_deadtime_source("31", source) == "ap_L_cm2"
 
-    # Its downstream row sources I_SWEEP and takes the I_SWEEP electrode's area.
     source, _, _ = effective_deadtime_source("31", 11, ChannelKind.ISAT, False)
     assert source == ChannelKind.I_SWEEP
-    assert density_area_key_for_deadtime_source(11, source) == "ap_L_cm2"
+    assert density_area_key_for_deadtime_source("31", source) == "ap_R_cm2"
+
+    # A nominally wired run at the same port answers the other way round.
+    assert density_area_key_for_deadtime_source("41", ChannelKind.ISAT) == "ap_R_cm2"
+    assert density_area_key_for_deadtime_source("41", ChannelKind.I_SWEEP) == "ap_L_cm2"
 
 
 def test_a_channel_with_no_calibrated_face_area_is_refused():
@@ -93,7 +121,14 @@ def test_a_channel_with_no_calibrated_face_area_is_refused():
         ChannelKind.MOVING_PHOTODIODE,
     ):
         with pytest.raises(ValueError, match="no calibrated face area"):
-            density_area_key_for_deadtime_source(21, channel)
+            density_area_key_for_deadtime_source("33", channel)
+
+
+def test_a_port_left_in_the_run_id_slot_is_refused():
+    """The first argument used to be the port; an int there must not answer."""
+    for port in (11, 21, 29, 41, 50):
+        with pytest.raises(TypeError, match="takes the run id first"):
+            density_area_key_for_deadtime_source(port, ChannelKind.ISAT)
 
 
 def test_helper_agrees_with_the_mach_products_stamped_face_areas(capsys):
@@ -121,22 +156,27 @@ def test_helper_agrees_with_the_mach_products_stamped_face_areas(capsys):
     assert rows, f"{MACH_PRODUCT} carries no run with stamped face area keys"
 
     print(
-        f"\n{'set':>3} {'run':>3} {'port':>4} {'rot':>5}  "
+        f"\n{'set':>3} {'run':>3} {'port':>4} {'rot':>5} {'wiring':>8}  "
         f"{'upstream':>9} {'downstream':>11}  {'helper(ISAT)':>12} "
         f"{'helper(ISWEEP)':>14}  verdict"
     )
     for set_id, run_id, port, rot, upstream, downstream in rows:
-        helper_isat = density_area_key_for_deadtime_source(port, ChannelKind.ISAT)
-        helper_isweep = density_area_key_for_deadtime_source(port, ChannelKind.I_SWEEP)
+        helper_isat = density_area_key_for_deadtime_source(run_id, ChannelKind.ISAT)
+        helper_isweep = density_area_key_for_deadtime_source(run_id, ChannelKind.I_SWEEP)
 
-        # The ISAT electrode is upstream at rot-180 and downstream at rot-0.
-        if rot == 180.0:
+        # The ISAT electrode is upstream at rot-180 and downstream at rot-0 --
+        # unless the cables were crossed at the connector, which puts the ISAT
+        # channel on the other electrode and inverts both answers.
+        crossed = run_id in ELECTRICAL_SWAP_RUN_IDS
+        isat_is_upstream = (rot == 180.0) != crossed
+        if isat_is_upstream:
             expect_isat, expect_isweep = upstream, downstream
         else:
             expect_isat, expect_isweep = downstream, upstream
         ok = helper_isat == expect_isat and helper_isweep == expect_isweep
         print(
-            f"{set_id:>3} {run_id:>3} {port:>4} {rot:>5.0f}  "
+            f"{set_id:>3} {run_id:>3} {port:>4} {rot:>5.0f} "
+            f"{'crossed' if crossed else 'nominal':>8}  "
             f"{upstream:>9} {downstream:>11}  {helper_isat:>12} "
             f"{helper_isweep:>14}  {'MATCH' if ok else 'MISMATCH'}"
         )
@@ -150,3 +190,7 @@ def test_helper_agrees_with_the_mach_products_stamped_face_areas(capsys):
     print(captured.out)
     assert captured.out.count("MATCH") == len(rows)
     assert "MISMATCH" not in captured.out
+    # The gate is only meaningful if the crossed-cable run is inside it.
+    assert captured.out.count("crossed") == sum(
+        1 for row in rows if row[1] in ELECTRICAL_SWAP_RUN_IDS
+    )

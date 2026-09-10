@@ -81,7 +81,10 @@ def test_effective_deadtime_source_uses_isat_for_known_wiring_swap():
     assert source == ChannelKind.ISAT
     assert invert is False
     assert overridden is True
-    assert density_area_key_for_deadtime_source(11, source) == "ap_R_cm2"
+    # Crossed cables: run 31's ISAT channel sat on the LEFT electrode, so its
+    # upstream row takes the left electrode's area.
+    assert density_area_key_for_deadtime_source("31", source) == "ap_L_cm2"
+    assert density_area_key_for_deadtime_source("31", ChannelKind.I_SWEEP) == "ap_R_cm2"
 
     source, invert, overridden = effective_deadtime_source("01", 11, ChannelKind.I_SWEEP, True)
     assert electrical_connections_swapped("01") is False
@@ -93,7 +96,7 @@ def test_effective_deadtime_source_uses_isat_for_known_wiring_swap():
     assert source == ChannelKind.I_SWEEP
     assert invert is True
     assert overridden is False
-    assert density_area_key_for_deadtime_source(21, source) == "ap_L_cm2"
+    assert density_area_key_for_deadtime_source("33", source) == "ap_L_cm2"
 
 
 def test_manifest_loads_current_attenuation_rules():

@@ -224,6 +224,11 @@ def area_key_for_electrode(source_channel: ChannelKind) -> str:
     accumulates ``ap_R_m2`` from the rot-180 ISAT product and ``ap_L_m2`` from
     the rot-0 I_SWEEP product.  A density built from either product reproduces
     that calibration only under this assignment.
+
+    This is the NOMINAL wiring, which is the only wiring ES4 carries: the one
+    run whose cables were crossed at the connector is an ES3 port-11 run and
+    never reaches this instrument.  ``density_area_key_for_deadtime_source``
+    is the swap-aware answer and is what the stamp comparison below reads.
     """
     if source_channel == ChannelKind.ISAT:
         return "ap_R_cm2"
@@ -410,7 +415,7 @@ def build_port(port: int, repo: Path, window_ms=PLATEAU_MS) -> dict:
     area_isweep_m2 = areas[area_key_for_electrode(ChannelKind.I_SWEEP)] * 1e-4
     # The area key the placed product stamps, against the helper's live answer.
     stamped_isat = str(isat["attrs"].get("density_area_key", ""))
-    helper_isat = density_area_key_for_deadtime_source(port, ChannelKind.ISAT)
+    helper_isat = density_area_key_for_deadtime_source(run180, ChannelKind.ISAT)
 
     te_ev, te_measured = read_overlay_te(repo / OVERLAY_NPZ, port, t_ms)
     cs = ion_sound_speed_m_s(te_ev, M_I_AMU)

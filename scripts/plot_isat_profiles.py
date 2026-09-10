@@ -692,7 +692,7 @@ def build_hdf5(
                 g_run.attrs["deadtime_source_invert_polarity"] = bool(source_invert)
                 g_run.attrs["deadtime_source_overridden"] = bool(source_overridden)
                 g_run.attrs["density_area_key"] = density_area_key_for_deadtime_source(
-                    cfg.probe.port,
+                    run_id,
                     source_kind,
                 )
                 g_run.attrs["calibration_core_mean_raw_a"] = core_mean
