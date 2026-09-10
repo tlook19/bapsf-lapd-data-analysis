@@ -4,8 +4,11 @@ For each run the script reads the dead-time (inter-sweep) periods of the
 Isat and Isweep channels, combines them with the filled T_e map from
 te_filled.hdf5, and derives:
 
-  n_e_R  — electron density from the Isat face (A_p_R, right/downstream)
-  n_e_L  — electron density from the -Isweep face (A_p_L, left/upstream)
+  n_e_R  — electron density from the Isat CHANNEL (A_p_R under the nominal
+           wiring; the per-run n_e_R_density_area_key attr names the area
+           actually applied, which exchanges on a crossed-cable run)
+  n_e_L  — electron density from the -Isweep CHANNEL (A_p_L under the nominal
+           wiring; see n_e_L_density_area_key)
   mach   — Mach number M = ln(I_u / I_d) / K, area-normalised
   velocity_km_s — parallel flow speed M * C_s in km/s
   plasma_fwhm_cm — FWHM of the n_e_R radial profile at each cycle time
@@ -50,7 +53,9 @@ HDF5 output layout
 /experiment_sets/
   {set_id}/                        attrs: label, v_bank_v, v_puff_v
     {run_id}/                      attrs: run_id, rotation_deg, port, z_cm,
-                                          probe_id, ap_L_cm2, ap_R_cm2, ap_estimated
+                                          probe_id, ap_L_cm2, ap_R_cm2, ap_estimated,
+                                          n_e_R_density_area_key,
+                                          n_e_L_density_area_key
       inter_sweep_time_s           (n_cycles,) float64  dead-time midpoints
       n_e_R_m3                     (51, n_cycles) float64
       n_e_R_m3_std                 (51, n_cycles) float64  shot-to-shot std
@@ -429,6 +434,18 @@ def main() -> None:
                 g_run.attrs["probe_id"] = pid
                 g_run.attrs["ap_L_cm2"] = calib["ap_L_cm2"]
                 g_run.attrs["ap_R_cm2"] = calib["ap_R_cm2"]
+                # n_e_R_m3 and n_e_L_m3 are named for the CHANNEL that produced
+                # them -- R for ISAT, L for the negated I_SWEEP -- not for the
+                # electrode that channel reached, and on a crossed-cable run
+                # the two exchange.  Name the electrode each channel actually
+                # collected on, so a consumer can see which calibrated area
+                # divided which density without re-deriving the wiring rule.
+                g_run.attrs["n_e_R_density_area_key"] = (
+                    density_area_key_for_deadtime_source(run_id, ChannelKind.ISAT)
+                )
+                g_run.attrs["n_e_L_density_area_key"] = (
+                    density_area_key_for_deadtime_source(run_id, ChannelKind.I_SWEEP)
+                )
                 g_run.attrs["electrical_swap_applied"] = bool(electrical_connections_swapped(run_id))
                 g_run.attrs["ap_estimated"] = calib["estimated"]
                 g_run.attrs["probe_a_area_factor_applied"] = (
