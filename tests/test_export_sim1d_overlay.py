@@ -349,6 +349,66 @@ def test_the_weighted_scatter_sem_reduces_to_the_core_band_convention():
     assert sem == pytest.approx(values.std(ddof=1) / np.sqrt(values.size))
 
 
+def test_a_negative_weight_is_carried_and_the_mean_may_leave_its_own_range():
+    """The signed density weight is not a convex combination, and is not clipped.
+
+    ``ftavg`` is the ratio of two quadrature sums, ``sum w n T / sum w n``.
+    On the comparand chain ``n`` is the measured density WITH ITS SIGN, so a
+    cell on noise about zero enters with a negative weight and the ratio stops
+    being an average between its own nodes.  It is reported as computed: a
+    clip back into ``[min, max]`` is the retired sign test under another name.
+    """
+    values = np.array([1.0, 2.0, 3.0])
+    weights = np.array([1.0, -0.4, 0.2])
+
+    mean, _ = _weighted_mean_and_sem(values, weights)
+
+    assert mean == pytest.approx(
+        float(weights @ values) / float(weights.sum()), rel=1e-12
+    )
+    assert mean > values.max()  # outside the range of its own nodes
+
+
+def test_a_negative_weighted_variance_is_refused_rather_than_floored():
+    """A negative scatter variance is undefined, and must not read as zero.
+
+    Zero would claim the retained cells agree exactly, which is the opposite
+    of what a negative variance says, so the SEM comes back NaN while the
+    mean -- which is still the ratio that was wanted -- stays finite.
+    """
+    values = np.array([0.0, 1.0, 10.0])
+    weights = np.array([1.0, -0.55, 0.2])
+
+    normalized = weights / weights.sum()
+    mean = float(normalized @ values)
+    variance = float(normalized @ (values - mean) ** 2) / (
+        1.0 - float(normalized @ normalized)
+    )
+    assert variance < 0.0  # the premise of this test, measured not assumed
+
+    reported_mean, sem = _weighted_mean_and_sem(values, weights)
+
+    assert reported_mean == pytest.approx(mean, rel=1e-12)
+    assert np.isnan(sem)
+
+
+def test_non_negative_weights_can_never_reach_either_behaviour():
+    """The signed-weight handling is inert for every unsigned caller.
+
+    The Isat families, the clipped legacy rows and the unweighted ``plain``
+    average all pass non-negative weights, for which the mean is a convex
+    combination and ``s^2 >= 0`` identically.  Measured over a spread of
+    random non-negative weightings rather than asserted.
+    """
+    rng = np.random.default_rng(20260922)
+    for _ in range(2000):
+        values = rng.normal(size=6) * 5.0
+        weights = rng.random(6)
+        mean, sem = _weighted_mean_and_sem(values, weights)
+        assert values.min() - 1e-12 <= mean <= values.max() + 1e-12
+        assert np.isfinite(sem) and sem >= 0.0
+
+
 def test_the_te_average_carries_the_semi_quantitative_weight_it_integrates():
     te = np.full(X_CM.size, 3.0)
     marks = np.abs(X_CM) > 12.0
@@ -760,9 +820,10 @@ def _convention_pair(mean, ftavg):
 
 
 def test_a_zero_core_band_mean_under_a_finite_flux_tube_average_is_refused():
-    # The density grid holds strictly positive cells or NaN, so a zero
-    # core-band mean means the grid has begun carrying zero-filled cells --
-    # and the flux-tube row's error is transferred from that mean.
+    # The density grid holds SIGNED measurements or NaN, and a mean of
+    # measured cells does not land on exactly zero, so a zero core-band mean
+    # means the grid has begun carrying zero-filled cells -- and the
+    # flux-tube row's error is transferred from that mean.
     args = _convention_pair([4.0, 0.0, 6.0], [3.0, 5.0, 5.5])
 
     with pytest.raises(ValueError, match="finite flux-tube average") as excinfo:
@@ -781,6 +842,17 @@ def test_a_non_finite_core_band_mean_under_a_finite_flux_tube_average_is_refused
         _check_density_convention_pair(*args)
 
     assert "t = 1.5 ms" in str(excinfo.value)
+
+
+def test_a_negative_core_band_mean_is_a_measurement_and_is_not_refused():
+    """A decayed column reads negative in the core band, and that is data.
+
+    The density product carries the sign of the measured current, so a port
+    whose column has gone into the noise averages to a negative core-band
+    mean.  The guard judges EXACT ZERO and non-finite, which are input
+    defects; a negative mean is a measurement and must pass.
+    """
+    _check_density_convention_pair(*_convention_pair([4.0, -0.3, 6.0], [3.0, 5.0, 5.5]))
 
 
 def test_an_unusable_core_band_mean_passes_when_the_flux_tube_side_is_nan():
@@ -1744,6 +1816,161 @@ def test_the_flux_tube_te_rows_rebuilt_from_the_placed_profile_products():
             checked_sets += 1
 
     assert checked_sets >= 1
+
+
+def test_the_density_product_keeps_the_cells_the_sign_test_used_to_delete():
+    """The density grid is SIGNED, and says which cells the sign test took.
+
+    A cell whose measured current is negative is noise about zero, not a
+    failure, so it is stored with its sign; NaN is reserved for a cell with no
+    usable measurement.  ``n_e_sign_masked`` is the traceability companion --
+    exactly the finite non-positive cells, the set the retired sign test would
+    have written as NaN -- and nothing masks anything by it.
+    """
+    if not DENSITY_PROFILES_HDF5.exists():
+        pytest.skip("the placed density profile product is not on disk")
+
+    checked = 0
+    with h5py.File(DENSITY_PROFILES_HDF5, "r") as density_hdf:
+        assert "SIGNED" in str(density_hdf.attrs["n_e_sign_convention"])
+        for set_id in sorted(density_hdf["experiment_sets"]):
+            group = density_hdf[f"experiment_sets/{set_id}"]
+            density = group["n_e_m3"][()]
+            sign_masked = group["n_e_sign_masked"][()].astype(bool)
+
+            assert sign_masked.shape == density.shape
+            assert np.array_equal(
+                sign_masked, np.isfinite(density) & (density <= 0.0)
+            )
+            # The cells the sign test used to delete are present and finite.
+            assert np.all(np.isfinite(density[sign_masked]))
+            checked += 1
+
+    assert checked >= 1
+    # At least one set must actually carry them, or this asserts nothing.
+    assert sign_masked.any()
+
+
+def _comparand_nodes(density_profile, te_profile, x_cm, radius_cm=FLUX_TUBE_RADIUS_CM):
+    """``_quadrature_nodes`` on THE COMPARAND CHAIN: no subtraction, no clip.
+
+    This is the signed path -- what every density and T_e row of record is
+    reduced on -- so ``values`` here can be negative and the weights ``w n``
+    can change sign.  Returns ``None`` where no row is formed.
+    """
+    density, _ = _despike_profile(density_profile)
+    te, _ = _despike_profile(te_profile)
+    finite = np.isfinite(density) & np.isfinite(te)
+    if np.count_nonzero(finite) < 5:
+        return None
+    values = density[finite]
+    total = float(np.sum(values))
+    if total <= 0.0:
+        return None
+    centroid = float(np.sum(values * x_cm[finite]) / total)
+    folded = np.abs(x_cm[finite] - centroid)
+    limit = _column_edge_cm(folded) if radius_cm is None else float(radius_cm)
+    try:
+        weights = _flux_tube_weights(folded, limit)
+    except ValueError:
+        return None
+    return weights, values, te[finite]
+
+
+def test_the_signed_weight_breaks_the_convex_combination_and_the_break_is_measured():
+    """What the comparand T_e rows ARE, and what they have stopped being.
+
+    With the density sign test retired the weight ``w_i n_i`` can be negative,
+    so ``te_ftavg_ev`` is no longer bounded by the T_e values at its own
+    nodes.  Nothing here asserts a bound, because the bound is not a property
+    of these rows any more.  What IS asserted, at every port and every sample
+    of the real products:
+
+    * the row is still exactly the ratio of its two quadrature sums, and the
+      gap to the plain row is still exactly the weighted covariance;
+    * every sample that leaves ``[min T, max T]`` has at least one
+      negative-weight node -- the excursion is the signed weight and nothing
+      else, never a defect of the quadrature;
+    * under the FLUX-TUBE convention no sample inside the 10-19 ms plateau
+      window leaves its bound, which is the window every scored row is taken
+      over.  The whole-column convention is not asserted to that: it
+      integrates to the scan edge, where the noise cells are, and it does
+      leave the bound at early samples.
+    """
+    if not (TE_FILLED_HDF5.exists() and DENSITY_PROFILES_HDF5.exists()):
+        pytest.skip("the placed T_e / density profile products are not on disk")
+
+    excursions = 0
+    plateau_excursions = 0
+    negative_weight_samples = 0
+    checked_sets = 0
+    with h5py.File(TE_FILLED_HDF5, "r") as te_hdf, h5py.File(
+        DENSITY_PROFILES_HDF5, "r"
+    ) as density_hdf:
+        x_cm = density_hdf["x_cm"][()]
+        shared = sorted(
+            set(te_hdf["experiment_sets"]) & set(density_hdf["experiment_sets"])
+        )
+        for set_id in shared:
+            te_group = te_hdf[f"experiment_sets/{set_id}"]
+            density_group = density_hdf[f"experiment_sets/{set_id}"]
+            if not np.allclose(te_group["x_cm"][()], x_cm):
+                pytest.skip(f"ES{set_id} radial grids differ between products")
+            te_profiles = te_group["te_filled"][()]
+            te_time_ms = te_group["cycle_time_ms"][()]
+            weight = _interp_onto_time_grid(
+                density_group["n_e_m3"][()],
+                density_group["inter_sweep_time_s"][()] * 1000.0,
+                te_time_ms,
+            )
+            rows = _flux_tube_te_series(
+                te_profiles, weight, x_cm, subtract_background=False
+            )
+
+            n_z, _, n_t = te_profiles.shape
+            for zi in range(n_z):
+                for ti in range(n_t):
+                    nodes = _comparand_nodes(
+                        weight[zi, :, ti], te_profiles[zi, :, ti], x_cm
+                    )
+                    stats = {
+                        "ftavg": rows["ftavg"][zi, ti],
+                        "plain": rows["plain"][zi, ti],
+                    }
+                    if nodes is None:
+                        assert np.isnan(stats["ftavg"])
+                        assert np.isnan(stats["plain"])
+                        continue
+                    _assert_is_the_two_quadrature_sums(stats, nodes)
+                    _assert_the_gap_is_the_weighted_covariance(stats, nodes)
+
+                    weights, density, te_values = nodes
+                    weighted = weights * density
+                    if np.any(weighted < 0.0):
+                        negative_weight_samples += 1
+                    if not np.isfinite(stats["ftavg"]):
+                        continue
+                    carrying = weights > 0.0
+                    low = float(np.min(te_values[carrying]))
+                    high = float(np.max(te_values[carrying]))
+                    if low <= stats["ftavg"] <= high:
+                        continue
+                    excursions += 1
+                    assert np.any(weighted < 0.0), (
+                        f"ES{set_id} port index {zi} sample {ti}: the weighted "
+                        "T_e left [min, max] of its own nodes with every "
+                        "quadrature weight non-negative, which cannot happen"
+                    )
+                    in_plateau = 10.0 <= float(te_time_ms[ti]) <= 19.0
+                    plateau_excursions += int(in_plateau)
+            checked_sets += 1
+
+    assert checked_sets >= 1
+    # The premise: the signed weight really is present in these products.
+    assert negative_weight_samples > 0
+    assert excursions > 0
+    # The scored window is clean of it under the flux-tube convention.
+    assert plateau_excursions == 0
 
 
 def test_the_exported_geomean_is_the_two_faces_area_normalized_geometric_mean():

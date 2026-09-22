@@ -232,7 +232,11 @@ def electron_density_m3(
     Inverts: I_sat = exp(-1/2) * A_p * e * n_e * C_s
     => n_e = I_sat / (exp(-1/2) * A_p * e * C_s)
 
-    isat_a: ion saturation current in A (positive); NaN/negative → NaN density.
+    isat_a: ion saturation current in A, SIGNED.  The density carries the sign
+        of the current: a negative current gives a negative density, which is
+        what a cell sitting on noise about zero measures.  Nothing here masks
+        a sign, and a caller that deletes the negative cells of a scan biases
+        every average over that scan upward.  NaN propagates.
     probe_area_m2: probe collection area in m^2.
     cs_m_s: ion sound speed in m/s; must be broadcastable with isat_a.
     """
