@@ -36,6 +36,7 @@ from scripts.export_es1_sim1d_overlay import (
     PORTS,
     RAW_PLATEAU_WINDOW_MS,
     ROT180_ISAT_PROFILE_HDF5,
+    SCHEMA_VERSION,
     _es4_upstream_definitions,
     _es4_upstream_rows,
 )
@@ -118,16 +119,14 @@ def _row(fields, key):
 # ---------------------------------------------------------------- schema ---
 
 def test_the_exported_schema_is_odd_and_the_augmenter_accepts_it():
-    """Odd is an exporter version, even is an augmented one; both must hold."""
-    from scripts.export_es1_sim1d_overlay import export_overlay  # noqa: F401
-    import inspect
+    """Odd is an exporter version, even is an augmented one; both must hold.
 
-    source = inspect.getsource(
-        __import__("scripts.export_es1_sim1d_overlay", fromlist=["x"])
-    )
-    schema = int(
-        source.split("schema_version=np.array(")[1].split(",")[0]
-    )
+    Read off the exporter's own ``SCHEMA_VERSION`` constant.  This used to
+    scrape the literal out of the module source, which broke the moment the
+    literal became the constant it should always have been.
+    """
+    schema = SCHEMA_VERSION
+
     assert schema % 2 == 1, "an exporter schema is odd; even means augmented"
     assert schema in AUGMENTED_SCHEMA, (
         f"the augmenter does not accept schema v{schema}, so an export at this "
