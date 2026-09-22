@@ -68,11 +68,11 @@ the ensemble sd nearly tenfold; the common level clears it.  No existing field
 changes, and the family is ABSENT unless the flag is passed, so a product that
 lacks these names was exported without it rather than with it and zeroed.
 
-Two radial-averaging conventions
---------------------------------
-The overlay carries the measured radial average in BOTH conventions, because
-the comparison convention is otherwise implicit and is the same order as the
-residuals it is used to judge:
+Three radial-averaging conventions
+----------------------------------
+The overlay carries the measured radial average in ALL THREE conventions,
+because the comparison convention is otherwise implicit and is the same order
+as the residuals it is used to judge:
 
 ``density_mean_cm3`` (and its SEM fields) is the LEGACY convention: an
 unweighted arithmetic mean of the 51-point line scan over the core band
@@ -89,10 +89,34 @@ from a diameter line scan requires assuming the column is axisymmetric about
 its own centroid, which is an ASSUMPTION and not a measurement -- see
 ``ftavg_axisymmetry`` in the exported product.
 
-The two conventions are exported side by side and are NOT interchangeable; a
-consumer must state which one a number came from.
+``density_column_cm3`` and ``te_column_ev`` are the WHOLE-COLUMN convention:
+the same quadrature taken from the density centroid out to the COLUMN EDGE --
+which is the SCAN LIMIT in the folded frame, not a measured column boundary --
+and then, for the density row, divided by ``pi * ftavg_radius_cm^2`` rather
+than by the area it was integrated over.  It is therefore the column's
+INVENTORY PER UNIT LENGTH expressed as the density the transport model's tube
+would carry if all of that plasma were inside it.  Plasma measured outside the
+cathode flux tube got there by cross-field transport the 1D model does not
+represent, so a model tube that carries the column's whole inventory is the
+comparison this convention makes; ``column_over_ftavg_ratio`` is the share of
+the column that sits outside the tube, per port and per sample.
 
-T_e is the one row where the two conventions differ by more than a weighting.
+NO BACKGROUND IS SUBTRACTED FROM ANY COMPARAND IN THIS PRODUCT.  The Isat
+baseline is already taken from the end of the shot, where there is no plasma,
+so a line scan carries no second background to remove and the edge-median
+subtraction this chain used to apply was removing the cross-field plasma the
+column convention counts.  ``density_ftavg_cm3``, the density weight behind
+``te_ftavg_ev`` and the ES4 upstream bracket moved at schema v33; the three
+``isat_ftavg_*`` families at v35.  Every area-averaged row is therefore on one
+convention and they are commensurate with each other.  The retired values
+survive under five ``*_subtracted_*`` names, for continuity reads only -- see
+``ftavg_background`` and ``subtracted_legacy_definition``.
+
+The three conventions are exported side by side and are NOT interchangeable; a
+consumer must state which one a number came from.  ``ftavg_comparand_map``
+names the field that carries each scored row in each of them.
+
+T_e is the one row where the conventions differ by more than a weighting.
 ``te_ftavg_ev`` is the DENSITY-WEIGHTED flux-tube mean, which is what a 1D
 cell carries (its ``E_e / (3/2 n)``); ``te_ftavg_plain_ev`` is the unweighted
 area mean of the same profile and is printed beside it, not scored.  Both
@@ -100,8 +124,18 @@ integrate over a disc the measurement does not always fill: the filled T_e
 product reports the MEASUREMENT only out to a per-port trust radius and the
 scrape-off-layer prior beyond it, so every T_e flux-tube sample carries
 ``ftavg_coverage_cm`` and ``ftavg_prior_beyond_coverage`` saying how far the
-measurement actually reached.  See ``te_ftavg_definition``,
-``te_ftavg_sem_definition`` and ``ftavg_coverage_definition``.
+measurement actually reached.  ``te_column_ev`` is the same density-weighted
+mean over the column extent, with ``te_column_plain_ev`` beside it and
+``column_coverage_cm`` / ``column_prior_beyond_coverage`` as its own coverage
+record -- and that flag is True at EVERY port of every set, because no port's
+T_e is trusted all the way to the column edge.  HOW MUCH of each column T_e is
+the prior rather than a measurement is ``te_column_prior_weight``: 21-27 % at
+the eight ES1/ES2 aperture ports and 57-76 % at every p50 row and across sets
+3 and 4, so twelve of the twenty port-rows are substantially a statement about
+the prior.  See ``te_ftavg_definition``,
+``te_ftavg_sem_definition``, ``ftavg_coverage_definition``,
+``column_definition``, ``column_edge_definition``, ``column_sem_definition``
+and ``column_coverage_definition``.
 
 Which probe face the Isat flux-tube average comes from
 ------------------------------------------------------
@@ -176,7 +210,7 @@ from es4_upstream_rows_rot180_isat import (
 #: the CURRENT schema by importing it: a literal pinned in one test is a pin
 #: on whatever vintage happened to be on disk the day it was written, and
 #: goes stale silently the next time the product is placed.
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 35
 
 MANIFEST = Path("config/may2026_run_manifest.toml")
 DENSITY_HDF5 = Path("processed/density_profiles_isweep.hdf5")
@@ -450,6 +484,15 @@ def _subtract_background(profile: np.ndarray) -> np.ndarray:
     A side whose outer points are all non-finite contributes no median and is
     skipped rather than poisoning the minimum; the profile is only rejected
     outright when neither side yields one.
+
+    RETIRED FROM THE COMPARAND CHAIN (see ``ftavg_background`` in the exported
+    product).  The probe's own zeroing already removes the instrumental
+    baseline -- it is taken from the end of the shot, where there is no plasma
+    -- so there is no second background left in a line scan to remove, and
+    what this function takes off the outer cells is plasma.  It survives for
+    the explicitly named legacy rows ``density_ftavg_subtracted_cm3`` and
+    ``density_column_subtracted_cm3``, and for the Isat flux-tube families,
+    which this member did not re-cut.
     """
     values = np.asarray(profile, dtype=np.float64)
     if np.count_nonzero(np.isfinite(values)) < 5:
@@ -508,52 +551,110 @@ def _flux_tube_weights(radius_cm: np.ndarray, radius_limit_cm: float) -> np.ndar
     return weights
 
 
+def _column_edge_cm(folded_radius_cm: np.ndarray) -> float:
+    """Return the COLUMN EDGE of one folded profile, in cm.
+
+    The whole-column conventions integrate from the density centroid out to
+    this radius: the outermost folded radius the scan still carries a retained
+    cell at.  A retained cell is one that survived its product's own QC -- the
+    density chain writes a non-positive or unusable cell as NaN and those are
+    dropped before this is taken -- so this is the outermost radius with a
+    QC-surviving measured value.
+
+    It is also where the effective-width ledger reads its own background:
+    ``_subtract_background`` takes its baseline from the outermost
+    ``BACKGROUND_EDGE_POINTS`` of this same scan, so a profile has reached the
+    ledger's background by construction at the edge, and the integral closes on
+    the scan rather than on an assumed column radius.  The two candidate edge
+    definitions -- the outermost QC-surviving cell and the radius at which the
+    profile reaches the background ledger -- are therefore the same radius in
+    this chain, and this is it.
+    """
+    return float(np.max(folded_radius_cm))
+
+
 def _flux_tube_profile_stats(
     profile: np.ndarray,
     x_cm: np.ndarray,
     *,
     point_sem: np.ndarray | None = None,
-    radius_cm: float = FLUX_TUBE_RADIUS_CM,
+    radius_cm: float | None = FLUX_TUBE_RADIUS_CM,
+    normalize_radius_cm: float | None = None,
+    subtract_background: bool = True,
 ) -> dict[str, float | int]:
     """Return the flux-tube average of one radial profile and its companions.
 
-    The pipeline is, in order: repair single-cell spikes; subtract the
-    effective-width ledger's scalar background; take the core-band mean of that
-    same background-subtracted profile (the numerator of the convention ratio,
-    reported so the ratio is reconstructible from the product alone); clip the
-    profile at zero and drop non-finite cells; fold about the profile centroid,
-    treating ``r = |x - x_c|`` as radius; and integrate to ``radius_cm``.
+    The pipeline is, in order: repair single-cell spikes; OPTIONALLY subtract
+    the effective-width ledger's scalar background; take the core-band mean of
+    whichever profile that leaves (the numerator of the convention ratio,
+    reported so the ratio is reconstructible from the product alone); drop
+    non-finite cells; fold about the profile centroid, treating
+    ``r = |x - x_c|`` as radius; and integrate to ``radius_cm``.
+
+    ``subtract_background=False`` is THE COMPARAND CHAIN and is what every
+    density row of record uses.  The probe's own zeroing already removes the
+    instrumental baseline, from the end of the shot where there is no plasma,
+    so a line scan carries no second background to remove and what the
+    subtraction took off the outer cells was plasma.  With it off, the
+    centroid, the quadrature nodes and the core companion are all taken from
+    the UNSUBTRACTED profile, and the clip at zero -- which existed because
+    subtracting a baseline can drive outer cells negative -- is not applied
+    either: the density product writes a non-positive cell as ``NaN`` before
+    it is stored, so there is nothing for it to clip.  ``True`` keeps the
+    historical behaviour for the explicitly named legacy rows and for the Isat
+    families this member did not re-cut.
+
+    ``radius_cm`` is the quadrature's outer limit.  ``None`` integrates to the
+    profile's own COLUMN EDGE instead (``_column_edge_cm``), which is what the
+    whole-column convention does; the limit actually used comes back as
+    ``edge``.  ``normalize_radius_cm`` is the radius the area average is
+    expressed over: ``None`` (the default) divides by the area integrated over,
+    which is the flux-tube convention, and passing ``ftavg_radius_cm`` with
+    ``radius_cm=None`` divides the column's whole inventory per unit length by
+    the tube's area instead.  The returned ``ftavg`` and its two uncertainties
+    carry that normalization; nothing else in the dict does.
 
     ``point_sem`` is an optional per-point uncertainty on the SAME samples; it
     is propagated through the quadrature weights in quadrature, treating the
     points as independent.  The background's own sampling uncertainty is not
-    propagated -- it is a small, fully correlated term.
+    propagated -- it is a small, fully correlated term.  ``scatter_sem`` is the
+    other, always-available uncertainty: the scatter of the retained radial
+    cells about their own weighted average (``_weighted_mean_and_sem``), the
+    weighted generalization of the core-band radial SEM.
     """
     despiked, n_despiked = _despike_profile(profile)
-    subtracted = _subtract_background(despiked)
+    prepared = _subtract_background(despiked) if subtract_background else despiked
     core_band = (x_cm >= X_MIN_CM) & (x_cm <= X_MAX_CM)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
-        core_mean = float(np.nanmean(subtracted[core_band]))
+        core_mean = float(np.nanmean(prepared[core_band]))
 
     empty = dict(
         ftavg=np.nan,
         ftavg_sem=np.nan,
+        scatter_sem=np.nan,
         core=core_mean,
         centroid=np.nan,
+        edge=np.nan,
         n_despiked=n_despiked,
     )
-    finite = np.isfinite(subtracted)
+    finite = np.isfinite(prepared)
     if np.count_nonzero(finite) < 5:
         return empty
-    values = np.clip(subtracted[finite], 0.0, None)
+    values = (
+        np.clip(prepared[finite], 0.0, None)
+        if subtract_background
+        else prepared[finite]
+    )
     positions = x_cm[finite]
     total = float(np.sum(values))
     if total <= 0.0:
         return empty
     centroid = float(np.sum(values * positions) / total)
+    folded = np.abs(positions - centroid)
+    limit = _column_edge_cm(folded) if radius_cm is None else float(radius_cm)
     try:
-        weights = _flux_tube_weights(np.abs(positions - centroid), radius_cm)
+        weights = _flux_tube_weights(folded, limit)
     except ValueError:
         empty["centroid"] = centroid
         return empty
@@ -564,11 +665,21 @@ def _flux_tube_profile_stats(
         sem_values = np.asarray(point_sem, dtype=np.float64)[finite]
         if np.all(np.isfinite(sem_values)):
             ftavg_sem = float(np.sqrt(np.sum((weights * sem_values) ** 2)))
+    _, scatter_sem = _weighted_mean_and_sem(values, weights)
+    if normalize_radius_cm is not None:
+        # The quadrature already divided by the area it integrated over; put
+        # the integral back over the requested area instead.
+        scale = (limit / float(normalize_radius_cm)) ** 2
+        ftavg *= scale
+        ftavg_sem *= scale
+        scatter_sem *= scale
     return dict(
         ftavg=ftavg,
         ftavg_sem=ftavg_sem,
+        scatter_sem=scatter_sem,
         core=core_mean,
         centroid=centroid,
+        edge=limit,
         n_despiked=n_despiked,
     )
 
@@ -577,24 +688,38 @@ def _flux_tube_series(
     profiles: np.ndarray,
     x_cm: np.ndarray,
     point_sem: np.ndarray | None = None,
+    *,
+    radius_cm: float | None = FLUX_TUBE_RADIUS_CM,
+    normalize_radius_cm: float | None = None,
+    subtract_background: bool = True,
 ) -> dict[str, np.ndarray]:
     """Apply ``_flux_tube_profile_stats`` to every (z, time) profile.
 
     ``profiles`` is shaped ``(z, x, time)``; every returned array is shaped
     ``(z, time)``.  Each time sample is reduced independently, so the exported
-    series is self-contained sample by sample.
+    series is self-contained sample by sample -- and so is its integration
+    extent, which is why ``edge`` comes back per port and per sample.
+    ``radius_cm``, ``normalize_radius_cm`` and ``subtract_background`` are
+    passed through unchanged; see ``_flux_tube_profile_stats``.
     """
+    names = ("ftavg", "ftavg_sem", "scatter_sem", "core", "centroid", "edge")
     n_z, _, n_t = profiles.shape
     out = {
-        name: np.full((n_z, n_t), np.nan, dtype=np.float64)
-        for name in ("ftavg", "ftavg_sem", "core", "centroid")
+        name: np.full((n_z, n_t), np.nan, dtype=np.float64) for name in names
     }
     out["n_despiked"] = np.zeros((n_z, n_t), dtype=np.int16)
     for zi in range(n_z):
         for ti in range(n_t):
             sem = None if point_sem is None else point_sem[zi, :, ti]
-            stats = _flux_tube_profile_stats(profiles[zi, :, ti], x_cm, point_sem=sem)
-            for name in ("ftavg", "ftavg_sem", "core", "centroid"):
+            stats = _flux_tube_profile_stats(
+                profiles[zi, :, ti],
+                x_cm,
+                point_sem=sem,
+                radius_cm=radius_cm,
+                normalize_radius_cm=normalize_radius_cm,
+                subtract_background=subtract_background,
+            )
+            for name in names:
                 out[name][zi, ti] = stats[name]
             out["n_despiked"][zi, ti] = stats["n_despiked"]
     return out
@@ -643,14 +768,19 @@ def _flux_tube_te_stats(
     x_cm: np.ndarray,
     *,
     semi_quantitative: np.ndarray | None = None,
-    radius_cm: float = FLUX_TUBE_RADIUS_CM,
+    radius_cm: float | None = FLUX_TUBE_RADIUS_CM,
+    normalize_radius_cm: float | None = None,
+    subtract_background: bool = True,
+    trust_radius_cm: float | None = None,
+    blend_radius_cm: float | None = None,
 ) -> dict[str, float | int]:
     """Return the flux-tube T_e of one radial profile pair, both weightings.
 
     The DENSITY side runs the identical pipeline as
-    ``_flux_tube_profile_stats`` -- despike, subtract the effective-width
-    ledger's scalar background, clip at zero, drop non-finite cells, fold about
-    the profile centroid, integrate to ``radius_cm`` -- so the returned
+    ``_flux_tube_profile_stats`` -- despike, optionally subtract the
+    effective-width ledger's scalar background and clip at zero, drop
+    non-finite cells, fold about the profile centroid, integrate to
+    ``radius_cm`` -- so the returned
     ``weight_density`` is the same number that function returns as ``ftavg``,
     and the quadrature nodes and weights are the same ones.  That holds WHERE
     T_e IS FINITE WHEREVER THE DENSITY IS, since a non-finite T_e cell would
@@ -676,9 +806,37 @@ def _flux_tube_te_stats(
     count of marked cells carrying quadrature weight and the total weight they
     carry are returned so a consumer can see how much of the average is at the
     swept diagnostic's limit.
+
+    ``radius_cm=None`` integrates to the pair's own COLUMN EDGE instead of to
+    the flux-tube radius, and the limit used comes back as ``edge``; both
+    averages are RATIOS over one node set, so neither moves with the
+    normalization and ``normalize_radius_cm`` reaches ``weight_density``
+    alone -- see ``_flux_tube_profile_stats`` for what it means there.
+
+    ``trust_radius_cm`` and ``blend_radius_cm`` are that port's filled-T_e
+    trust model.  Given either, the returned ``prior_weight`` /
+    ``pure_prior_weight`` are the SHARE of the density-weighted quadrature
+    weight (``sum w n``) carried by cells at ``|x|`` beyond that radius, and
+    ``plain_prior_weight`` / ``plain_pure_prior_weight`` the same share of the
+    unweighted ``sum w``.  Beyond the trust radius the filled product mixes
+    the measurement into the scrape-off-layer prior; beyond the blend radius
+    it reports the prior alone.  These say how much of an average is the prior
+    rather than a measurement of that port -- a number, not an adjective.  The
+    mask is in SCAN ``|x|``, the frame the trust model is stated in, NOT in
+    the quadrature's centroid-folded radius.  ``NaN`` where the radius is not
+    given.
+
+    ``subtract_background=False`` is the comparand chain, and it reaches the
+    T_e rows through the WEIGHT: both averages are taken over the unsubtracted
+    density's node set, weights and centroid.  The plain row is not weighted
+    by the density but still sits on that node set, so it moves a little too.
     """
     despiked_density, _ = _despike_profile(density_profile)
-    subtracted = _subtract_background(despiked_density)
+    prepared_density = (
+        _subtract_background(despiked_density)
+        if subtract_background
+        else despiked_density
+    )
     despiked_te, n_despiked = _despike_profile(te_profile)
 
     empty = dict(
@@ -688,23 +846,34 @@ def _flux_tube_te_stats(
         plain_sem=np.nan,
         weight_density=np.nan,
         centroid=np.nan,
+        edge=np.nan,
         n_despiked=n_despiked,
         node_count=0,
         semi_quant_count=0,
         semi_quant_weight=np.nan,
+        prior_weight=np.nan,
+        pure_prior_weight=np.nan,
+        plain_prior_weight=np.nan,
+        plain_pure_prior_weight=np.nan,
     )
-    finite = np.isfinite(subtracted) & np.isfinite(despiked_te)
+    finite = np.isfinite(prepared_density) & np.isfinite(despiked_te)
     if np.count_nonzero(finite) < 5:
         return empty
-    values = np.clip(subtracted[finite], 0.0, None)
+    values = (
+        np.clip(prepared_density[finite], 0.0, None)
+        if subtract_background
+        else prepared_density[finite]
+    )
     te_values = despiked_te[finite]
     positions = x_cm[finite]
     total = float(np.sum(values))
     if total <= 0.0:
         return empty
     centroid = float(np.sum(values * positions) / total)
+    folded = np.abs(positions - centroid)
+    limit = _column_edge_cm(folded) if radius_cm is None else float(radius_cm)
     try:
-        weights = _flux_tube_weights(np.abs(positions - centroid), radius_cm)
+        weights = _flux_tube_weights(folded, limit)
     except ValueError:
         empty["centroid"] = centroid
         return empty
@@ -718,17 +887,45 @@ def _flux_tube_te_stats(
         marked = np.asarray(semi_quantitative, dtype=bool)[finite] & carrying
         semi_quant_count = int(np.count_nonzero(marked))
         semi_quant_weight = float(np.sum(weights[marked]))
+    weight_density = float(weights @ values)
+
+    def _beyond_share(radius: float | None) -> tuple[float, float]:
+        """The (density-weighted, unweighted) weight share past ``radius``."""
+        if radius is None:
+            return float("nan"), float("nan")
+        beyond = np.abs(positions) > float(radius)
+        weighted = weights * values
+        weighted_total = float(np.sum(weighted))
+        plain_total = float(np.sum(weights))
+        return (
+            float(np.sum(weighted[beyond]) / weighted_total)
+            if weighted_total > 0.0
+            else float("nan"),
+            float(np.sum(weights[beyond]) / plain_total)
+            if plain_total > 0.0
+            else float("nan"),
+        )
+
+    prior_weight, plain_prior_weight = _beyond_share(trust_radius_cm)
+    pure_prior_weight, plain_pure_prior_weight = _beyond_share(blend_radius_cm)
+    if normalize_radius_cm is not None:
+        weight_density *= (limit / float(normalize_radius_cm)) ** 2
     return dict(
         ftavg=ftavg,
         ftavg_sem=ftavg_sem,
         plain=plain,
         plain_sem=plain_sem,
-        weight_density=float(weights @ values),
+        weight_density=weight_density,
         centroid=centroid,
+        edge=limit,
         n_despiked=n_despiked,
         node_count=int(np.count_nonzero(carrying)),
         semi_quant_count=semi_quant_count,
         semi_quant_weight=semi_quant_weight,
+        prior_weight=prior_weight,
+        pure_prior_weight=pure_prior_weight,
+        plain_prior_weight=plain_prior_weight,
+        plain_pure_prior_weight=plain_pure_prior_weight,
     )
 
 
@@ -737,11 +934,21 @@ def _flux_tube_te_series(
     density_profiles: np.ndarray,
     x_cm: np.ndarray,
     semi_quantitative: np.ndarray | None = None,
+    *,
+    radius_cm: float | None = FLUX_TUBE_RADIUS_CM,
+    normalize_radius_cm: float | None = None,
+    subtract_background: bool = True,
+    trust_radius_cm: np.ndarray | None = None,
+    blend_radius_cm: np.ndarray | None = None,
 ) -> dict[str, np.ndarray]:
     """Apply ``_flux_tube_te_stats`` to every (z, time) profile pair.
 
     Both grids are shaped ``(z, x, time)`` on the SAME time base; every
-    returned array is shaped ``(z, time)``.
+    returned array is shaped ``(z, time)``.  ``radius_cm`` and
+    ``normalize_radius_cm`` are passed through unchanged; see
+    ``_flux_tube_te_stats``.  ``trust_radius_cm`` and ``blend_radius_cm`` are
+    PER-PORT, shaped ``(z,)``: the trust model is a per-port statement, so
+    each row's prior-weight share is taken against its own radii.
     """
     if te_profiles.shape != density_profiles.shape:
         raise ValueError(
@@ -749,18 +956,23 @@ def _flux_tube_te_series(
             f"{density_profiles.shape} must be reduced over the same "
             "(z, x, time) grid"
         )
+    names = (
+        "ftavg",
+        "ftavg_sem",
+        "plain",
+        "plain_sem",
+        "weight_density",
+        "centroid",
+        "edge",
+        "semi_quant_weight",
+        "prior_weight",
+        "pure_prior_weight",
+        "plain_prior_weight",
+        "plain_pure_prior_weight",
+    )
     n_z, _, n_t = te_profiles.shape
     out = {
-        name: np.full((n_z, n_t), np.nan, dtype=np.float64)
-        for name in (
-            "ftavg",
-            "ftavg_sem",
-            "plain",
-            "plain_sem",
-            "weight_density",
-            "centroid",
-            "semi_quant_weight",
-        )
+        name: np.full((n_z, n_t), np.nan, dtype=np.float64) for name in names
     }
     out["n_despiked"] = np.zeros((n_z, n_t), dtype=np.int16)
     out["node_count"] = np.zeros((n_z, n_t), dtype=np.int16)
@@ -775,16 +987,17 @@ def _flux_tube_te_series(
                 density_profiles[zi, :, ti],
                 x_cm,
                 semi_quantitative=marks,
+                radius_cm=radius_cm,
+                normalize_radius_cm=normalize_radius_cm,
+                subtract_background=subtract_background,
+                trust_radius_cm=(
+                    None if trust_radius_cm is None else float(trust_radius_cm[zi])
+                ),
+                blend_radius_cm=(
+                    None if blend_radius_cm is None else float(blend_radius_cm[zi])
+                ),
             )
-            for name in (
-                "ftavg",
-                "ftavg_sem",
-                "plain",
-                "plain_sem",
-                "weight_density",
-                "centroid",
-                "semi_quant_weight",
-            ):
+            for name in names:
                 out[name][zi, ti] = stats[name]
             out["n_despiked"][zi, ti] = stats["n_despiked"]
             out["node_count"][zi, ti] = stats["node_count"]
@@ -883,7 +1096,10 @@ def _es4_upstream_definitions() -> dict[str, np.ndarray]:
             "the LEGACY convention of density_mean_cm3) and "
             "es4_upstream_density_ftavg_cm3[r] (the FLUX-TUBE convention of "
             "density_ftavg_cm3, same radius, same despike, same "
-            "centroid-folding), both in cm^-3 on es4_upstream_time_ms, which "
+            "centroid-folding and, since schema v33, the same NO-background-"
+            "subtraction ruling -- see ftavg_background; both rows of the "
+            "bracket moved together, so the face spread is unaffected by the "
+            "ruling), both in cm^-3 on es4_upstream_time_ms, which "
             "is density_time_ms.  es4_upstream_density_core_count[r] counts "
             "the core cells behind each sample.  NO SEM is exported for these "
             "rows: the pre-existing density_total_sem_cm3 is the rot-0 "
@@ -1138,7 +1354,14 @@ def _es4_upstream_rows(
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
                 core_mean_m3 = np.nanmean(masked[core, :], axis=0)
-            ftavg = _flux_tube_series(masked[None, :, :], x_cm)["ftavg"][0]
+            # The comparand convention: NO background subtraction, the same as
+            # density_ftavg_cm3, which this family brackets and which the p21
+            # row below is a rescale of.  A bracket whose two rows were reduced
+            # under different conventions would report the convention change as
+            # a face spread.
+            ftavg = _flux_tube_series(
+                masked[None, :, :], x_cm, subtract_background=False
+            )["ftavg"][0]
             keys.append(f"p{port}_{face_label}")
             row_port.append(port)
             role.append(row_role)
@@ -2312,18 +2535,58 @@ def export_overlay(
         PORTS,
     )
 
-    density_ftavg = _flux_tube_series(density_profiles_m3, density_x_cm)
+    # THE DENSITY ROWS OF RECORD ARE TAKEN ON THE UNSUBTRACTED PROFILE.  The
+    # probe's zeroing already removed the instrumental baseline, from the end
+    # of the shot where there is no plasma, so the ledger's edge-median
+    # subtraction was removing plasma; see ftavg_background.
+    density_ftavg = _flux_tube_series(
+        density_profiles_m3, density_x_cm, subtract_background=False
+    )
+    # The WHOLE-COLUMN convention: the same reduction of the same profiles,
+    # integrated to each sample's own column edge and then divided by the
+    # tube's area rather than by the area integrated over.
+    density_column = _flux_tube_series(
+        density_profiles_m3,
+        density_x_cm,
+        radius_cm=None,
+        normalize_radius_cm=FLUX_TUBE_RADIUS_CM,
+        subtract_background=False,
+    )
+    # The same two reductions WITH the retired subtraction, exported under
+    # explicit legacy names so a pre-ruling result stays reproducible.
+    density_ftavg_legacy = _flux_tube_series(density_profiles_m3, density_x_cm)
+    density_column_legacy = _flux_tube_series(
+        density_profiles_m3,
+        density_x_cm,
+        radius_cm=None,
+        normalize_radius_cm=FLUX_TUBE_RADIUS_CM,
+    )
 
     # The flux-tube T_e rows.  T_e lives on the sweep-cycle clock and the
     # density on the inter-sweep dead-time clock, so the DENSITY -- which is
     # only the weight here -- is the grid that moves: it is interpolated onto
     # te_time_ms cell by cell, and the T_e rows stay on the clock every other
     # te_* field is already exported on.
+    te_clock_density_m3 = _interp_onto_time_grid(
+        density_profiles_m3, density.time_ms, te.time_ms
+    )
     te_ftavg = _flux_tube_te_series(
         te_filled_profiles,
-        _interp_onto_time_grid(density_profiles_m3, density.time_ms, te.time_ms),
+        te_clock_density_m3,
         density_x_cm,
         te_records["semi_quantitative"],
+        subtract_background=False,
+    )
+    te_column = _flux_tube_te_series(
+        te_filled_profiles,
+        te_clock_density_m3,
+        density_x_cm,
+        te_records["semi_quantitative"],
+        radius_cm=None,
+        normalize_radius_cm=FLUX_TUBE_RADIUS_CM,
+        subtract_background=False,
+        trust_radius_cm=te_records["trust_radius_cm"],
+        blend_radius_cm=te_records["trust_blend_cm"],
     )
     ftavg_coverage_cm = _measured_coverage_cm(
         te_records["measured_te"],
@@ -2332,6 +2595,12 @@ def export_overlay(
         te_records["row_measured_cells"],
     )
     ftavg_prior_beyond_coverage = ~(ftavg_coverage_cm >= FLUX_TUBE_RADIUS_CM)
+    # The column rows measure the SAME thing -- how far out the filled T_e
+    # product reports its own measurement -- so the coverage radius is the same
+    # number under both conventions.  Only what it is compared against moves:
+    # the column integrates to te_column_edge_cm, not to the tube radius.
+    column_coverage_cm = ftavg_coverage_cm
+    column_prior_beyond_coverage = ~(column_coverage_cm >= te_column["edge"])
 
     def _face_ftavg(path: Path, label: str) -> tuple[dict, dict]:
         scans = _rot0_isat_profiles(path, experiment_set_id, density.z_cm)
@@ -2346,18 +2615,38 @@ def export_overlay(
             raise ValueError(
                 f"{label} Isat and density inter-sweep time grids differ"
             )
-        return scans, _flux_tube_series(
-            scans["isat_a"], scans["x_cm"], scans["sem_a"]
+        # The comparand convention, as for the density rows: no background
+        # subtraction (see ftavg_background), with the retired reduction kept
+        # beside it under a _subtracted name.
+        return (
+            scans,
+            _flux_tube_series(
+                scans["isat_a"],
+                scans["x_cm"],
+                scans["sem_a"],
+                subtract_background=False,
+            ),
+            _flux_tube_series(scans["isat_a"], scans["x_cm"], scans["sem_a"]),
         )
 
-    upstream_scans, upstream_ftavg = _face_ftavg(isat_profile_path, "upstream")
-    rot0_isat, isat_ftavg = _face_ftavg(rot0_isat_profile_path, "downstream")
+    upstream_scans, upstream_ftavg, upstream_ftavg_legacy = _face_ftavg(
+        isat_profile_path, "upstream"
+    )
+    rot0_isat, isat_ftavg, isat_ftavg_legacy = _face_ftavg(
+        rot0_isat_profile_path, "downstream"
+    )
     geomean_scans = _flow_symmetrized_profiles(
         upstream_scans,
         rot0_isat,
         face_areas_cm2,
     )
     geomean_ftavg = _flux_tube_series(
+        geomean_scans["profiles"],
+        upstream_scans["x_cm"],
+        geomean_scans["sem"],
+        subtract_background=False,
+    )
+    geomean_ftavg_legacy = _flux_tube_series(
         geomean_scans["profiles"],
         upstream_scans["x_cm"],
         geomean_scans["sem"],
@@ -2415,6 +2704,36 @@ def export_overlay(
         }
     density_mean_cm3 = density.mean * DENSITY_SCALE_CM3
     density_ftavg_cm3 = density_ftavg["ftavg"] * M3_TO_CM3
+    density_column_cm3 = density_column["ftavg"] * M3_TO_CM3
+    density_ftavg_subtracted_cm3 = density_ftavg_legacy["ftavg"] * M3_TO_CM3
+    density_column_subtracted_cm3 = density_column_legacy["ftavg"] * M3_TO_CM3
+    # The raw inventory per unit length, cm^-1: the column row is that divided
+    # by the tube's area, so multiplying it back is the same number the
+    # quadrature integrated and not a second reduction.
+    column_inventory_per_cm = (
+        np.pi * FLUX_TUBE_RADIUS_CM**2 * density_column_cm3
+    )
+    with np.errstate(divide="ignore", invalid="ignore"):
+        column_over_ftavg_ratio = np.where(
+            np.isfinite(density_ftavg_cm3) & (density_ftavg_cm3 > 0.0),
+            density_column_cm3 / density_ftavg_cm3,
+            np.nan,
+        )
+        # The Probe-A area calibration enters the core-band SEM as
+        # |core mean| * relative (see _load_density_stats), so the RELATIVE
+        # term is what transfers onto a row at a different level; recovering it
+        # here keeps the two-term composition of density_total_sem_cm3 without
+        # re-reading the calibration.
+        calibration_relative = np.where(
+            np.isfinite(density.mean) & (density.mean != 0.0),
+            density.calibration_uncertainty / np.abs(density.mean),
+            0.0,
+        )
+    density_column_radial_sem_cm3 = density_column["scatter_sem"] * M3_TO_CM3
+    density_column_sem_cm3 = np.hypot(
+        density_column_radial_sem_cm3,
+        np.abs(density_column_cm3) * calibration_relative,
+    )
     # The ES4 upstream-face bracket is exported at experiment set 4 only; every
     # other set writes the same field set it always has.
     es4_upstream_fields: dict[str, np.ndarray] = {}
@@ -2744,15 +3063,48 @@ def export_overlay(
             "not captured by it."
         ),
         ftavg_background=np.array(
+            "NO BACKGROUND IS SUBTRACTED FROM ANY DENSITY ROW OF RECORD, AND "
+            "THAT IS A RULING, NOT AN OMISSION.  The Isat baseline behind "
+            "these profiles is already taken by subtracting the signal from "
+            "the END OF THE SHOT, where there is no plasma, so a line scan "
+            "carries no second background to remove -- and what an edge-median "
+            "subtraction takes off the outer cells is therefore PLASMA, which "
+            "at a 25 cm scan is exactly the cross-field plasma "
+            "density_column_cm3 exists to count.  EVERY AREA-AVERAGED "
+            "COMPARAND IN THIS PRODUCT IS NOW ON THAT RULING, so they are all "
+            "commensurate with each other: density_ftavg_cm3, "
+            "density_ftavg_core_cm3, density_ftavg_centroid_cm and every "
+            "density_column_* row; the density WEIGHT behind te_ftavg_ev and "
+            "te_column_ev; the ES4 es4_upstream_density_ftavg_cm3 bracket "
+            "(all at schema v33); and isat_ftavg_upstream_a, isat_ftavg_a and "
+            "isat_ftavg_geomean_a_per_cm2 with their SEM, core and centroid "
+            "companions (v35).  All are taken on the UNSUBTRACTED, despiked "
+            "profile; the clip at zero that the subtraction motivated is not "
+            "applied to them either.  ON THE DENSITY GRID THE CLIP HAD "
+            "NOTHING TO DO -- that product writes a non-positive cell as NaN "
+            "before it is stored, so no cell of the unsubtracted profile is "
+            "negative (0 of 28,279 finite despiked cells across the four "
+            "sets).  ON THE ISAT SCANS IT DID: the far skirt carries "
+            "genuinely negative cells (349 of 10,200 on the ES1 upstream "
+            "face), noise about zero at a radius where there is little "
+            "current, and the retired path lifted every one of them to zero. "
+            " That lift was a second, silent positive bias and it is gone "
+            "too; a negative cell now enters the quadrature as measured.  It "
+            "is also why an isat_ftavg_*_subtracted_* row is not uniformly "
+            "below its comparand: where the baseline was itself zero, the "
+            "lift is all the retired path did, and the legacy row can sit "
+            "slightly above.  "
+            "The core-band density_mean_cm3 was never background-subtracted, "
+            "so it and density_ftavg_cm3 now differ by the weighting alone.  "
+            "THE RETIRED CONVENTION, for continuity reads only: "
             "scalar baseline = the smaller of the two medians of the outer "
             f"{BACKGROUND_EDGE_POINTS} points on each side, clipped at zero "
-            "and subtracted, profile then clipped at zero; convention taken "
-            "from the effective-width ledger.  A side whose outer points are "
-            "all non-finite yields no median and is skipped; a sample with "
-            "neither side usable is NaN.  The legacy density_mean_cm3 is "
-            "NOT background-subtracted, so the ratio of the two exported "
-            "fields is not the pure weighting correction; ratio "
-            "density_ftavg_core_cm3 / density_ftavg_cm3 for that."
+            "and subtracted, profile then clipped at zero, taken from the "
+            "effective-width ledger; a side whose outer points are all "
+            "non-finite yields no median and is skipped, and a sample with "
+            "neither side usable was NaN.  Its values survive as the five "
+            "rows named in subtracted_legacy_definition and are NOT "
+            "comparands.  NOTHING IN THIS PRODUCT STILL SUBTRACTS."
         ),
         ftavg_despike=np.array(
             f"isolated single-cell spikes at or above "
@@ -2787,6 +3139,30 @@ def export_overlay(
         density_ftavg_core_cm3=density_ftavg["core"] * M3_TO_CM3,
         density_ftavg_centroid_cm=density_ftavg["centroid"],
         density_ftavg_n_despiked=density_ftavg["n_despiked"],
+        density_ftavg_subtracted_cm3=density_ftavg_subtracted_cm3,
+        subtracted_legacy_definition=np.array(
+            "LEGACY ROWS, NOT COMPARANDS.  Five rows carry the RETIRED "
+            "edge-median background subtraction, one for each area-averaged "
+            "comparand: density_ftavg_subtracted_cm3, "
+            "density_column_subtracted_cm3, isat_ftavg_upstream_subtracted_a, "
+            "isat_ftavg_subtracted_a and "
+            "isat_ftavg_geomean_subtracted_a_per_cm2.  Each is its comparand "
+            "computed the way it was before the ruling -- the effective-width "
+            "ledger's baseline, the smaller of the two outer-edge medians "
+            "clipped at zero, subtracted from every cell and the profile then "
+            "clipped at zero -- and they exist only so a result quoted before "
+            "the ruling can be reproduced and traced.  THE SUBTRACTION WAS AN "
+            "ERROR: the Isat baseline is already taken by subtracting the "
+            "signal from the END OF THE SHOT, where there is no plasma, so "
+            "there is no background left for a line scan to remove and the "
+            "edge medians it removed are plasma.  Only the value row of each "
+            "family is kept; no legacy SEM, core, centroid or despike "
+            "companion is exported, because the retired reduction is not "
+            "something a new result may quote.  See ftavg_background.  The "
+            "density rows were re-cut at schema v33 and the three Isat "
+            "families at v35; a product at v31 or earlier carries the "
+            "subtracted values under the COMPARAND names."
+        ),
         te_ftavg_time_ms=te.time_ms,
         te_ftavg_ev=te_ftavg["ftavg"],
         te_ftavg_sem_ev=np.hypot(
@@ -2932,24 +3308,250 @@ def export_overlay(
             "above the threshold -- see te_semi_quantitative_rule) and what "
             "fraction of the total quadrature weight they carry."
         ),
+        density_column_cm3=density_column_cm3,
+        density_column_sem_cm3=density_column_sem_cm3,
+        density_column_radial_sem_cm3=density_column_radial_sem_cm3,
+        density_column_subtracted_cm3=density_column_subtracted_cm3,
+        column_inventory_per_cm=column_inventory_per_cm,
+        column_edge_cm=density_column["edge"],
+        column_over_ftavg_ratio=column_over_ftavg_ratio,
+        te_column_ev=te_column["ftavg"],
+        te_column_sem_ev=np.hypot(
+            te_column["ftavg_sem"],
+            np.nan_to_num(te_records["window_sem_ev"], nan=0.0),
+        ),
+        te_column_radial_sem_ev=te_column["ftavg_sem"],
+        te_column_plain_ev=te_column["plain"],
+        te_column_plain_sem_ev=np.hypot(
+            te_column["plain_sem"],
+            np.nan_to_num(te_records["window_sem_ev"], nan=0.0),
+        ),
+        te_column_plain_radial_sem_ev=te_column["plain_sem"],
+        te_column_edge_cm=te_column["edge"],
+        te_column_prior_weight=te_column["prior_weight"],
+        te_column_pure_prior_weight=te_column["pure_prior_weight"],
+        te_column_plain_prior_weight=te_column["plain_prior_weight"],
+        te_column_plain_pure_prior_weight=te_column["plain_pure_prior_weight"],
+        column_coverage_cm=column_coverage_cm,
+        column_prior_beyond_coverage=column_prior_beyond_coverage,
+        column_definition=np.array(
+            "THE WHOLE-COLUMN COMPARAND, the third radial-averaging convention "
+            "beside the core-band line cut and the flux tube.  WHY IT EXISTS: "
+            "plasma measured outside the cathode flux tube got there by "
+            "cross-field transport a 1D model does not represent, so the "
+            "model's single radial cell is compared against the WHOLE column's "
+            "plasma rather than against the part of it that happens to lie "
+            "inside the tube.  density_column_cm3 (cm^-3, on density_time_ms) "
+            "is int_0^edge n(r) 2 pi r dr / (pi * ftavg_radius_cm^2): the "
+            "column's inventory per unit length, expressed as the density a "
+            "tube of radius ftavg_radius_cm would carry if all of it were "
+            "inside.  It is NOT an average over the disc it was integrated "
+            "over -- the numerator runs to column_edge_cm and the denominator "
+            "is the TUBE's area -- which is exactly why it exceeds "
+            "density_ftavg_cm3 wherever the column is wider than the tube.  "
+            "THE INTEGRAND IS THE PROFILE AS MEASURED: nothing is subtracted "
+            "from it and nothing is clipped.  The Isat baseline was already "
+            "taken from the end of the shot, where there is no plasma, so "
+            "there is no background left in a line scan to remove, and the "
+            "edge-median subtraction this chain used to apply was removing "
+            "the very cross-field plasma this convention counts (see "
+            "ftavg_background; the retired values survive as "
+            "density_column_subtracted_cm3).  density_column_cm3 is therefore "
+            "THE MEASURED INVENTORY OUT TO THE SCAN EDGE.  It remains a lower "
+            "bound in ONE respect only, and a different one: the scan stops at "
+            "|x| = 25 cm, so any plasma beyond the scan edge is not in it, and "
+            "this product cannot say how much that is.  "
+            "column_inventory_per_cm is the numerator itself, in cm^-1, for "
+            "an interferometer cross-check; it is pi * ftavg_radius_cm^2 "
+            "times density_column_cm3 by construction and is not a second "
+            "reduction.  column_over_ftavg_ratio is "
+            "density_column_cm3 / density_ftavg_cm3 PER SAMPLE: the factor by "
+            "which the column's inventory exceeds the tube's, one plus the "
+            "share outside the tube.  THE LEVEL IS THE RATIO OF THE PLATEAU "
+            "MEANS, not the plateau mean of this field; the per-sample field "
+            "is for time-resolved inspection, and where the denominator is at "
+            "the noise floor NEITHER is a level -- at ES4 p50 the mean of the "
+            "per-sample ratios is 1.41 over the one plateau sample that "
+            "survives while the ratio of the plateau means is 0.85, an "
+            "implied share outside the tube of -18 %.  te_column_ev (eV, on "
+            "te_time_ms) is the DENSITY-WEIGHTED mean over the SAME extent, "
+            "int n T_e 2 pi r dr / int n 2 pi r dr, which is a 1D cell's "
+            "E_e / (3/2 n); te_column_plain_ev is the unweighted area mean "
+            "over that extent, int T_e 2 pi r dr / (pi * edge^2), printed "
+            "beside it and NOT scored.  Both are ratios over one node set, so "
+            "neither carries the tube-area normalization the density row does; "
+            "both sit on the UNSUBTRACTED density's nodes and centroid, and "
+            "the weighted one is weighted by it.  EVERYTHING ELSE IS THE "
+            "FLUX-TUBE CHAIN UNCHANGED: same despike gate, same fold about "
+            "the DENSITY centroid "
+            "(density_ftavg_centroid_cm and te_ftavg_centroid_cm are the "
+            "centroids these rows fold about too), same trapezoidal quadrature "
+            "closed at r = 0 and at the outer limit, and the same "
+            "interpolation of the density weight onto te_time_ms.  Isat gets "
+            "NO column row: the scorer synthesises the Isat comparand as "
+            "n sqrt(T_e) from the two rows above, so a third measured Isat "
+            "convention would be a fourth way to say the same thing.  The "
+            "three conventions are NOT interchangeable and a result must say "
+            "which one it quoted -- see ftavg_comparand_map."
+        ),
+        column_edge_definition=np.array(
+            "WHERE THE COLUMN INTEGRAL STOPS, per port and per sample.  "
+            "column_edge_cm is the extent behind density_column_cm3 and "
+            "column_inventory_per_cm, on density_time_ms; te_column_edge_cm is "
+            "the extent behind te_column_ev and te_column_plain_ev, on "
+            "te_time_ms, and the two differ because the T_e rows are reduced "
+            "over the density grid INTERPOLATED onto the T_e clock and over "
+            "the nodes where both profiles are usable.  THE DEFINITION, "
+            "plainly: THE EDGE IS THE SCAN LIMIT, in the centroid-folded "
+            "frame -- the outermost folded radius r = |x - x_c| at which the "
+            "scan still carries a retained cell.  Retained means the cell "
+            "survived its product's own QC, since the density chain writes a "
+            "non-positive or unusable cell as NaN and those are dropped first, "
+            "so at these sets the edge is the |x| = 25 cm scan end, or the "
+            "outermost cell inside it that survived, plus the per-sample "
+            "centroid offset: 23 to 28 cm in practice.  IT IS NOT A MEASURED "
+            "COLUMN BOUNDARY.  The profile is NOT required to have fallen to "
+            "anything there, and nothing is subtracted to make it look as "
+            "though it had: the density at the scan edge is whatever the "
+            "probe measured, and it is integrated as plasma (see "
+            "ftavg_background).  An earlier vintage of this field claimed the "
+            "edge was where the profile 'reaches the background ledger'; that "
+            "was circular -- the ledger DEFINED its baseline from the "
+            "outermost cells of this same scan, so the subtracted profile sat "
+            "at zero there by construction at any scan extent whatever -- and "
+            "the ledger is retired from this chain.  WHAT THE SCAN LIMIT DOES "
+            "COST: plasma beyond |x| = 25 cm is outside every column row, and "
+            "this product cannot say how much there is.  A consumer wanting "
+            "the column integrated to a DECLARED radius, rather than to the "
+            "scan's own end, cannot get it from this product.  The edge is "
+            "stated in the CENTROID-FOLDED radius, not "
+            "in scan |x|; column_coverage_cm is stated in scan |x| (see "
+            "column_coverage_definition), and the offset between the two "
+            "frames is te_ftavg_centroid_cm."
+        ),
+        column_sem_definition=np.array(
+            "THE SAME ERROR MODEL THE FLUX-TUBE ROWS CARRY, over the column "
+            "extent.  te_column_sem_ev is te_column_radial_sem_ev and the "
+            "fit-window convention term te_window_sem_ev added in quadrature, "
+            "and te_column_plain_sem_ev is that composition for the unweighted "
+            "row.  The radial term is the scatter of the retained radial cells "
+            "about their own weighted average, propagated through the "
+            "quadrature weights -- s^2 = sum a_i (T_i - m)^2 / (1 - sum a_i^2), "
+            "sem = sqrt(s^2 sum a_i^2) with a_i the normalized weights -- which "
+            "reduces exactly to std(ddof=1)/sqrt(N) at equal weights.  IT IS A "
+            "RADIAL-SCATTER TERM, not a shot or cycle SEM; the filled T_e "
+            "product carries no per-cell uncertainty, so no cycle-to-cycle "
+            "term enters either row.  THE WINDOW TERM IS TRANSFERRED AND "
+            "UNDERSTATES: te_window_sem_ev is defined over the CORE BAND ONLY "
+            "-- the export refuses a filled product whose window-spread band "
+            "is not core_x_min_cm to core_x_max_cm -- so it is carried onto "
+            "the column row unchanged rather than re-derived over it.  The "
+            "sweep-systematics term for everything between the core band and "
+            "column_edge_cm is MISSING, and the exported total understates the "
+            "column uncertainty by however large it is; the gap is WIDER here "
+            "than for the flux-tube rows, because the column extends further.  "
+            "density_column_sem_cm3 is the same two-term composition as "
+            "density_total_sem_cm3: density_column_radial_sem_cm3, the same "
+            "weighted radial-scatter statistic (the weighted generalization of "
+            "density_radial_sem_cm3, carrying the tube-area normalization the "
+            "row itself carries), in quadrature with the Probe-A area "
+            "calibration entered as the RELATIVE uncertainty it is, i.e. the "
+            "core-band calibration term divided by the core-band mean and "
+            "applied to density_column_cm3.  It is NOT the core-band "
+            "fractional total error transferred whole, which is what "
+            "ftavg_comparand_map tells a consumer to do with density_ftavg_cm3 "
+            "and which gives a different number; a result must say which it "
+            "used.  NEITHER SEM CONTAINS THE SCAN-EXTENT CAVEAT: plasma "
+            "beyond the |x| = 25 cm scan edge is in no column row and is not "
+            "a scatter term (see column_edge_definition)."
+        ),
+        column_coverage_definition=np.array(
+            "HOW MUCH OF THE COLUMN IS MEASURED, per port and per sample, for "
+            "the T_e rows -- the only column rows with a prior in them.  "
+            "column_coverage_cm IS ftavg_coverage_cm, the same number: the "
+            "outermost scan |x| carrying a QC-surviving MEASURED T_e cell, "
+            "capped at that port's te_trust_radius_cm, NaN where the row is "
+            "prior-derived at that sample.  What the column convention changes "
+            "is only what the coverage is compared AGAINST: "
+            "column_prior_beyond_coverage is True wherever column_coverage_cm "
+            "< te_column_edge_cm, including where the coverage is NaN.  IT IS "
+            "TRUE AT EVERY PORT OF EVERY EXPERIMENT SET, without exception: "
+            "the highest trust radius in the repo is ftavg_radius_cm = "
+            "18.415 cm (ES1/ES2 p11/p21/p29/p41) and every other port keeps "
+            "the historical 10 cm, while the column integral runs past 23 cm, "
+            "so part of the disc every te_column_ev integrates over is the "
+            "repo's scrape-off-layer prior rather than a measurement of that "
+            "port.  HOW MUCH OF IT IS THE PRIOR IS A NUMBER, NOT AN "
+            "ADJECTIVE, AND IT IS SET- AND PORT-CONDITIONAL: "
+            "te_column_prior_weight is the share of the row's own "
+            "density-weighted quadrature weight (sum w n) carried by cells at "
+            "|x| beyond that port's te_trust_radius_cm, per port and per "
+            "sample, and te_column_pure_prior_weight the share beyond "
+            "te_trust_blend_cm, where the filled product reports the prior "
+            "alone.  Over the 15.0-19.5 ms plateau those shares read: ES1 "
+            "0.247 / 0.242 / 0.265 / 0.212 / 0.671 at p11 / p21 / p29 / p41 / "
+            "p50, ES2 0.270 / 0.205 / 0.256 / 0.239 / 0.689, ES3 0.735 / "
+            "0.685 / 0.700 / 0.601 / 0.639, ES4 0.705 / 0.622 / 0.617 / 0.567 "
+            "/ 0.756; pure-prior at ES1, 0.109 / 0.141 / 0.170 / 0.131 / "
+            "0.345.  At the eight ES1/ES2 aperture ports the prior carries "
+            "21-27 % of the weight; at every p50 row and across sets 3 and 4 "
+            "it carries 57-76 %, and AT TWELVE OF THE TWENTY PORT-ROWS IT IS "
+            "NOT A SMALL CORRECTION -- those rows are substantially a "
+            "statement about the repo's SOL prior and must not be read as a "
+            "measurement of that port's column T_e.  The unweighted row is "
+            "worse again: te_column_plain_prior_weight and "
+            "te_column_plain_pure_prior_weight are the same shares of sum w, "
+            "and they run 0.42 to 0.84, which is one reason the plain row is "
+            "not the comparand.  These shares are taken on the UNSUBTRACTED "
+            "density weight (schema v33): the retired background subtraction "
+            "held the outer cells down, so every share here is LARGER than "
+            "the same statistic taken before the ruling -- ES1 p11 0.247 "
+            "against 0.218.  The"
+            "flag is the reliable statement and the coverage radius is "
+            "indicative, for the same frame reason ftavg_coverage_definition "
+            "gives: coverage is in scan |x| and the edge is in the "
+            "centroid-folded radius.  The prior-weight masks are in scan |x| "
+            "too.  density_column_cm3 and column_inventory_per_cm carry no "
+            "such field: the density is measured at every radius of the scan."
+        ),
         ftavg_comparand_map=np.array(
-            "WHICH FIELD IS THE FLUX-TUBE COMPARAND FOR EACH SCORED ROW, so a "
-            "consumer does not have to choose.  Density: density_ftavg_cm3 "
-            "(cm^-3), the plain area mean, with the core-band fractional error "
-            "density_total_sem_cm3 / density_mean_cm3 transferred onto it.  "
-            "T_e: te_ftavg_ev (eV), the density-weighted area mean, with "
-            "te_ftavg_sem_ev.  Isat: isat_ftavg_upstream_a (A), the plain area "
-            "mean of the measured Isat(r) on the UPSTREAM probe face, with "
+            "WHICH FIELD CARRIES EACH SCORED ROW IN EACH OF THE THREE "
+            "RADIAL-AVERAGING CONVENTIONS, so a consumer does not have to "
+            "choose.  (1) CORE, the legacy line cut, an unweighted arithmetic "
+            "mean of the 51-point scan over core_x_min_cm to core_x_max_cm, "
+            "carrying no radial area weighting at all: density_mean_cm3 with "
+            "density_total_sem_cm3, te_mean_ev with te_sem_ev.  (2) FTAVG, the "
+            "flux tube, int 2 pi r f dr / (pi R^2) out to R = ftavg_radius_cm, "
+            "the disc the model's single radial cell occupies: "
+            "density_ftavg_cm3 (cm^-3), the plain area mean, with the "
+            "core-band fractional error density_total_sem_cm3 / "
+            "density_mean_cm3 transferred onto it; te_ftavg_ev (eV), the "
+            "density-weighted area mean, with te_ftavg_sem_ev; "
+            "isat_ftavg_upstream_a (A), the plain area mean of the measured "
+            "Isat(r) on the UPSTREAM probe face, with "
             "isat_ftavg_upstream_sem_a -- that is the truth channel and the "
             "face the density chain reads; isat_ftavg_a is the SHADOWED "
             "downstream face and isat_ftavg_geomean_a_per_cm2 the "
-            "flow-cancelled estimator in A cm^-2 (see ftavg_face_ruling).  The "
-            "core-band rows density_mean_cm3 and te_mean_ev are the LEGACY "
-            "comparand and are unchanged; the two conventions are not "
-            "interchangeable and a result must say which it quoted."
+            "flow-cancelled estimator in A cm^-2 (see ftavg_face_ruling).  "
+            "(3) COLUMN, the whole measured column's inventory per unit "
+            "length divided by the TUBE's area, the comparand for a model tube "
+            "asked to carry all of the plasma including what cross-field "
+            "transport put outside it: density_column_cm3 (cm^-3) with "
+            "density_column_sem_cm3, te_column_ev (eV) with te_column_sem_ev, "
+            "and NO Isat row -- the scorer synthesises Isat as n sqrt(T_e) "
+            "from the two.  column_over_ftavg_ratio is the share of the plasma "
+            "outside the tube and column_inventory_per_cm the raw line "
+            "inventory in cm^-1.  See column_definition, column_edge_definition, "
+            "column_sem_definition and column_coverage_definition.  NO ROW IN "
+            "ANY OF THE THREE SUBTRACTS A BACKGROUND (schema v35; see "
+            "ftavg_background), so they are commensurate with each other and "
+            "differ only by the radial weighting and the extent -- but they "
+            "are still NOT interchangeable and a result must say which one it "
+            "quoted."
         ),
         isat_ftavg_geomean_time_ms=upstream_scans["time_ms"],
         isat_ftavg_geomean_a_per_cm2=geomean_ftavg["ftavg"],
+        isat_ftavg_geomean_subtracted_a_per_cm2=geomean_ftavg_legacy["ftavg"],
         isat_ftavg_geomean_sem_a_per_cm2=geomean_ftavg["ftavg_sem"],
         isat_ftavg_geomean_core_a_per_cm2=geomean_ftavg["core"],
         isat_ftavg_geomean_centroid_cm=geomean_ftavg["centroid"],
@@ -2974,6 +3576,7 @@ def export_overlay(
         ),
         isat_ftavg_upstream_time_ms=upstream_scans["time_ms"],
         isat_ftavg_upstream_a=upstream_ftavg["ftavg"],
+        isat_ftavg_upstream_subtracted_a=upstream_ftavg_legacy["ftavg"],
         isat_ftavg_upstream_sem_a=upstream_ftavg["ftavg_sem"],
         isat_ftavg_upstream_core_a=upstream_ftavg["core"],
         isat_ftavg_upstream_centroid_cm=upstream_ftavg["centroid"],
@@ -2994,6 +3597,7 @@ def export_overlay(
         ),
         isat_ftavg_time_ms=rot0_isat["time_ms"],
         isat_ftavg_a=isat_ftavg["ftavg"],
+        isat_ftavg_subtracted_a=isat_ftavg_legacy["ftavg"],
         isat_ftavg_sem_a=isat_ftavg["ftavg_sem"],
         isat_ftavg_core_a=isat_ftavg["core"],
         isat_ftavg_centroid_cm=isat_ftavg["centroid"],
@@ -3016,8 +3620,10 @@ def export_overlay(
         isat_ftavg_sem_definition=np.array(
             "per-point shot SEM (isat_a_std / sqrt(n_shots_used)) propagated "
             "through the quadrature weights in quadrature, points treated as "
-            "independent; the background's own sampling uncertainty is not "
-            "included.  This is a shot SEM and is NOT commensurate with "
+            "independent.  Since schema v35 there is no background term to "
+            "carry: nothing is subtracted from these rows (see "
+            "ftavg_background).  This is a shot SEM and is NOT commensurate "
+            "with "
             "density_total_sem_cm3, which is a radial-scatter SEM plus the "
             "Probe-A area calibration."
         ),
