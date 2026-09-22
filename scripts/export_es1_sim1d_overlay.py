@@ -101,16 +101,16 @@ represent, so a model tube that carries the column's whole inventory is the
 comparison this convention makes; ``column_over_ftavg_ratio`` is the share of
 the column that sits outside the tube, per port and per sample.
 
-NO BACKGROUND IS SUBTRACTED FROM ANY DENSITY ROW OF RECORD (schema v33).  The
-Isat baseline is already taken from the end of the shot, where there is no
-plasma, so a line scan carries no second background to remove and the
-edge-median subtraction this chain used to apply was removing the cross-field
-plasma the column convention counts.  ``density_ftavg_cm3`` MOVED at that
-ruling and so did the density weight behind ``te_ftavg_ev``; the retired
-values survive as ``density_ftavg_subtracted_cm3`` and
-``density_column_subtracted_cm3`` for continuity reads only.  The
-``isat_ftavg_*`` families and the ES4 upstream bracket were NOT re-cut and are
-still on the old convention -- see ``ftavg_background``.
+NO BACKGROUND IS SUBTRACTED FROM ANY COMPARAND IN THIS PRODUCT.  The Isat
+baseline is already taken from the end of the shot, where there is no plasma,
+so a line scan carries no second background to remove and the edge-median
+subtraction this chain used to apply was removing the cross-field plasma the
+column convention counts.  ``density_ftavg_cm3``, the density weight behind
+``te_ftavg_ev`` and the ES4 upstream bracket moved at schema v33; the three
+``isat_ftavg_*`` families at v35.  Every area-averaged row is therefore on one
+convention and they are commensurate with each other.  The retired values
+survive under five ``*_subtracted_*`` names, for continuity reads only -- see
+``ftavg_background`` and ``subtracted_legacy_definition``.
 
 The three conventions are exported side by side and are NOT interchangeable; a
 consumer must state which one a number came from.  ``ftavg_comparand_map``
@@ -210,7 +210,7 @@ from es4_upstream_rows_rot180_isat import (
 #: the CURRENT schema by importing it: a literal pinned in one test is a pin
 #: on whatever vintage happened to be on disk the day it was written, and
 #: goes stale silently the next time the product is placed.
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 35
 
 MANIFEST = Path("config/may2026_run_manifest.toml")
 DENSITY_HDF5 = Path("processed/density_profiles_isweep.hdf5")
@@ -2615,18 +2615,38 @@ def export_overlay(
             raise ValueError(
                 f"{label} Isat and density inter-sweep time grids differ"
             )
-        return scans, _flux_tube_series(
-            scans["isat_a"], scans["x_cm"], scans["sem_a"]
+        # The comparand convention, as for the density rows: no background
+        # subtraction (see ftavg_background), with the retired reduction kept
+        # beside it under a _subtracted name.
+        return (
+            scans,
+            _flux_tube_series(
+                scans["isat_a"],
+                scans["x_cm"],
+                scans["sem_a"],
+                subtract_background=False,
+            ),
+            _flux_tube_series(scans["isat_a"], scans["x_cm"], scans["sem_a"]),
         )
 
-    upstream_scans, upstream_ftavg = _face_ftavg(isat_profile_path, "upstream")
-    rot0_isat, isat_ftavg = _face_ftavg(rot0_isat_profile_path, "downstream")
+    upstream_scans, upstream_ftavg, upstream_ftavg_legacy = _face_ftavg(
+        isat_profile_path, "upstream"
+    )
+    rot0_isat, isat_ftavg, isat_ftavg_legacy = _face_ftavg(
+        rot0_isat_profile_path, "downstream"
+    )
     geomean_scans = _flow_symmetrized_profiles(
         upstream_scans,
         rot0_isat,
         face_areas_cm2,
     )
     geomean_ftavg = _flux_tube_series(
+        geomean_scans["profiles"],
+        upstream_scans["x_cm"],
+        geomean_scans["sem"],
+        subtract_background=False,
+    )
+    geomean_ftavg_legacy = _flux_tube_series(
         geomean_scans["profiles"],
         upstream_scans["x_cm"],
         geomean_scans["sem"],
@@ -3050,29 +3070,41 @@ def export_overlay(
             "carries no second background to remove -- and what an edge-median "
             "subtraction takes off the outer cells is therefore PLASMA, which "
             "at a 25 cm scan is exactly the cross-field plasma "
-            "density_column_cm3 exists to count.  As of schema v33 "
-            "density_ftavg_cm3, density_ftavg_core_cm3, "
-            "density_ftavg_centroid_cm, every density_column_* row and the "
-            "density WEIGHT behind te_ftavg_ev and te_column_ev are taken on "
-            "the UNSUBTRACTED, despiked profile; the clip at zero that the "
-            "subtraction motivated is not applied to them either, and it has "
-            "nothing to do: the density product writes a non-positive cell as "
-            "NaN before it is stored, so no cell of the unsubtracted profile "
-            "is negative.  THE RETIRED CONVENTION, for continuity reads only: "
+            "density_column_cm3 exists to count.  EVERY AREA-AVERAGED "
+            "COMPARAND IN THIS PRODUCT IS NOW ON THAT RULING, so they are all "
+            "commensurate with each other: density_ftavg_cm3, "
+            "density_ftavg_core_cm3, density_ftavg_centroid_cm and every "
+            "density_column_* row; the density WEIGHT behind te_ftavg_ev and "
+            "te_column_ev; the ES4 es4_upstream_density_ftavg_cm3 bracket "
+            "(all at schema v33); and isat_ftavg_upstream_a, isat_ftavg_a and "
+            "isat_ftavg_geomean_a_per_cm2 with their SEM, core and centroid "
+            "companions (v35).  All are taken on the UNSUBTRACTED, despiked "
+            "profile; the clip at zero that the subtraction motivated is not "
+            "applied to them either.  ON THE DENSITY GRID THE CLIP HAD "
+            "NOTHING TO DO -- that product writes a non-positive cell as NaN "
+            "before it is stored, so no cell of the unsubtracted profile is "
+            "negative (0 of 28,279 finite despiked cells across the four "
+            "sets).  ON THE ISAT SCANS IT DID: the far skirt carries "
+            "genuinely negative cells (349 of 10,200 on the ES1 upstream "
+            "face), noise about zero at a radius where there is little "
+            "current, and the retired path lifted every one of them to zero. "
+            " That lift was a second, silent positive bias and it is gone "
+            "too; a negative cell now enters the quadrature as measured.  It "
+            "is also why an isat_ftavg_*_subtracted_* row is not uniformly "
+            "below its comparand: where the baseline was itself zero, the "
+            "lift is all the retired path did, and the legacy row can sit "
+            "slightly above.  "
+            "The core-band density_mean_cm3 was never background-subtracted, "
+            "so it and density_ftavg_cm3 now differ by the weighting alone.  "
+            "THE RETIRED CONVENTION, for continuity reads only: "
             "scalar baseline = the smaller of the two medians of the outer "
             f"{BACKGROUND_EDGE_POINTS} points on each side, clipped at zero "
             "and subtracted, profile then clipped at zero, taken from the "
             "effective-width ledger; a side whose outer points are all "
             "non-finite yields no median and is skipped, and a sample with "
-            "neither side usable was NaN.  Its values survive as "
-            "density_ftavg_subtracted_cm3 and density_column_subtracted_cm3 "
-            "and are NOT comparands.  STILL SUBTRACTED, NOT RE-CUT BY THIS "
-            "MEMBER: every isat_ftavg_* family (upstream, downstream and "
-            "geomean) and the ES4 es4_upstream_density_ftavg_cm3 row, which "
-            "are therefore on the OLD convention and are not commensurate "
-            "with density_ftavg_cm3 until they are re-cut.  The legacy "
-            "core-band density_mean_cm3 was never background-subtracted, so "
-            "it and density_ftavg_cm3 now differ by the weighting alone."
+            "neither side usable was NaN.  Its values survive as the five "
+            "rows named in subtracted_legacy_definition and are NOT "
+            "comparands.  NOTHING IN THIS PRODUCT STILL SUBTRACTS."
         ),
         ftavg_despike=np.array(
             f"isolated single-cell spikes at or above "
@@ -3108,18 +3140,28 @@ def export_overlay(
         density_ftavg_centroid_cm=density_ftavg["centroid"],
         density_ftavg_n_despiked=density_ftavg["n_despiked"],
         density_ftavg_subtracted_cm3=density_ftavg_subtracted_cm3,
-        density_subtracted_legacy_definition=np.array(
-            "LEGACY ROWS, NOT COMPARANDS: density_ftavg_subtracted_cm3 and "
-            "density_column_subtracted_cm3 are density_ftavg_cm3 and "
-            "density_column_cm3 computed the way they were before schema v33 "
-            "-- with the effective-width ledger's edge-median baseline "
-            "subtracted and the profile clipped at zero -- and they exist "
-            "only so a result quoted before the ruling can be reproduced and "
-            "traced.  THE SUBTRACTION WAS AN ERROR: the Isat baseline is "
-            "already taken from the end of the shot, where there is no "
-            "plasma, so there is no background left for a line scan to "
-            "remove and the edge medians it removed are plasma.  See "
-            "ftavg_background.  A new result must not quote these rows."
+        subtracted_legacy_definition=np.array(
+            "LEGACY ROWS, NOT COMPARANDS.  Five rows carry the RETIRED "
+            "edge-median background subtraction, one for each area-averaged "
+            "comparand: density_ftavg_subtracted_cm3, "
+            "density_column_subtracted_cm3, isat_ftavg_upstream_subtracted_a, "
+            "isat_ftavg_subtracted_a and "
+            "isat_ftavg_geomean_subtracted_a_per_cm2.  Each is its comparand "
+            "computed the way it was before the ruling -- the effective-width "
+            "ledger's baseline, the smaller of the two outer-edge medians "
+            "clipped at zero, subtracted from every cell and the profile then "
+            "clipped at zero -- and they exist only so a result quoted before "
+            "the ruling can be reproduced and traced.  THE SUBTRACTION WAS AN "
+            "ERROR: the Isat baseline is already taken by subtracting the "
+            "signal from the END OF THE SHOT, where there is no plasma, so "
+            "there is no background left for a line scan to remove and the "
+            "edge medians it removed are plasma.  Only the value row of each "
+            "family is kept; no legacy SEM, core, centroid or despike "
+            "companion is exported, because the retired reduction is not "
+            "something a new result may quote.  See ftavg_background.  The "
+            "density rows were re-cut at schema v33 and the three Isat "
+            "families at v35; a product at v31 or earlier carries the "
+            "subtracted values under the COMPARAND names."
         ),
         te_ftavg_time_ms=te.time_ms,
         te_ftavg_ev=te_ftavg["ftavg"],
@@ -3491,11 +3533,6 @@ def export_overlay(
             "face the density chain reads; isat_ftavg_a is the SHADOWED "
             "downstream face and isat_ftavg_geomean_a_per_cm2 the "
             "flow-cancelled estimator in A cm^-2 (see ftavg_face_ruling).  "
-            "CAVEAT, schema v33: the three isat_ftavg_* families still carry "
-            "the RETIRED edge-median background subtraction, while the "
-            "density and T_e rows beside them no longer do, so they are not "
-            "commensurate with density_ftavg_cm3 until they are re-cut -- see "
-            "ftavg_background.  "
             "(3) COLUMN, the whole measured column's inventory per unit "
             "length divided by the TUBE's area, the comparand for a model tube "
             "asked to carry all of the plasma including what cross-field "
@@ -3505,11 +3542,16 @@ def export_overlay(
             "from the two.  column_over_ftavg_ratio is the share of the plasma "
             "outside the tube and column_inventory_per_cm the raw line "
             "inventory in cm^-1.  See column_definition, column_edge_definition, "
-            "column_sem_definition and column_coverage_definition.  The three "
-            "are NOT interchangeable and a result must say which it quoted."
+            "column_sem_definition and column_coverage_definition.  NO ROW IN "
+            "ANY OF THE THREE SUBTRACTS A BACKGROUND (schema v35; see "
+            "ftavg_background), so they are commensurate with each other and "
+            "differ only by the radial weighting and the extent -- but they "
+            "are still NOT interchangeable and a result must say which one it "
+            "quoted."
         ),
         isat_ftavg_geomean_time_ms=upstream_scans["time_ms"],
         isat_ftavg_geomean_a_per_cm2=geomean_ftavg["ftavg"],
+        isat_ftavg_geomean_subtracted_a_per_cm2=geomean_ftavg_legacy["ftavg"],
         isat_ftavg_geomean_sem_a_per_cm2=geomean_ftavg["ftavg_sem"],
         isat_ftavg_geomean_core_a_per_cm2=geomean_ftavg["core"],
         isat_ftavg_geomean_centroid_cm=geomean_ftavg["centroid"],
@@ -3534,6 +3576,7 @@ def export_overlay(
         ),
         isat_ftavg_upstream_time_ms=upstream_scans["time_ms"],
         isat_ftavg_upstream_a=upstream_ftavg["ftavg"],
+        isat_ftavg_upstream_subtracted_a=upstream_ftavg_legacy["ftavg"],
         isat_ftavg_upstream_sem_a=upstream_ftavg["ftavg_sem"],
         isat_ftavg_upstream_core_a=upstream_ftavg["core"],
         isat_ftavg_upstream_centroid_cm=upstream_ftavg["centroid"],
@@ -3554,6 +3597,7 @@ def export_overlay(
         ),
         isat_ftavg_time_ms=rot0_isat["time_ms"],
         isat_ftavg_a=isat_ftavg["ftavg"],
+        isat_ftavg_subtracted_a=isat_ftavg_legacy["ftavg"],
         isat_ftavg_sem_a=isat_ftavg["ftavg_sem"],
         isat_ftavg_core_a=isat_ftavg["core"],
         isat_ftavg_centroid_cm=isat_ftavg["centroid"],
@@ -3576,8 +3620,10 @@ def export_overlay(
         isat_ftavg_sem_definition=np.array(
             "per-point shot SEM (isat_a_std / sqrt(n_shots_used)) propagated "
             "through the quadrature weights in quadrature, points treated as "
-            "independent; the background's own sampling uncertainty is not "
-            "included.  This is a shot SEM and is NOT commensurate with "
+            "independent.  Since schema v35 there is no background term to "
+            "carry: nothing is subtracted from these rows (see "
+            "ftavg_background).  This is a shot SEM and is NOT commensurate "
+            "with "
             "density_total_sem_cm3, which is a radial-scatter SEM plus the "
             "Probe-A area calibration."
         ),

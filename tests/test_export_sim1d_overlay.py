@@ -1607,26 +1607,74 @@ def test_the_column_te_prior_weight_is_the_measured_share(experiment_set):
     )
 
 
-def test_the_legacy_subtracted_rows_sit_below_the_comparand_rows():
-    """The retired convention is kept, named, and is NOT the comparand."""
+#: Every area-averaged comparand and the legacy row that carries its retired,
+#: background-subtracted value.
+SUBTRACTED_LEGACY_PAIRS = (
+    ("density_ftavg_subtracted_cm3", "density_ftavg_cm3"),
+    ("density_column_subtracted_cm3", "density_column_cm3"),
+    ("isat_ftavg_upstream_subtracted_a", "isat_ftavg_upstream_a"),
+    ("isat_ftavg_subtracted_a", "isat_ftavg_a"),
+    ("isat_ftavg_geomean_subtracted_a_per_cm2", "isat_ftavg_geomean_a_per_cm2"),
+)
+
+
+def test_the_legacy_subtracted_rows_read_low_and_are_not_the_comparand():
+    """The retired convention is kept, named, and reads low on balance.
+
+    It reads low, not uniformly low, and the difference is NOT pointwise
+    one-signed.  The retired path did TWO things -- removed an edge-median
+    baseline and clipped the result at zero -- and the Isat line scans carry
+    genuinely negative cells in the far skirt (349 of 10,200 finite despiked
+    cells on the ES1 upstream face), which the clip used to lift to zero.  At
+    a sample whose baseline is itself zero, that lift is all there is, so the
+    legacy row can sit a little ABOVE its comparand; the re-derived centroid
+    moves the quadrature nodes by a hair on top of it.  What holds is the
+    MEDIAN, and the monotone statement belongs on a profile with a strictly
+    positive pedestal and no negative cells -- the test below.
+    """
     overlay = _overlay_or_skip()
     if "density_ftavg_subtracted_cm3" not in overlay.files:
         pytest.skip("the ES1 overlay on disk predates the background ruling")
 
-    for legacy, comparand in (
-        ("density_ftavg_subtracted_cm3", "density_ftavg_cm3"),
-        ("density_column_subtracted_cm3", "density_column_cm3"),
-    ):
+    for legacy, comparand in SUBTRACTED_LEGACY_PAIRS:
+        assert legacy in overlay.files, legacy
         both = np.isfinite(overlay[legacy]) & np.isfinite(overlay[comparand])
         assert both.any(), legacy
-        # Removing a non-negative pedestal can only take density away.
-        assert np.all(overlay[legacy][both] <= overlay[comparand][both] + 1e-6)
-        # And it is not a no-op: the pedestal is real plasma at these scans.
-        assert np.any(overlay[legacy][both] < overlay[comparand][both])
+        relative = (
+            overlay[legacy][both] - overlay[comparand][both]
+        ) / overlay[comparand][both]
+        # The retired convention took signal away from the typical sample.
+        assert np.median(relative) < 0.0, legacy
+        assert legacy in str(overlay["subtracted_legacy_definition"]), legacy
 
     ruling = str(overlay["ftavg_background"])
     assert "NO BACKGROUND IS SUBTRACTED" in ruling
-    assert "end of the shot" in ruling.lower() or "END OF THE SHOT" in ruling
+    assert "END OF THE SHOT" in ruling
+    assert "NOTHING IN THIS PRODUCT STILL SUBTRACTS." in ruling
+
+
+def test_a_positive_pedestal_is_what_the_retired_convention_removed():
+    """The monotone statement, on a profile where only the baseline differs.
+
+    The ledger's baseline is the median of the outermost three samples, which
+    on a monotone skirt is the middle one, |x| = 24 cm -- so what it removes
+    is the pedestal PLUS whatever the Gaussian still has out there, and the
+    weights summing to one for a uniform profile make the area average drop by
+    exactly that much.
+    """
+    pedestal = 0.4
+    profile = pedestal + np.exp(-((X_CM / 9.0) ** 2))
+    removed = pedestal + np.exp(-((24.0 / 9.0) ** 2))
+
+    comparand = _flux_tube_profile_stats(
+        profile, X_CM, subtract_background=False
+    )
+    legacy = _flux_tube_profile_stats(profile, X_CM, subtract_background=True)
+
+    assert profile.min() > 0.0  # nothing for the retired clip to lift
+    assert comparand["ftavg"] - legacy["ftavg"] == pytest.approx(
+        removed, rel=1e-9
+    )
 
 
 TE_FILLED_HDF5 = Path("processed/te_filled.hdf5")
