@@ -16,10 +16,15 @@ from scripts.export_es1_sim1d_overlay import (
     _despike_profile,
     _discharge_stats,
     _flux_tube_profile_stats,
+    _flux_tube_te_series,
+    _flux_tube_te_stats,
     _flow_symmetrized_profiles,
     _flux_tube_weights,
+    _interp_onto_time_grid,
     _interferometer_decay_stats,
     _isat_decay_geomean,
+    _measured_coverage_cm,
+    _weighted_mean_and_sem,
     _plateau_current_a,
     _rot0_isat_profiles,
     _subtract_background,
@@ -145,6 +150,180 @@ def test_flux_tube_average_weights_the_outer_radii_more_than_the_core_mean():
     peaked = np.exp(-((X_CM / 8.0) ** 2))
     stats = _flux_tube_profile_stats(peaked, X_CM)
     assert stats["core"] > stats["ftavg"]
+
+
+# ---------------------------------------------------------------------------
+# The flux-tube T_e comparand: density-weighted, plain, and its coverage
+# ---------------------------------------------------------------------------
+#: A density profile that is FLAT across the whole integration disc and tapers
+#: outside it, so the scalar background is well defined and the despike gate
+#: sees no step.  Same shape as the flat-column density test above.
+_TAPER = {21: 2.0, 22: 1.0, 23: 0.5, 24: 0.25, 25: 0.0}
+
+
+def _flat_density(level=3.0):
+    return np.array(
+        [_TAPER.get(int(abs(position)), level) for position in X_CM],
+        dtype=np.float64,
+    )
+
+
+def _peaked(width_cm, pedestal=0.0, amplitude=1.0):
+    """A smooth Gaussian the despike gate leaves alone."""
+    return pedestal + amplitude * np.exp(-((X_CM / width_cm) ** 2))
+
+
+def _core_band_mean(profile):
+    band = (X_CM >= X_MIN_CM) & (X_CM <= X_MAX_CM)
+    return float(np.mean(np.asarray(profile)[band]))
+
+
+def test_flat_te_on_flat_density_gives_the_core_value_under_both_weightings():
+    """(i) Nothing to weight and nothing to average: all three agree."""
+    te = np.full(X_CM.size, 4.25)
+    stats = _flux_tube_te_stats(te, _flat_density(), X_CM)
+
+    assert stats["n_despiked"] == 0
+    assert stats["ftavg"] == pytest.approx(4.25, rel=1e-12)
+    assert stats["plain"] == pytest.approx(4.25, rel=1e-12)
+    assert stats["plain"] == pytest.approx(_core_band_mean(te), rel=1e-12)
+    # A flat profile has no radial scatter, so the scatter SEM is zero.
+    assert stats["ftavg_sem"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_a_peaked_te_on_a_flat_density_weights_to_its_own_plain_area_mean():
+    """(ii) A flat weight is no weight; both fall below the core-band mean."""
+    te = _peaked(8.0, pedestal=1.0, amplitude=4.0)
+    stats = _flux_tube_te_stats(te, _flat_density(), X_CM)
+
+    assert stats["n_despiked"] == 0
+    assert stats["ftavg"] == pytest.approx(stats["plain"], rel=1e-12)
+    # The area average reaches radii the core-band line cut never sees, and
+    # T_e is lower out there.
+    assert stats["plain"] < _core_band_mean(te)
+
+
+def test_a_peaked_density_pulls_the_te_average_above_the_plain_one():
+    """(iii) The weight is largest where T_e is hottest."""
+    te = _peaked(8.0, pedestal=1.0, amplitude=4.0)
+    density = _peaked(9.0, pedestal=0.0, amplitude=1.0)
+    stats = _flux_tube_te_stats(te, density, X_CM)
+
+    assert stats["ftavg"] > stats["plain"]
+    assert stats["plain"] < _core_band_mean(te)
+
+
+def test_the_te_weight_denominator_is_the_exported_density_flux_tube_average():
+    """The two rows must be one quantity: same nodes, same weights."""
+    te = _peaked(8.0, pedestal=1.0, amplitude=4.0)
+    density = _peaked(9.0, pedestal=0.0, amplitude=1.0)
+
+    stats = _flux_tube_te_stats(te, density, X_CM)
+    density_only = _flux_tube_profile_stats(density, X_CM)
+
+    assert stats["weight_density"] == pytest.approx(
+        density_only["ftavg"], rel=1e-12
+    )
+    assert stats["centroid"] == pytest.approx(density_only["centroid"], rel=1e-12)
+
+
+def test_the_weighted_scatter_sem_reduces_to_the_core_band_convention():
+    """Equal weights must give back std(ddof=1)/sqrt(N), the core-band form."""
+    values = np.array([1.0, 2.0, 4.0, 8.0, 9.0])
+    mean, sem = _weighted_mean_and_sem(values, np.full(values.size, 0.37))
+
+    assert mean == pytest.approx(values.mean())
+    assert sem == pytest.approx(values.std(ddof=1) / np.sqrt(values.size))
+
+
+def test_the_te_average_carries_the_semi_quantitative_weight_it_integrates():
+    te = np.full(X_CM.size, 3.0)
+    marks = np.abs(X_CM) > 12.0
+    stats = _flux_tube_te_stats(
+        te, _flat_density(), X_CM, semi_quantitative=marks
+    )
+
+    inside = int(np.count_nonzero(marks & (np.abs(X_CM) <= FLUX_TUBE_RADIUS_CM)))
+    # Every marked cell inside the tube, plus the ONE sample just outside it
+    # that carries the quadrature's closing weight at r = R.
+    assert stats["semi_quant_count"] == inside + 1
+    # 2 r dr weighting: the marked annulus 12 to 18.415 cm is most of the disc.
+    assert 0.4 < stats["semi_quant_weight"] < 0.9
+
+
+def test_a_density_profile_that_stops_short_of_the_radius_gives_no_te_row():
+    short_x = np.linspace(-9.0, 9.0, 19)
+    stats = _flux_tube_te_stats(
+        np.full(short_x.size, 3.0), np.full(short_x.size, 1.0), short_x
+    )
+
+    assert np.isnan(stats["ftavg"]) and np.isnan(stats["plain"])
+
+
+def test_the_te_series_refuses_grids_that_are_not_the_same_shape():
+    with pytest.raises(ValueError, match="same"):
+        _flux_tube_te_series(
+            np.ones((2, X_CM.size, 3)), np.ones((2, X_CM.size, 4)), X_CM
+        )
+
+
+def test_coverage_is_the_outermost_measured_radius_capped_at_the_trust_radius():
+    """(iv) A row measured only to 10 cm must say so, per port and sample."""
+    n_t = 2
+    measured = np.full((3, X_CM.size, n_t), np.nan)
+    measured[0, np.abs(X_CM) <= 10.0, :] = 3.0   # truncated at 10 cm
+    measured[1, np.abs(X_CM) <= 22.0, :] = 3.0   # measured past the aperture
+    measured[2, np.abs(X_CM) <= 22.0, :] = 3.0   # measured, but untrusted port
+    trust = np.array([18.415, 18.415, 10.0])
+    rows = np.array([[7, 7], [7, 7], [7, 7]], dtype=np.int16)
+
+    coverage = _measured_coverage_cm(measured, X_CM, trust, rows)
+
+    assert coverage[0].tolist() == [10.0, 10.0]
+    assert coverage[1].tolist() == [18.415, 18.415]
+    assert coverage[2].tolist() == [10.0, 10.0]
+    prior = ~(coverage >= FLUX_TUBE_RADIUS_CM)
+    assert prior[0].tolist() == [True, True]
+    assert prior[1].tolist() == [False, False]
+    assert prior[2].tolist() == [True, True]
+
+
+def test_a_prior_derived_row_has_no_coverage_and_is_flagged():
+    measured = np.full((1, X_CM.size, 2), np.nan)
+    measured[0, np.abs(X_CM) <= 22.0, 0] = 3.0
+    trust = np.array([18.415])
+    # The product itself calls the row prior-derived at both samples.
+    rows = np.array([[0, 0]], dtype=np.int16)
+
+    coverage = _measured_coverage_cm(measured, X_CM, trust, rows)
+
+    assert np.isnan(coverage).all()
+    assert (~(coverage >= FLUX_TUBE_RADIUS_CM)).all()
+
+
+def test_the_density_weight_is_moved_onto_the_te_clock_without_inventing_cells():
+    source_time = np.array([0.375, 0.875, 1.375, 1.875])
+    target_time = np.array([0.0, 0.5, 1.0, 1.5])
+    profiles = np.array([[[1.0, 2.0, np.nan, 4.0], [1.0, 1.0, 1.0, 1.0]]])
+
+    moved = _interp_onto_time_grid(profiles, source_time, target_time)
+
+    # Before the first source sample np.interp holds its finite end value.
+    assert moved[0, 0, 0] == pytest.approx(1.0)
+    assert moved[0, 0, 1] == pytest.approx(1.25)
+    # Both target samples bracketed by the non-finite source sample are gone,
+    # rather than filled in from the finite samples further away.
+    assert np.isnan(moved[0, 0, 2]) and np.isnan(moved[0, 0, 3])
+    assert np.allclose(moved[0, 1], 1.0)
+
+
+def test_a_cell_with_one_finite_sample_does_not_reach_the_te_clock():
+    source_time = np.array([0.0, 1.0, 2.0])
+    profiles = np.array([[[np.nan, 5.0, np.nan]]])
+
+    moved = _interp_onto_time_grid(profiles, source_time, np.array([0.5, 1.5]))
+
+    assert np.isnan(moved).all()
 
 
 def test_despike_repairs_an_isolated_bracketed_spike():
@@ -439,6 +618,12 @@ def _write_te_records(path, *, omit=(), core_band=(X_MIN_CM, X_MAX_CM)):
         "te_row_measured_core_cells": np.array(
             [[5, 5, 5], [5, 5, 5], [5, 5, 5], [0, 0, 0], [0, 0, 0]], dtype=np.int16
         ),
+        "te_masked": np.where(
+            np.abs(X_CM)[None, :, None] <= 10.0,
+            3.0,
+            np.nan,
+        ).repeat(5, axis=0).repeat(3, axis=2),
+        "te_semi_quantitative": np.zeros((5, X_CM.size, 3), dtype=bool),
     }
     with h5py.File(path, "w") as hdf:
         group = hdf.create_group("experiment_sets/1")
@@ -470,6 +655,12 @@ def test_te_records_are_read_off_the_filled_product(tmp_path):
     assert records["core_control_source"].tolist() == [1, 1, 1, 2, 2]
     assert records["row_measured_cells"][:, 0].tolist() == [7, 7, 7, 0, 0]
     assert records["row_measured_core_cells"][:, 0].tolist() == [5, 5, 5, 0, 0]
+    # The two per-cell grids the flux-tube T_e rows stand on come out too.
+    assert records["measured_te"].shape == (5, X_CM.size, 3)
+    assert records["semi_quantitative"].shape == (5, X_CM.size, 3)
+    assert np.isfinite(records["measured_te"][0, :, 0]).sum() == int(
+        np.count_nonzero(np.abs(X_CM) <= 10.0)
+    )
 
 
 def test_a_row_with_no_measured_cell_is_flagged_prior_derived(tmp_path):
@@ -869,6 +1060,40 @@ def test_the_exported_overlay_carries_both_faces_and_the_chords():
     assert overlay["interf_decay_z_cm"].shape == (n_chords,)
     assert overlay["interf_decay_n_shots"].shape == (n_chords,)
     assert overlay["interf_decay_run_ids"].shape[0] == n_chords
+
+
+def test_the_exported_overlay_carries_the_flux_tube_te_comparand():
+    """The placed product, when it is a flux-tube-T_e vintage."""
+    overlay = _overlay_or_skip()
+    if "te_ftavg_ev" not in overlay.files:
+        pytest.skip("the ES1 overlay on disk predates the flux-tube T_e rows")
+
+    shape = overlay["te_mean_ev"].shape
+    for key in (
+        "te_ftavg_ev",
+        "te_ftavg_sem_ev",
+        "te_ftavg_radial_sem_ev",
+        "te_ftavg_plain_ev",
+        "te_ftavg_plain_sem_ev",
+        "te_ftavg_weight_density_cm3",
+        "te_ftavg_centroid_cm",
+        "ftavg_coverage_cm",
+        "ftavg_prior_beyond_coverage",
+    ):
+        assert overlay[key].shape == shape, key
+    assert np.array_equal(overlay["te_ftavg_time_ms"], overlay["te_time_ms"])
+
+    # The core-band row is a line cut through the hot axis; the area average
+    # over the same profile reaches the cold outer radii and must sit below
+    # it, and the density weighting must pull it back above the plain one.
+    finite = np.isfinite(overlay["te_ftavg_ev"]) & np.isfinite(overlay["te_mean_ev"])
+    assert finite.any()
+    assert np.all(overlay["te_ftavg_ev"][finite] < overlay["te_mean_ev"][finite])
+    assert np.all(overlay["te_ftavg_ev"][finite] >= overlay["te_ftavg_plain_ev"][finite])
+
+    # Every p50 row integrates over a disc the measurement does not fill.
+    p50 = int(np.flatnonzero(overlay["port"] == 50)[0])
+    assert overlay["ftavg_prior_beyond_coverage"][p50].all()
 
 
 def test_the_exported_geomean_is_the_two_faces_area_normalized_geometric_mean():
