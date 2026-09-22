@@ -104,8 +104,9 @@ def _rot180_line_integrals(
         te_interp = _interp_te_to_times(te_filled[z_idx, :, :], te_time_ms, time_ms)
         cs = ion_sound_speed_m_s(te_interp, M_I_AMU)
         probe = _probe_id(run_id)
+        # The density carries the measured sign of every cell; a negative
+        # far-skirt cell is noise about zero, not a missing measurement.
         density = electron_density_m3(grp["isat_a"][()], ap_r_m2[probe], cs)
-        density = np.where((density > 0) & np.isfinite(density), density, np.nan)
         line = np.array([_line_integral_cm2(density[:, ti], x_m) for ti in range(density.shape[1])])
         entries.append((z_cm, time_ms, line, run_id))
 
