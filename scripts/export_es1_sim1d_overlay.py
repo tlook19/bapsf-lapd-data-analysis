@@ -641,7 +641,11 @@ def _flux_tube_te_stats(
     ledger's scalar background, clip at zero, drop non-finite cells, fold about
     the profile centroid, integrate to ``radius_cm`` -- so the returned
     ``weight_density`` is the same number that function returns as ``ftavg``,
-    and the quadrature nodes and weights are the same ones.
+    and the quadrature nodes and weights are the same ones.  That holds WHERE
+    T_e IS FINITE WHEREVER THE DENSITY IS, since a non-finite T_e cell would
+    drop a node the density chain keeps; it is true of every filled T_e
+    product in this repo, which carry zero non-finite cells by construction of
+    the fill.
 
     The T_e side is despiked on the same gate and then NOT
     background-subtracted and NOT clipped: T_e does not fall to zero at the
@@ -2800,7 +2804,21 @@ def export_overlay(
             "T_e is E_e / (3/2 n).  te_ftavg_plain_ev is the UNWEIGHTED area "
             "mean of the same profile over the same quadrature, "
             "int 2 pi r T_e dr / (pi R^2); it is printed beside the weighted "
-            "row as the weighting's size and is NOT the comparand.  Both are "
+            "row as the weighting's size and is NOT the comparand.  WHICH OF "
+            "THE TWO IS LARGER IS NOT FIXED.  With w the quadrature weights "
+            "and <.> the w-normalized average, te_ftavg_ev - te_ftavg_plain_ev "
+            "= cov_w(n, T_e) / <n> exactly, so the weighted row sits ABOVE the "
+            "plain one only where n and T_e correlate POSITIVELY across the "
+            "disc -- the ordinary peaked-column case -- and BELOW it wherever "
+            "they anti-correlate, which happens at a hollow density profile "
+            "and wherever the density is at the noise floor and its shape is "
+            "no longer the column's.  Both orderings occur in these products, "
+            "sample by sample; it is the PLATEAU-WINDOW MEAN that is ordered "
+            "plain < weighted < core at every port of every set, and a "
+            "per-sample ordering must not be assumed.  The same caveat "
+            "applies to te_mean_ev as an upper bound: a sample can read "
+            "te_ftavg_ev above its own core-band row where the profile is "
+            "flat or inverted across the band edge.  Both are "
             "reduced with the same machinery as density_ftavg_cm3 -- same "
             "despike gate, same trapezoidal quadrature closed at r = 0 and "
             "r = R, same centroid fold -- and BOTH fold about the DENSITY "
@@ -2871,8 +2889,19 @@ def export_overlay(
             "te_trust_blend_cm it reports the prior alone, so a measured cell "
             "out there is not what the product reports.  It is NaN where the "
             "row is prior-derived at that sample (te_row_measured == False), "
-            "and it is stated in scan |x|, not in the quadrature's "
-            "centroid-folded radius; the two differ by te_ftavg_centroid_cm.  "
+            "and it is stated in scan |x|, NOT in the quadrature's "
+            "centroid-folded radius r = |x - x_c|.  THE TWO FRAMES ARE NOT "
+            "INTERCHANGEABLE AND THE OFFSET IS NOT SMALL: the shift is "
+            "te_ftavg_centroid_cm, whose magnitude runs to several cm at the "
+            "clean sets (ES1 median 0.7 cm, 95th percentile 2.3 cm) and to "
+            "TENS of cm at the high-puff sets, where the density profile is "
+            "at the noise floor and its intensity centroid wanders -- ES3 "
+            "reaches a 95th percentile of 6.7 cm and a maximum of 24.0 cm, "
+            "past the scan edge itself, and ES4 a 95th percentile of 11.1 cm. "
+            " Where the centroid is offset by that much, a coverage of "
+            "10.0 cm in scan |x| does not map onto a 10.0 cm annulus of the "
+            "integrated disc, and the flag is the reliable statement while "
+            "the radius is indicative.  "
             "ftavg_prior_beyond_coverage is True wherever "
             "ftavg_coverage_cm < ftavg_radius_cm, including where the coverage "
             "is NaN: True means part of the disc the T_e average integrates "

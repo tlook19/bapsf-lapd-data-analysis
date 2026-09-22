@@ -173,6 +173,16 @@ def _peaked(width_cm, pedestal=0.0, amplitude=1.0):
     return pedestal + amplitude * np.exp(-((X_CM / width_cm) ** 2))
 
 
+def _hollow_density(ring_cm=12.0, width_cm=6.0):
+    """A HOLLOW column: an annular density peak with a depressed axis.
+
+    Still falls away at the scan edge, so the ledger's scalar background is
+    small and the profile survives the clip; what makes it hollow is that it
+    is lowest exactly where a peaked T_e is hottest.
+    """
+    return np.exp(-(((np.abs(X_CM) - ring_cm) / width_cm) ** 2))
+
+
 def _core_band_mean(profile):
     band = (X_CM >= X_MIN_CM) & (X_CM <= X_MAX_CM)
     return float(np.mean(np.asarray(profile)[band]))
@@ -211,6 +221,108 @@ def test_a_peaked_density_pulls_the_te_average_above_the_plain_one():
 
     assert stats["ftavg"] > stats["plain"]
     assert stats["plain"] < _core_band_mean(te)
+
+
+def _quadrature_nodes(density_profile, te_profile, x_cm):
+    """The quadrature nodes, weights and values, from the single-source parts.
+
+    Assembles what the average is taken over -- despiked and
+    background-subtracted density, despiked T_e, the centroid fold and
+    ``_flux_tube_weights`` -- WITHOUT taking the average, so a test can form
+    the two quadrature sums itself and check the reduction against them.
+    Returns ``None`` where the reduction is not defined.
+    """
+    density, _ = _despike_profile(density_profile)
+    density = _subtract_background(density)
+    te, _ = _despike_profile(te_profile)
+    finite = np.isfinite(density) & np.isfinite(te)
+    if np.count_nonzero(finite) < 5:
+        return None
+    values = np.clip(density[finite], 0.0, None)
+    total = float(np.sum(values))
+    if total <= 0.0:
+        return None
+    centroid = float(np.sum(values * x_cm[finite]) / total)
+    try:
+        weights = _flux_tube_weights(
+            np.abs(x_cm[finite] - centroid), FLUX_TUBE_RADIUS_CM
+        )
+    except ValueError:
+        return None
+    return weights, values, te[finite]
+
+
+def _assert_is_the_two_quadrature_sums(stats, nodes):
+    """``ftavg`` is sum w n T / sum w n and ``plain`` is sum w T / sum w.
+
+    Where no weight-carrying node holds any density -- ``sum w n == 0``, which
+    the placed products do reach at a noise-floor row -- the weighted average
+    is not defined and must be NaN while the plain one stays finite.
+    """
+    weights, density, te = nodes
+    assert stats["plain"] == pytest.approx(
+        float(weights @ te) / float(weights.sum()), rel=1e-12
+    )
+    weighted = weights * density
+    if float(weighted.sum()) <= 0.0:
+        assert np.isnan(stats["ftavg"])
+        return
+    assert stats["ftavg"] == pytest.approx(
+        float(weighted @ te) / float(weighted.sum()), rel=1e-12
+    )
+
+
+def _assert_the_gap_is_the_weighted_covariance(stats, nodes):
+    """``ftavg - plain == cov_w(n, T_e) / <n>_w``, the sign-carrying identity."""
+    weights, density, te = nodes
+    normalized = weights / weights.sum()
+    mean_n = float(normalized @ density)
+    if mean_n <= 0.0:
+        assert np.isnan(stats["ftavg"])
+        return
+    covariance = float(normalized @ (density * te)) - mean_n * float(normalized @ te)
+    assert stats["ftavg"] - stats["plain"] == pytest.approx(
+        covariance / mean_n, rel=1e-9, abs=1e-12
+    )
+
+
+def test_the_weighted_row_is_the_density_weighted_quadrature_on_the_same_nodes():
+    """The property the two rows actually have: one quadrature, two weightings."""
+    te = _peaked(8.0, pedestal=1.0, amplitude=4.0)
+    density = _peaked(9.0, pedestal=0.0, amplitude=1.0)
+
+    stats = _flux_tube_te_stats(te, density, X_CM)
+    nodes = _quadrature_nodes(density, te, X_CM)
+
+    _assert_is_the_two_quadrature_sums(stats, nodes)
+    _assert_the_gap_is_the_weighted_covariance(stats, nodes)
+
+
+def test_the_two_rows_differ_by_the_weighted_covariance_of_density_and_te():
+    """Which row is larger is the SIGN of that covariance, and nothing else."""
+    te = _peaked(8.0, pedestal=1.0, amplitude=4.0)
+    for density in (
+        _peaked(9.0, amplitude=1.0),   # peaked with T_e: positive covariance
+        _flat_density(1.0),            # flat across the disc: zero
+        _hollow_density(),             # ring: negative
+    ):
+        stats = _flux_tube_te_stats(te, density, X_CM)
+        _assert_the_gap_is_the_weighted_covariance(
+            stats, _quadrature_nodes(density, te, X_CM)
+        )
+
+
+def test_a_hollow_density_puts_the_weighted_average_below_the_plain_one():
+    """The ordering is NOT universal: anti-correlated n and T_e invert it.
+
+    This is why no per-sample ``ftavg >= plain`` assertion may be made against
+    a real product.  A hollow density weights the cold outer radii hardest.
+    """
+    te = _peaked(8.0, pedestal=1.0, amplitude=4.0)
+
+    stats = _flux_tube_te_stats(te, _hollow_density(), X_CM)
+
+    assert stats["ftavg"] < stats["plain"]
 
 
 def test_the_te_weight_denominator_is_the_exported_density_flux_tube_average():
@@ -601,6 +713,44 @@ def test_geomean_refuses_two_readings_of_the_same_face():
 # ---------------------------------------------------------------------------
 # The filled T_e product's trust and semi-quantitative records
 # ---------------------------------------------------------------------------
+def _window_mean(values, time_ms, window=RAW_PLATEAU_WINDOW_MS):
+    """Per-port mean over the scoring plateau window, NaN-safe and warning-free."""
+    band = np.asarray(values, dtype=np.float64)[
+        :, (time_ms >= window[0]) & (time_ms <= window[1])
+    ]
+    finite = np.isfinite(band)
+    counts = finite.sum(axis=1)
+    out = np.full(band.shape[0], np.nan)
+    covered = counts > 0
+    out[covered] = (
+        np.where(finite, band, 0.0)[covered].sum(axis=1) / counts[covered]
+    )
+    return out
+
+
+def _plateau_ordering_margins_ev(core, ftavg, plain, time_ms):
+    """Assert plain < weighted < core ON THE PLATEAU-WINDOW MEANS; return margins.
+
+    This is a WINDOW-MEAN property and is asserted as one.  The per-sample
+    ordering is not a property of these rows at all: the gap between the
+    weighted and the plain row is cov_w(n, T_e) / <n>, which changes sign
+    wherever the density and T_e anti-correlate across the disc.
+    """
+    means = [_window_mean(v, time_ms) for v in (core, ftavg, plain)]
+    rows = np.isfinite(means[0]) & np.isfinite(means[1]) & np.isfinite(means[2])
+    assert rows.any(), "no port carries a plateau-window mean"
+    core_mean, ftavg_mean, plain_mean = (m[rows] for m in means)
+    assert np.all(plain_mean < ftavg_mean), (
+        "the density weighting must lift the plateau-mean T_e above the plain "
+        f"area mean: {plain_mean} vs {ftavg_mean}"
+    )
+    assert np.all(ftavg_mean < core_mean), (
+        "the area average reaches radii the core-band line cut never sees and "
+        f"must sit below it: {ftavg_mean} vs {core_mean}"
+    )
+    return list(zip(ftavg_mean - plain_mean, core_mean - ftavg_mean))
+
+
 def _write_te_records(path, *, omit=(), core_band=(X_MIN_CM, X_MAX_CM)):
     records = {
         "core_mean_te_monotonic_clamped": np.zeros((5, 3), dtype=bool),
@@ -1083,17 +1233,91 @@ def test_the_exported_overlay_carries_the_flux_tube_te_comparand():
         assert overlay[key].shape == shape, key
     assert np.array_equal(overlay["te_ftavg_time_ms"], overlay["te_time_ms"])
 
-    # The core-band row is a line cut through the hot axis; the area average
-    # over the same profile reaches the cold outer radii and must sit below
-    # it, and the density weighting must pull it back above the plain one.
-    finite = np.isfinite(overlay["te_ftavg_ev"]) & np.isfinite(overlay["te_mean_ev"])
-    assert finite.any()
-    assert np.all(overlay["te_ftavg_ev"][finite] < overlay["te_mean_ev"][finite])
-    assert np.all(overlay["te_ftavg_ev"][finite] >= overlay["te_ftavg_plain_ev"][finite])
+    # The ordering of the three rows is a PLATEAU-WINDOW-MEAN property and is
+    # asserted as one.  Per SAMPLE it does not hold and must not be asserted:
+    # te_ftavg_ev - te_ftavg_plain_ev is cov_w(n, T_e) / <n>, which changes
+    # sign wherever n and T_e anti-correlate across the disc, and a flat or
+    # inverted profile across the core-band edge can put a sample above its
+    # own core-band row.  See the two synthetic tests above.
+    assert _plateau_ordering_margins_ev(
+        overlay["te_mean_ev"],
+        overlay["te_ftavg_ev"],
+        overlay["te_ftavg_plain_ev"],
+        overlay["te_time_ms"],
+    )
 
     # Every p50 row integrates over a disc the measurement does not fill.
     p50 = int(np.flatnonzero(overlay["port"] == 50)[0])
     assert overlay["ftavg_prior_beyond_coverage"][p50].all()
+
+
+TE_FILLED_HDF5 = Path("processed/te_filled.hdf5")
+DENSITY_PROFILES_HDF5 = Path("processed/density_profiles_isweep.hdf5")
+
+
+def test_the_flux_tube_te_rows_rebuilt_from_the_placed_profile_products():
+    """The rows REGENERATED from the real inputs, at every experiment set.
+
+    The placed overlay npz can be any vintage, so the test above skips on an
+    old one; this one does not depend on it.  It rebuilds the flux-tube T_e
+    rows from the two profile products the exporter reads, with the exporter's
+    own functions, and checks the two things that must hold of them:
+
+    * each row IS the two quadrature sums over its nodes, and the gap between
+      them IS the weighted covariance of density and T_e -- exactly, at every
+      port and every sample;
+    * the PLATEAU-WINDOW MEANS are ordered plain < weighted < core at every
+      port.  Per sample they are not, and nothing here asserts that they are.
+    """
+    if not (TE_FILLED_HDF5.exists() and DENSITY_PROFILES_HDF5.exists()):
+        pytest.skip("the placed T_e / density profile products are not on disk")
+
+    checked_sets = 0
+    with h5py.File(TE_FILLED_HDF5, "r") as te_hdf, h5py.File(
+        DENSITY_PROFILES_HDF5, "r"
+    ) as density_hdf:
+        x_cm = density_hdf["x_cm"][()]
+        shared = sorted(
+            set(te_hdf["experiment_sets"]) & set(density_hdf["experiment_sets"])
+        )
+        for set_id in shared:
+            te_group = te_hdf[f"experiment_sets/{set_id}"]
+            density_group = density_hdf[f"experiment_sets/{set_id}"]
+            if not np.allclose(te_group["x_cm"][()], x_cm):
+                pytest.skip(f"ES{set_id} radial grids differ between products")
+            te_profiles = te_group["te_filled"][()]
+            te_time_ms = te_group["cycle_time_ms"][()]
+            weight = _interp_onto_time_grid(
+                density_group["n_e_m3"][()],
+                density_group["inter_sweep_time_s"][()] * 1000.0,
+                te_time_ms,
+            )
+            rows = _flux_tube_te_series(te_profiles, weight, x_cm)
+
+            n_z, _, n_t = te_profiles.shape
+            for zi in range(n_z):
+                for ti in range(n_t):
+                    nodes = _quadrature_nodes(
+                        weight[zi, :, ti], te_profiles[zi, :, ti], x_cm
+                    )
+                    stats = {
+                        "ftavg": rows["ftavg"][zi, ti],
+                        "plain": rows["plain"][zi, ti],
+                    }
+                    if nodes is None:
+                        assert np.isnan(stats["ftavg"])
+                        assert np.isnan(stats["plain"])
+                        continue
+                    _assert_is_the_two_quadrature_sums(stats, nodes)
+                    _assert_the_gap_is_the_weighted_covariance(stats, nodes)
+
+            core_mean, _, _, _ = _nan_core_stats(te_profiles, x_cm, X_MIN_CM, X_MAX_CM)
+            _plateau_ordering_margins_ev(
+                core_mean, rows["ftavg"], rows["plain"], te_time_ms
+            )
+            checked_sets += 1
+
+    assert checked_sets >= 1
 
 
 def test_the_exported_geomean_is_the_two_faces_area_normalized_geometric_mean():
