@@ -369,6 +369,105 @@ def test_a_negative_weight_is_carried_and_the_mean_may_leave_its_own_range():
     assert mean > values.max()  # outside the range of its own nodes
 
 
+def test_a_non_positive_column_reports_an_axial_area_mean_and_no_temperature():
+    """The ES4 p50 state: a whole column whose intensity sums non-positive.
+
+    Such a column has NO CENTROID -- an intensity-weighted mean position is
+    undefined for a non-positive intensity -- but it is still a MEASUREMENT of
+    a port with no plasma left in it, and NaN would say otherwise.  The row is
+    reported on the one fold centre that needs no intensity, the geometric
+    axis x = 0, and carries the SIGNED AREA MEAN in the row's own units.  The
+    T_e rows, ratios over that same non-positive weight, stay NaN, and the
+    weight-density field carries the denominator that refused.
+    """
+    # Noise about zero with a net negative sum, and no step the despike gate
+    # would repair: a slow cosine ripple sitting below zero.
+    column = -1.0 + 0.5 * np.cos(X_CM * (np.pi / 12.5))
+    assert np.sum(column) < 0.0  # the premise, measured not assumed
+
+    density = _flux_tube_profile_stats(column, X_CM, subtract_background=False)
+
+    axial_weights = _flux_tube_weights(np.abs(X_CM), FLUX_TUBE_RADIUS_CM)
+    expected = float(axial_weights @ column) / float(axial_weights.sum())
+    assert density["ftavg"] == pytest.approx(expected, rel=1e-12)
+    assert density["ftavg"] < 0.0
+    # An AREA MEAN, in the row's own units -- it sits between the extremes of
+    # the profile it averages, which a sum over 51 cells could not.
+    assert column.min() <= density["ftavg"] <= column.max()
+    assert abs(density["ftavg"]) < abs(float(np.sum(column)))
+    # No centroid exists; the extent the weights were formed over is reported.
+    assert np.isnan(density["centroid"])
+    assert density["edge"] == pytest.approx(FLUX_TUBE_RADIUS_CM)
+    assert np.isnan(density["ftavg_sem"])
+    assert np.isnan(density["scatter_sem"])
+
+    # The whole-column convention folds about the same axis, out to the scan
+    # limit, and does NOT take the tube-area renormalization there -- which is
+    # what makes pi R^2 times the row a consistent inventory.
+    column_stats = _flux_tube_profile_stats(
+        column,
+        X_CM,
+        radius_cm=None,
+        normalize_radius_cm=FLUX_TUBE_RADIUS_CM,
+        subtract_background=False,
+    )
+    scan_limit = float(np.max(np.abs(X_CM)))
+    scan_weights = _flux_tube_weights(np.abs(X_CM), scan_limit)
+    assert column_stats["edge"] == pytest.approx(scan_limit)
+    assert column_stats["ftavg"] == pytest.approx(
+        float(scan_weights @ column) / float(scan_weights.sum()), rel=1e-12
+    )
+
+    te = _flux_tube_te_stats(
+        _peaked(8.0, pedestal=1.0, amplitude=4.0),
+        column,
+        X_CM,
+        subtract_background=False,
+    )
+
+    assert np.isnan(te["ftavg"])
+    assert np.isnan(te["plain"])
+    assert np.isnan(te["ftavg_sem"])
+    assert np.isnan(te["plain_sem"])
+    # The denominator is exported beside the refusal, and is the same number
+    # the density row carries.
+    assert te["weight_density"] == pytest.approx(density["ftavg"], rel=1e-12)
+
+
+def test_a_column_with_plasma_is_untouched_by_the_non_positive_rule():
+    """The rule is inert wherever the column sums positive, which is everywhere else."""
+    column = _peaked(9.0, pedestal=0.0, amplitude=1.0)
+    stats = _flux_tube_profile_stats(column, X_CM, subtract_background=False)
+
+    assert np.isfinite(stats["ftavg"])
+    assert np.isfinite(stats["centroid"])
+    assert np.isfinite(stats["edge"])
+    # The CENTROID fold is the one that was used, not the axial fallback: for
+    # an off-axis column the two give different numbers, and this is the
+    # centroid one.
+    offset = np.exp(-(((X_CM - 6.0) / 9.0) ** 2))
+    off_stats = _flux_tube_profile_stats(offset, X_CM, subtract_background=False)
+    assert off_stats["centroid"] == pytest.approx(6.0, abs=0.5)
+    axial_weights = _flux_tube_weights(np.abs(X_CM), FLUX_TUBE_RADIUS_CM)
+    axial_mean = float(axial_weights @ offset) / float(axial_weights.sum())
+    assert off_stats["ftavg"] != pytest.approx(axial_mean, rel=1e-3)
+
+
+def test_the_legacy_subtracted_chain_keeps_refusing_a_column_it_erased():
+    """The signed-total rule does not reach the clipped legacy rows.
+
+    ``subtract_background=True`` clips at zero, so its total can only ever
+    reach the boundary, and a zero there means the retired subtraction erased
+    the profile rather than that the column measured negative.  Those rows
+    exist to reproduce the retired METHOD, so they keep returning NaN --
+    see ``test_the_retired_subtraction_erases_a_flat_profile_entirely``.
+    """
+    column = -1.0 + 0.5 * np.cos(X_CM * (np.pi / 12.5))
+    stats = _flux_tube_profile_stats(column, X_CM, subtract_background=True)
+
+    assert np.isnan(stats["ftavg"])
+
+
 def test_a_negative_weighted_variance_is_refused_rather_than_floored():
     """A negative scatter variance is undefined, and must not read as zero.
 

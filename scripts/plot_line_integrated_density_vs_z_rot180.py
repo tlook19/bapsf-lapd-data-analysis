@@ -43,7 +43,15 @@ def _probe_id(run_id: str) -> str:
 
 
 def _line_integral_cm2(profile_m3: np.ndarray, x_m: np.ndarray) -> float:
-    valid = np.isfinite(profile_m3) & (profile_m3 > 0)
+    """Integrate a SIGNED radial density profile across the scan, in cm^-2.
+
+    Every cell that carries a measurement enters with its measured sign.  A
+    negative far-skirt cell is noise about zero, not a missing measurement, and
+    dropping it would keep only the upward half of that noise and bias the
+    integral high -- the retired sign test, by another route.  NaN means no
+    usable measurement and is the only thing excluded.
+    """
+    valid = np.isfinite(profile_m3)
     if valid.sum() < 2:
         return np.nan
     return float(np.trapezoid(profile_m3[valid], x_m[valid]) / 1e4)
@@ -104,8 +112,9 @@ def _rot180_line_integrals(
         te_interp = _interp_te_to_times(te_filled[z_idx, :, :], te_time_ms, time_ms)
         cs = ion_sound_speed_m_s(te_interp, M_I_AMU)
         probe = _probe_id(run_id)
+        # The density carries the measured sign of every cell; a negative
+        # far-skirt cell is noise about zero, not a missing measurement.
         density = electron_density_m3(grp["isat_a"][()], ap_r_m2[probe], cs)
-        density = np.where((density > 0) & np.isfinite(density), density, np.nan)
         line = np.array([_line_integral_cm2(density[:, ti], x_m) for ti in range(density.shape[1])])
         entries.append((z_cm, time_ms, line, run_id))
 

@@ -1,14 +1,42 @@
-# Canonical empirical Probe A (p11/p50) normalization for May 2026.
+# Canonical Probe A (p11/p50) current-to-area normalization for May 2026.
 #
-# Derived from ES1 FWHM-core mean density over 10--19 ms after one-sided
-# high-current-shot rejection. The bracket requires scaled p11 density to be
-# no greater than p21 and scaled p50 density to be no less than p41.
+# CLASS: GEOMETRY-BOXED.  Re-classed from FITTED on 2026-09-22.  The VALUE and
+# the two bounds are unchanged from the day they were written; what changed is
+# what they are claimed to be.
 #
-# This is an effective current-to-area normalization, not a claim that the
-# physical probe face is geometrically smaller by this factor. Apply it once
-# to raw Probe A current (or, equivalently, divide its reference area by the
-# factor). The same Probe A body supplies both electrical faces, so this file
-# makes the analysis-wide assumption that the factor applies to both faces.
+# MECHANISM.  The Probe A tip is a 1 x 1 mm planar face of finite thickness,
+# and the four EDGES of the plane collect as well as the face does.  At a
+# 0.25 mm thickness the edge area equals the face area, which puts the
+# collecting area at about twice the face area -- a factor of about 2, from the
+# geometry of the tip rather than from a fit.  The recorded 2.0303 sits inside
+# that box.  The SAME physical probe sits at p11 and p50, so one factor is
+# common to both ports; the only difference between them is a small alignment
+# one, the probe normal against probe B's.  The middle three probes are 1 x 4 mm
+# tips and carry the same edge caveat in their own proportion; it is not
+# removed from them here.
+#
+# THE RETIRED PROVENANCE.  The value was originally obtained by an ES1
+# FWHM-core density BRACKET over 10--19 ms after one-sided high-current-shot
+# rejection, requiring scaled p11 density <= p21 and scaled p50 density >= p41,
+# with factor = sqrt(lower * upper).  THAT METHOD IS RETIRED.  It no longer
+# closes on today's inputs: re-derived 2026-09-22 it gives lower = n41/n50 =
+# 4.4895 against upper = n21/n11 = 1.7879, so no factor satisfies both
+# constraints at once, and the factor it would report, 2.8332, is physically
+# too large for this tip.  The bracket's own bounds below are kept as the
+# recorded interval of that day, not as a live claim of the retired method.
+#
+# Because the method is retired, the `> 0` sign test inside its derivation --
+# `scripts/plot_isat_profiles.py` in `_density_bracket_from_profiles`, and the
+# one in `calibrate_probe_area_m2` in `src/bapsf_lapd/density.py` -- is INERT
+# HISTORY and is deliberately left in place.  It was measured on 2026-09-22 to
+# drop zero cells from this derivation (0 of 3132 core-window cells across the
+# four calibration runs are non-positive), so it never moved this number.
+#
+# This is an effective current-to-area normalization: the physical FACE is not
+# smaller by this factor, the collecting AREA is larger than the face by about
+# it.  Apply it once to raw Probe A current (or, equivalently, divide its
+# reference area by the factor).  The same Probe A body supplies both
+# electrical faces, so the factor applies to both.
 
 [probe_A]
 factor = 2.03030067440105
