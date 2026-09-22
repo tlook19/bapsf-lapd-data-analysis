@@ -167,6 +167,17 @@ from es4_upstream_rows_rot180_isat import (
 )
 
 
+#: Schema version stamped into every exported product as ``schema_version``.
+#: ODD is an exporter version and EVEN an augmented one
+#: (``augment_sim1d_overlay_isat_drive.AUGMENTED_SCHEMA`` maps each exporter
+#: version to the augmented version it becomes), so this is bumped by TWO
+#: whenever the exported field set changes.  It is a named constant rather
+#: than a literal in the ``savez`` call so that a consumer or a test can pin
+#: the CURRENT schema by importing it: a literal pinned in one test is a pin
+#: on whatever vintage happened to be on disk the day it was written, and
+#: goes stale silently the next time the product is placed.
+SCHEMA_VERSION = 29
+
 MANIFEST = Path("config/may2026_run_manifest.toml")
 DENSITY_HDF5 = Path("processed/density_profiles_isweep.hdf5")
 TE_HDF5 = Path("processed/te_filled.hdf5")
@@ -2431,7 +2442,7 @@ def export_overlay(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        schema_version=np.array(29, dtype=np.int16),
+        schema_version=np.array(SCHEMA_VERSION, dtype=np.int16),
         experiment_set_id=np.array(experiment_set_id, dtype=np.int16),
         experiment_label=np.array(experiment_label),
         port=PORTS,

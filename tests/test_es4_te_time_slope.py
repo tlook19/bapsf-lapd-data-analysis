@@ -15,6 +15,8 @@ import math
 import numpy as np
 import pytest
 
+from scripts.augment_sim1d_overlay_isat_drive import AUGMENTED_SCHEMA
+from scripts.export_es1_sim1d_overlay import SCHEMA_VERSION
 from scripts.es4_te_time_slope import (
     DEFAULT_PORT,
     FORBIDDEN_OUTPUT_DIR,
@@ -212,17 +214,31 @@ def test_runs_for_port_override_refuses_an_absent_run_id():
         runs_for_port(SWEEPS_H5, 21, override_run_ids=("99",))
 
 
+#: What ``overlay_prior_te_ev``'s second return value may be when it is read
+#: off the PLACED product.  It is a provenance passthrough -- nothing in that
+#: function branches on it and the prior does not depend on it -- so the
+#: assertion belongs on "this file is one this repo's own tooling produced",
+#: which is the exporter's current schema or the version the augmenter turns
+#: it into.  Pinning a literal instead pins whatever vintage sat on disk the
+#: day the test was written, and goes stale silently the next time the
+#: product is placed: this pair pinned v23 and turned red at v29.
+PLACEABLE_SCHEMA_VERSIONS = frozenset(
+    {SCHEMA_VERSION, AUGMENTED_SCHEMA[SCHEMA_VERSION]}
+)
+
+
 def test_overlay_prior_te_ev_reads_the_p29_window_matched_row():
     prior, schema_version = overlay_prior_te_ev(OVERLAY_NPZ, 29, WINDOW_MATCHED_MS)
-    # On record: 1.58-1.74 eV for the ES4 overlay's p29 plateau.
+    # On record: 1.58-1.74 eV for the ES4 overlay's p29 plateau.  This is the
+    # row read the test exists for and it is unchanged.
     assert 1.5 <= prior <= 1.8
-    assert schema_version == 23
+    assert schema_version in PLACEABLE_SCHEMA_VERSIONS
 
 
 def test_overlay_prior_te_ev_nan_for_a_port_the_overlay_does_not_carry():
     prior, schema_version = overlay_prior_te_ev(OVERLAY_NPZ, 9999, WINDOW_MATCHED_MS)
     assert math.isnan(prior)
-    assert schema_version == 23
+    assert schema_version in PLACEABLE_SCHEMA_VERSIONS
 
 
 def test_overlay_prior_te_ev_refuses_a_missing_file(tmp_path):
