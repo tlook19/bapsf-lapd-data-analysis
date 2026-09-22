@@ -129,10 +129,13 @@ mean over the column extent, with ``te_column_plain_ev`` beside it and
 ``column_coverage_cm`` / ``column_prior_beyond_coverage`` as its own coverage
 record -- and that flag is True at EVERY port of every set, because no port's
 T_e is trusted all the way to the column edge.  HOW MUCH of each column T_e is
-the prior rather than a measurement is ``te_column_prior_weight``: 21-27 % at
-the eight ES1/ES2 aperture ports and 57-76 % at every p50 row and across sets
-3 and 4, so twelve of the twenty port-rows are substantially a statement about
-the prior.  See ``te_ftavg_definition``,
+the prior rather than a measurement is ``te_column_prior_weight``: 20-27 % at
+the eight ES1/ES2 aperture ports and 42-74 % at every p50 row and across sets
+3 and 4, so eleven of the twenty port-rows are substantially a statement about
+the prior -- and the twentieth, ES4 p50, carries no column row at all.  That
+share is a ratio of two SIGNED sums and is not confined to ``[0, 1]``; it is
+inside it at every sample of the scored plateau window, and leaves it only at
+early samples.  See ``te_ftavg_definition``,
 ``te_ftavg_sem_definition``, ``ftavg_coverage_definition``,
 ``column_definition``, ``column_edge_definition``, ``column_sem_definition``
 and ``column_coverage_definition``.
@@ -210,7 +213,7 @@ from es4_upstream_rows_rot180_isat import (
 #: the CURRENT schema by importing it: a literal pinned in one test is a pin
 #: on whatever vintage happened to be on disk the day it was written, and
 #: goes stale silently the next time the product is placed.
-SCHEMA_VERSION = 35
+SCHEMA_VERSION = 37
 
 MANIFEST = Path("config/may2026_run_manifest.toml")
 DENSITY_HDF5 = Path("processed/density_profiles_isweep.hdf5")
@@ -556,10 +559,13 @@ def _column_edge_cm(folded_radius_cm: np.ndarray) -> float:
 
     The whole-column conventions integrate from the density centroid out to
     this radius: the outermost folded radius the scan still carries a retained
-    cell at.  A retained cell is one that survived its product's own QC -- the
-    density chain writes a non-positive or unusable cell as NaN and those are
-    dropped before this is taken -- so this is the outermost radius with a
-    QC-surviving measured value.
+    cell at.  A retained cell is one that carries a measurement -- the density
+    chain writes a cell as NaN only where there is no usable measurement, and
+    a cell whose measured current is negative is noise about zero and is KEPT
+    with its sign -- so this is the outermost radius the scan measured at.
+    Because the sign test was retired, that is now essentially the scan extent
+    itself, and the column edge no longer contracts toward the core when the
+    outer skirt dips below zero.
 
     It is also where the effective-width ledger reads its own background:
     ``_subtract_background`` takes its baseline from the outermost
@@ -599,10 +605,13 @@ def _flux_tube_profile_stats(
     centroid, the quadrature nodes and the core companion are all taken from
     the UNSUBTRACTED profile, and the clip at zero -- which existed because
     subtracting a baseline can drive outer cells negative -- is not applied
-    either: the density product writes a non-positive cell as ``NaN`` before
-    it is stored, so there is nothing for it to clip.  ``True`` keeps the
-    historical behaviour for the explicitly named legacy rows and for the Isat
-    families this member did not re-cut.
+    either.  THE PROFILE IS SIGNED: the density product stores the measured
+    value of every cell it has one for, negative cells included, since a cell
+    on noise about zero averages out only if it is kept, and dropping it
+    redistributes its ``2 r dr`` weight onto the positive cells -- the same
+    upward bias the subtraction had.  ``True`` keeps the historical behaviour
+    for the explicitly named legacy rows and for the Isat families this member
+    did not re-cut.
 
     ``radius_cm`` is the quadrature's outer limit.  ``None`` integrates to the
     profile's own COLUMN EDGE instead (``_column_edge_cm``), which is what the
@@ -731,7 +740,7 @@ def _weighted_mean_and_sem(
 ) -> tuple[float, float]:
     """Return a weighted mean and the SCATTER SEM of that mean.
 
-    ``weights`` are non-negative and need not be normalized; they are
+    ``weights`` need not be normalized; they are
     normalized here to ``a_i``.  The returned SEM is the weighted
     generalization of the core-band convention (``_nan_core_stats``: the
     sample standard deviation over the retained cells divided by the square
@@ -747,6 +756,26 @@ def _weighted_mean_and_sem(
 
     Returns ``(nan, nan)`` for a non-positive total weight and a finite mean
     with a ``nan`` SEM where one node carries all of it.
+
+    WEIGHTS MAY BE NEGATIVE.  The density weight behind the T_e rows is the
+    SIGNED measured density, and a cell sitting on noise about zero carries a
+    negative weight.  Two things follow, and NEITHER IS REPAIRED HERE:
+
+    * the weighted mean is no longer a convex combination of the values, so
+      it can leave ``[min f, max f]``.  It is still the ratio of the two
+      quadrature sums, which is the quantity wanted, and it is NOT clipped
+      back into the range of its own nodes -- clipping would reimpose exactly
+      the upward bias that deleting the negative cells had;
+    * ``s^2`` can come out NEGATIVE, and where it does the scatter of the
+      nodes about their own average is NOT DEFINED and the SEM is ``nan``.
+      It is deliberately not floored to zero: zero would assert that the
+      retained cells agree exactly, which is the opposite of what a negative
+      variance says.
+
+    Neither can happen with non-negative weights -- ``s^2 >= 0`` identically
+    once ``sum a^2 < 1`` is checked -- so every unsigned caller (the Isat
+    families, the clipped legacy rows, the unweighted ``plain`` average) is
+    bit-unaffected by this.
     """
     values = np.asarray(values, dtype=np.float64)
     weights = np.asarray(weights, dtype=np.float64)
@@ -759,7 +788,9 @@ def _weighted_mean_and_sem(
     if not np.isfinite(mean) or sum_squares >= 1.0:
         return mean, float("nan")
     variance = float(normalized @ (values - mean) ** 2) / (1.0 - sum_squares)
-    return mean, float(np.sqrt(max(variance, 0.0) * sum_squares))
+    if variance < 0.0:
+        return mean, float("nan")
+    return mean, float(np.sqrt(variance * sum_squares))
 
 
 def _flux_tube_te_stats(
@@ -824,12 +855,32 @@ def _flux_tube_te_stats(
     rather than a measurement of that port -- a number, not an adjective.  The
     mask is in SCAN ``|x|``, the frame the trust model is stated in, NOT in
     the quadrature's centroid-folded radius.  ``NaN`` where the radius is not
-    given.
+    given.  The density-weighted pair are RATIOS OF TWO SIGNED SUMS and are
+    therefore not confined to ``[0, 1]``: where the cells beyond the radius
+    are noise about zero their numerator can go negative, or exceed a
+    denominator the same cells have pulled down.  That is reported as
+    computed; the unweighted pair, whose weights ``w`` are non-negative, stay
+    shares in the ordinary sense.
 
     ``subtract_background=False`` is the comparand chain, and it reaches the
     T_e rows through the WEIGHT: both averages are taken over the unsubtracted
     density's node set, weights and centroid.  The plain row is not weighted
     by the density but still sits on that node set, so it moves a little too.
+
+    THE WEIGHT IS SIGNED, and the consequences are carried, not repaired.
+    ``ftavg`` is the ratio ``sum w n T / sum w n`` of two quadrature sums, and
+    on the comparand chain ``n`` is the measured density with its sign, so a
+    node on noise about zero enters with a NEGATIVE weight.  Where enough of
+    them do, ``ftavg`` stops being a convex combination of its own nodes and
+    can read outside ``[min T, max T]``; where they cancel the positive ones,
+    ``sum w n <= 0`` and the row is ``NaN``.  Both are disclosed rather than
+    clipped -- clipping the weight at zero is the sign test again, by another
+    name, and it is what the product just stopped doing.  A row that leaves
+    its own bound is a row whose denominator is small and whose T_e therefore
+    is not measured to that precision; both happen only at samples where there
+    is nearly no plasma to weight with, and the exported row carries
+    ``te_ftavg_weight_density_*`` so a consumer can see the denominator.  The
+    ``plain`` row is unweighted and stays a convex combination throughout.
     """
     despiked_density, _ = _despike_profile(density_profile)
     prepared_density = (
@@ -1502,19 +1553,22 @@ def _check_density_convention_pair(
     The two exported density conventions come from two chains over the SAME
     ``n_e_m3`` grid: ``density_mean_cm3`` is the unweighted core-band mean of
     that grid, and ``density_ftavg_cm3`` is the despiked, background-subtracted,
-    centroid-folded flux-tube quadrature over the whole scan.  Every cell of the
-    grid is either strictly positive or NaN -- the density product maps a
-    non-positive or non-finite cell to NaN before it is written -- so the
-    core-band mean is itself either strictly positive or NaN, and a zero can
-    only come from a grid that has begun carrying zero-filled cells instead.
+    centroid-folded flux-tube quadrature over the whole scan.  A cell of the
+    grid is either a SIGNED measurement or NaN, and NaN means only that there
+    is no usable measurement there; a negative cell is a real reading on noise
+    about zero and is kept.  The core-band mean is therefore a signed number,
+    and at a port whose column has decayed into the noise it can legitimately
+    come out negative -- which is a measurement, not a defect, and is not
+    refused here.
 
-    A core-band mean that is zero or non-finite while the flux-tube average of
-    the same profile is finite therefore means the two chains disagree about
-    whether that port and sample carries plasma at all: either the input grid is
-    zero-filled, or the core band is empty while the off-core cells still carry
-    signal.  Both are defects of the input product, not the sample-level
-    "unusable" condition the flux-tube fields already express as NaN (that one
-    fails on the flux-tube side, which here succeeded).
+    What IS refused is a core-band mean of EXACTLY ZERO, or a non-finite one,
+    under a finite flux-tube average of the same profile.  Exact zero is not
+    something a mean of measured cells reaches; it is what a zero-filled input
+    grid produces.  A non-finite one under a finite flux-tube value means the
+    core band is empty while the off-core cells still carry signal.  Both are
+    defects of the input product, not the sample-level "unusable" condition the
+    flux-tube fields already express as NaN (that one fails on the flux-tube
+    side, which here succeeded).
 
     Emitting the pair anyway would ship a flux-tube value whose only exported
     uncertainty cannot be formed: the overlay carries no SEM under the flux-tube
@@ -1548,10 +1602,11 @@ def _check_density_convention_pair(
         f"{port_index.size} density sample(s) carry a finite flux-tube average "
         "over a core-band mean that is zero or non-finite: "
         + "; ".join(shown)
-        + ".  The core-band mean of the density grid is strictly positive "
-        "wherever it is defined and NaN otherwise, so this combination means "
-        "the input density product and the flux-tube reduction disagree about "
-        "whether the sample carries plasma.  The flux-tube row's uncertainty is "
+        + ".  The core-band mean of the density grid is a signed average of "
+        "measured cells and does not reach exactly zero; a zero or non-finite "
+        "one under a finite flux-tube average means the input density product "
+        "and the flux-tube reduction disagree about whether the sample carries "
+        "measurements at all.  The flux-tube row's uncertainty is "
         "carried as the core-band fractional error "
         "density_total_sem_cm3 / density_mean_cm3, which cannot be formed here; "
         "rebuild the density product rather than exporting the pair."
@@ -3062,6 +3117,43 @@ def export_overlay(
             "the assumption, and the on-record left/right profile asymmetry is "
             "not captured by it."
         ),
+        density_sign_convention=np.array(
+            "THE DENSITY IS SIGNED (schema v37).  processed/"
+            "density_profiles_isweep.hdf5 stores the measured value of every "
+            "cell it has a measurement for, negative cells included; NaN in "
+            "n_e_m3 means no usable measurement and NEVER a negative one.  The "
+            "retired convention wrote every non-positive cell as NaN -- a SIGN "
+            "TEST, never a QC gate: the mask was exactly the set of cells whose "
+            "Isat is negative (348/347/408/1218 cells of 10,200/10,200/5,100/"
+            "5,100 at ES1/ES2/ES3/ES4, identical to the negative-Isat mask at "
+            "every set).  Those cells are noise about zero at a radius where "
+            "there is little current; deleting them dropped the downward half "
+            "of the noise and redistributed each cell's 2 r dr quadrature "
+            "weight onto the positive cells, which is the same upward bias as "
+            "the background subtraction this product already retired.  The "
+            "cells the sign test would have deleted are still identifiable, as "
+            "n_e_sign_masked in the density product.  CONSEQUENCES, CARRIED "
+            "RATHER THAN CLIPPED: (1) column_edge_cm no longer contracts when "
+            "the skirt dips below zero, so the whole-column rows integrate the "
+            "full scan; (2) density_mean_cm3, an unweighted core-band mean, is "
+            "now a signed average and CAN BE NEGATIVE at a port whose column "
+            "has decayed into the noise -- it is at 2 ES3 and 19 ES4 samples, "
+            "all at the far end, and a consumer transferring the fractional "
+            "error density_total_sem_cm3/density_mean_cm3 must not use it "
+            "there; (3) the density is the WEIGHT behind te_ftavg_ev and "
+            "te_column_ev, so those ratios are no longer convex combinations "
+            "of their own T_e nodes and can read outside [min T, max T], and "
+            "where the negative nodes cancel the positive ones the row is NaN. "
+            " Measured at this vintage: under the flux-tube convention 0/1/1/1 "
+            "samples leave their bound at ES1/ES2/ES3/ES4 and none is in the "
+            "10-19 ms plateau; under the whole-column convention 2/5/1/2 "
+            "leave it and 2/1/2/1 go NaN on a non-positive total weight, all "
+            "at t <= 9 ms where there is nearly no plasma to weight with.  "
+            "te_ftavg_weight_density_cm3 and te_column_weight_density_cm3 are "
+            "the denominators, exported so a consumer can see when one is "
+            "small.  Nothing is clipped back into range: a clip at zero is the "
+            "sign test again under another name."
+        ),
         ftavg_background=np.array(
             "NO BACKGROUND IS SUBTRACTED FROM ANY DENSITY ROW OF RECORD, AND "
             "THAT IS A RULING, NOT AN OMISSION.  The Isat baseline behind "
@@ -3080,11 +3172,16 @@ def export_overlay(
             "isat_ftavg_geomean_a_per_cm2 with their SEM, core and centroid "
             "companions (v35).  All are taken on the UNSUBTRACTED, despiked "
             "profile; the clip at zero that the subtraction motivated is not "
-            "applied to them either.  ON THE DENSITY GRID THE CLIP HAD "
-            "NOTHING TO DO -- that product writes a non-positive cell as NaN "
-            "before it is stored, so no cell of the unsubtracted profile is "
-            "negative (0 of 28,279 finite despiked cells across the four "
-            "sets).  ON THE ISAT SCANS IT DID: the far skirt carries "
+            "applied to them either.  ON THE DENSITY GRID THE CLIP NOW HAS "
+            "WORK TO DO AND IS STILL NOT DONE: the density product's own sign "
+            "test was RETIRED (schema v37), so its far skirt carries the same "
+            "genuinely negative cells the Isat scans do -- noise about zero -- "
+            "and they enter the quadrature as measured.  In the vintage "
+            "before that, the density product wrote every non-positive cell "
+            "as NaN, which dropped it from the quadrature and redistributed "
+            "its 2 r dr weight onto the positive cells: the same upward bias "
+            "as the clip, by deletion instead of by lifting.  ON THE ISAT "
+            "SCANS THE CLIP ALWAYS DID: the far skirt carries "
             "genuinely negative cells (349 of 10,200 on the ES1 upstream "
             "face), noise about zero at a radius where there is little "
             "current, and the retired path lifted every one of them to zero. "
@@ -3161,7 +3258,16 @@ def export_overlay(
             "something a new result may quote.  See ftavg_background.  The "
             "density rows were re-cut at schema v33 and the three Isat "
             "families at v35; a product at v31 or earlier carries the "
-            "subtracted values under the COMPARAND names."
+            "subtracted values under the COMPARAND names.  THE TWO DENSITY "
+            "LEGACY ROWS MOVED AT v37 AND NO LONGER REPRODUCE A PRE-v37 "
+            "VALUE: they are the legacy REDUCTION, not a frozen copy, and the "
+            "density grid under them stopped deleting its negative cells.  "
+            "Those cells shift the edge medians this reduction takes its "
+            "baseline from, and the clip at zero then lifts them, so "
+            "density_ftavg_subtracted_cm3 and density_column_subtracted_cm3 "
+            "reproduce the retired METHOD over the corrected input, not the "
+            "numbers the retired method once produced.  The three Isat legacy "
+            "rows are unaffected -- their input never had a sign test."
         ),
         te_ftavg_time_ms=te.time_ms,
         te_ftavg_ev=te_ftavg["ftavg"],
@@ -3327,6 +3433,11 @@ def export_overlay(
             np.nan_to_num(te_records["window_sem_ev"], nan=0.0),
         ),
         te_column_plain_radial_sem_ev=te_column["plain_sem"],
+        # The whole-column counterpart of te_ftavg_weight_density_cm3: the
+        # DENOMINATOR sum w n of te_column_ev, exported because the weight is
+        # signed and a consumer has to be able to see when it is small or
+        # negative (see density_sign_convention).
+        te_column_weight_density_cm3=te_column["weight_density"] * M3_TO_CM3,
         te_column_edge_cm=te_column["edge"],
         te_column_prior_weight=te_column["prior_weight"],
         te_column_pure_prior_weight=te_column["pure_prior_weight"],
@@ -3405,11 +3516,15 @@ def export_overlay(
             "plainly: THE EDGE IS THE SCAN LIMIT, in the centroid-folded "
             "frame -- the outermost folded radius r = |x - x_c| at which the "
             "scan still carries a retained cell.  Retained means the cell "
-            "survived its product's own QC, since the density chain writes a "
-            "non-positive or unusable cell as NaN and those are dropped first, "
-            "so at these sets the edge is the |x| = 25 cm scan end, or the "
-            "outermost cell inside it that survived, plus the per-sample "
-            "centroid offset: 23 to 28 cm in practice.  IT IS NOT A MEASURED "
+            "carries a measurement: the density chain writes a cell as NaN "
+            "only where there is no usable measurement, and since the sign "
+            "test was retired (schema v37) a negative far-skirt cell is a "
+            "measurement and is retained.  The edge is therefore the "
+            "|x| = 25 cm scan end at essentially every sample, plus the "
+            "per-sample centroid offset: 23 to 28 cm in practice.  Under the "
+            "pre-v37 vintage it could instead be the outermost POSITIVE cell, "
+            "which pulled the edge inward wherever the skirt had dipped below "
+            "zero.  IT IS NOT A MEASURED "
             "COLUMN BOUNDARY.  The profile is NOT required to have fallen to "
             "anything there, and nothing is subtracted to make it look as "
             "though it had: the density at the scan edge is whatever the "
@@ -3488,25 +3603,35 @@ def export_overlay(
             "|x| beyond that port's te_trust_radius_cm, per port and per "
             "sample, and te_column_pure_prior_weight the share beyond "
             "te_trust_blend_cm, where the filled product reports the prior "
-            "alone.  Over the 15.0-19.5 ms plateau those shares read: ES1 "
-            "0.247 / 0.242 / 0.265 / 0.212 / 0.671 at p11 / p21 / p29 / p41 / "
-            "p50, ES2 0.270 / 0.205 / 0.256 / 0.239 / 0.689, ES3 0.735 / "
-            "0.685 / 0.700 / 0.601 / 0.639, ES4 0.705 / 0.622 / 0.617 / 0.567 "
-            "/ 0.756; pure-prior at ES1, 0.109 / 0.141 / 0.170 / 0.131 / "
-            "0.345.  At the eight ES1/ES2 aperture ports the prior carries "
-            "21-27 % of the weight; at every p50 row and across sets 3 and 4 "
-            "it carries 57-76 %, and AT TWELVE OF THE TWENTY PORT-ROWS IT IS "
+            "alone.  THE TWO DENSITY-WEIGHTED SHARES ARE RATIOS OF TWO SIGNED "
+            "SUMS (schema v37) and are not confined to [0, 1]: where the cells "
+            "beyond the radius are noise about zero the numerator can go "
+            "negative.  Measured at this vintage, every sample of the "
+            "15.0-19.5 ms scored window is inside [0, 1] at all four sets, and "
+            "the excursions are 5 / 8 / 1 / 1 samples at ES1 / ES2 / ES3 / ES4 "
+            "of 198 / 199 / 93 / 75 finite, all at t <= 9 ms where there is "
+            "nearly no plasma to weight with.  Over the 15.0-19.5 ms plateau "
+            "those shares read: ES1 "
+            "0.236 / 0.223 / 0.268 / 0.212 / 0.668 at p11 / p21 / p29 / p41 / "
+            "p50, ES2 0.270 / 0.201 / 0.254 / 0.228 / 0.688, ES3 0.735 / "
+            "0.680 / 0.700 / 0.600 / 0.504, ES4 0.698 / 0.619 / 0.617 / 0.419 "
+            "/ NaN (ES4 p50 carries no column row at all: its whole scan sums "
+            "non-positive over the plateau); pure-prior at ES1, 0.096 / 0.119 "
+            "/ 0.173 / 0.131 / 0.339.  At the eight ES1/ES2 aperture ports the "
+            "prior carries "
+            "20-27 % of the weight; at every p50 row and across sets 3 and 4 "
+            "it carries 42-74 %, and AT ELEVEN OF THE TWENTY PORT-ROWS IT IS "
             "NOT A SMALL CORRECTION -- those rows are substantially a "
             "statement about the repo's SOL prior and must not be read as a "
             "measurement of that port's column T_e.  The unweighted row is "
             "worse again: te_column_plain_prior_weight and "
             "te_column_plain_pure_prior_weight are the same shares of sum w, "
-            "and they run 0.42 to 0.84, which is one reason the plain row is "
+            "and they run 0.42 to 0.85, which is one reason the plain row is "
             "not the comparand.  These shares are taken on the UNSUBTRACTED "
             "density weight (schema v33): the retired background subtraction "
             "held the outer cells down, so every share here is LARGER than "
-            "the same statistic taken before the ruling -- ES1 p11 0.247 "
-            "against 0.218.  The"
+            "the same statistic taken before the ruling -- ES1 p11 0.236 "
+            "against 0.218.  The "
             "flag is the reliable statement and the coverage radius is "
             "indicative, for the same frame reason ftavg_coverage_definition "
             "gives: coverage is in scan |x| and the edge is in the "

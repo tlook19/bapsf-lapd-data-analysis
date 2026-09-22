@@ -10,6 +10,14 @@ For each experiment set, it computes electron density from the dead-time Isweep
 ion-saturation current and the filled T_e profile, then writes a compact HDF5
 product plus contour PNG/GIF outputs.
 
+The density is SIGNED.  The probe zero is taken from the end of the shot, where
+there is no plasma, so a line scan carries no background: a cell whose measured
+current is negative is noise about zero and is kept with its sign, because
+deleting it biases every average and every quadrature over that scan upward by
+redistributing its weight onto the positive cells.  ``NaN`` in ``n_e_m3`` means
+no usable measurement, never a negative one.  ``n_e_sign_masked`` records which
+cells the retired sign test would have deleted; nothing reads it as a mask.
+
 Probe A uses the probe-B area.  The Isweep profile product's ``isat_a`` dataset
 already has the probe-A current area factor applied; ``isat_a_raw`` is not used.
 
@@ -179,6 +187,18 @@ def compute_density_profiles(
         out_hdf.attrs["probe_a_area_uncertainty_propagation"] = (
             "sqrt((sigma_Aref/Aref)^2 + (sigma_factor/factor)^2)"
         )
+        out_hdf.attrs["n_e_sign_convention"] = (
+            "SIGNED. n_e carries the sign of the measured ion saturation "
+            "current at every cell where the measurement exists. A negative "
+            "cell is noise about zero, not a failure, and is kept so that "
+            "averages over it are unbiased. NaN means no usable measurement "
+            "(a non-finite density), never a negative one."
+        )
+        out_hdf.attrs["n_e_sign_masked_definition"] = (
+            "True where n_e is finite and non-positive: the cells the RETIRED "
+            "sign test would have written as NaN. Traceability only -- nothing "
+            "in this product or downstream of it is masked by this array."
+        )
         out_hdf.create_dataset("x_cm", data=x_cm)
         out_sets = out_hdf.create_group("experiment_sets")
         plot_data: list[dict] = []
@@ -224,7 +244,8 @@ def compute_density_profiles(
                     isat = isat * (probe_a_factor_override / applied_factor)
                 area_key = str(grp.attrs.get("density_area_key", "ap_L_cm2"))
                 density = electron_density_m3(isat, areas_m2[probe][area_key], cs)
-                density = np.where((density > 0) & np.isfinite(density), density, np.nan)
+                sign_masked = np.isfinite(density) & (density <= 0.0)
+                density = np.where(np.isfinite(density), density, np.nan)
 
                 entries.append((
                     z_cm,
@@ -234,6 +255,7 @@ def compute_density_profiles(
                     profile_time_s,
                     probe_a_factor_override if probe == "A" and probe_a_factor_override is not None else applied_factor,
                     area_key,
+                    sign_masked,
                 ))
 
             if not entries:
@@ -244,19 +266,21 @@ def compute_density_profiles(
             run_ids = [item[1] for item in entries]
             probes = [item[2] for item in entries]
             density_grid = np.stack([item[3] for item in entries], axis=0)
+            sign_masked_grid = np.stack([item[7] for item in entries], axis=0)
             time_s = entries[0][4]
 
             set_grp = out_sets.create_group(es_id)
             set_grp.create_dataset("z_cm", data=z_cm)
             set_grp.create_dataset("inter_sweep_time_s", data=time_s)
             set_grp.create_dataset("n_e_m3", data=density_grid)
+            set_grp.create_dataset("n_e_sign_masked", data=sign_masked_grid)
             set_grp.attrs["label"] = es_label
             set_grp.attrs["v_bank_v"] = v_bank
             if probe_a_factor_override is not None:
                 set_grp.attrs["probe_a_factor_override"] = probe_a_factor_override
 
             runs_grp = set_grp.create_group("runs")
-            for z, run_id, probe, _, _, factor, area_key in entries:
+            for z, run_id, probe, _, _, factor, area_key, _ in entries:
                 run_grp = runs_grp.create_group(run_id)
                 run_grp.attrs["z_cm"] = z
                 run_grp.attrs["probe_id"] = probe
