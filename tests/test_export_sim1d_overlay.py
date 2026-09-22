@@ -369,6 +369,74 @@ def test_a_negative_weight_is_carried_and_the_mean_may_leave_its_own_range():
     assert mean > values.max()  # outside the range of its own nodes
 
 
+def test_a_non_positive_column_reports_its_signed_total_and_no_temperature():
+    """The ES4 p50 state: a whole column that sums non-positive.
+
+    Such a column has no centroid to fold about, so no quadrature exists.  It
+    is still a MEASUREMENT -- the scan measured a port with no plasma left in
+    it, sitting on noise about zero -- so the DENSITY row carries the signed
+    total rather than NaN, which would have said no measurement exists.  The
+    T_e rows, which are ratios over that same non-positive weight, stay NaN,
+    and the weight-density field carries the denominator that refused so the
+    NaN says why.
+    """
+    # Noise about zero with a net negative sum, and no step the despike gate
+    # would repair: a slow cosine ripple sitting below zero.
+    column = -1.0 + 0.5 * np.cos(X_CM * (np.pi / 12.5))
+    assert np.sum(column) < 0.0  # the premise, measured not assumed
+
+    density = _flux_tube_profile_stats(column, X_CM, subtract_background=False)
+
+    assert density["ftavg"] == pytest.approx(float(np.sum(column)), rel=1e-12)
+    assert density["ftavg"] < 0.0
+    # A sum is not an area average: nothing that needs the quadrature exists.
+    assert np.isnan(density["ftavg_sem"])
+    assert np.isnan(density["scatter_sem"])
+    assert np.isnan(density["centroid"])
+    assert np.isnan(density["edge"])
+
+    te = _flux_tube_te_stats(
+        _peaked(8.0, pedestal=1.0, amplitude=4.0),
+        column,
+        X_CM,
+        subtract_background=False,
+    )
+
+    assert np.isnan(te["ftavg"])
+    assert np.isnan(te["plain"])
+    assert np.isnan(te["ftavg_sem"])
+    assert np.isnan(te["plain_sem"])
+    # The denominator is exported beside the refusal, and is the same number
+    # the density row carries.
+    assert te["weight_density"] == pytest.approx(density["ftavg"], rel=1e-12)
+
+
+def test_a_column_with_plasma_is_untouched_by_the_non_positive_rule():
+    """The rule is inert wherever the column sums positive, which is everywhere else."""
+    column = _peaked(9.0, pedestal=0.0, amplitude=1.0)
+    stats = _flux_tube_profile_stats(column, X_CM, subtract_background=False)
+
+    assert np.isfinite(stats["ftavg"])
+    assert stats["ftavg"] != pytest.approx(float(np.sum(column)))
+    assert np.isfinite(stats["centroid"])
+    assert np.isfinite(stats["edge"])
+
+
+def test_the_legacy_subtracted_chain_keeps_refusing_a_column_it_erased():
+    """The signed-total rule does not reach the clipped legacy rows.
+
+    ``subtract_background=True`` clips at zero, so its total can only ever
+    reach the boundary, and a zero there means the retired subtraction erased
+    the profile rather than that the column measured negative.  Those rows
+    exist to reproduce the retired METHOD, so they keep returning NaN --
+    see ``test_the_retired_subtraction_erases_a_flat_profile_entirely``.
+    """
+    column = -1.0 + 0.5 * np.cos(X_CM * (np.pi / 12.5))
+    stats = _flux_tube_profile_stats(column, X_CM, subtract_background=True)
+
+    assert np.isnan(stats["ftavg"])
+
+
 def test_a_negative_weighted_variance_is_refused_rather_than_floored():
     """A negative scatter variance is undefined, and must not read as zero.
 
