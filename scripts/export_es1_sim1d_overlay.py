@@ -11,9 +11,10 @@ The NPZ product is self-contained and uses simulation-facing units:
   per-sample count of semi-quantitative cells behind each T_e row;
 * offset-corrected ion-saturation current at x=0 in A for BOTH Mach-probe
   faces, and the flow-symmetrized geometric mean of the two in A cm^-2;
-* the same afterglow decay for the same three faces under the flux-tube and
-  whole-column radial averages, and the e-fold matrix fitted over the scored
-  decay window across all three faces and all three conventions (see
+* the same afterglow decay for the same three faces under all three radial
+  conventions -- core band, flux tube and whole column -- and the e-fold
+  matrix fitted over the scored decay window across the three faces and the
+  four conventions, the x=0 point included (see
   ``isat_decay_radial_definition`` and ``isat_decay_matrix_definition``);
 * shot-averaged interferometer line-integrated density in cm^-2 for the
   three chords, on the raw interferometer clock;
@@ -299,9 +300,12 @@ ISAT_DECAY_NOISE_TAIL_MS = 5.0
 ISAT_DECAY_NOISE_SIGMAS = 5.0
 
 #: The two axes of the afterglow e-fold matrix, in the order they are stored.
-#: ``isat_decay_matrix_tau_ms`` is indexed ``[face, convention, port]``.
+#: ``isat_decay_matrix_tau_ms`` is indexed ``[face, convention, port]``.  The
+#: conventions run outward: the x = 0 POINT, then the three radial averages
+#: the plateau rows are already exported in, so every plateau convention has a
+#: decay counterpart.
 ISAT_DECAY_MATRIX_FACES = ("upstream", "downstream", "geomean")
-ISAT_DECAY_MATRIX_CONVENTIONS = ("x0", "ftavg", "column")
+ISAT_DECAY_MATRIX_CONVENTIONS = ("x0", "core", "ftavg", "column")
 
 #: Runs whose LATE-AFTERGLOW Isat decay trace (the ``isat_decay_*`` /
 #: ``isat_decay_dn_*`` family ``_isat_decay_stats`` builds from
@@ -605,6 +609,38 @@ def _column_edge_cm(folded_radius_cm: np.ndarray) -> float:
     return float(np.max(folded_radius_cm))
 
 
+def _core_band_point_sem(
+    prepared: np.ndarray,
+    core_band: np.ndarray,
+    point_sem: np.ndarray | None,
+) -> float:
+    """Return the per-point SEM of one profile's CORE-BAND mean.
+
+    The core-band companion of ``ftavg_sem``, composed the same way and under
+    the same assumption: the per-point uncertainties are propagated through
+    the average that produced the row and the points are treated as
+    INDEPENDENT.  That average is the unweighted ``nanmean`` over the retained
+    cells of ``X_MIN_CM <= x <= X_MAX_CM``, so the weights are ``1/N`` and the
+    propagation is ``sqrt(sum sem_i^2) / N`` over exactly those cells.
+
+    ``nan`` when no per-point uncertainty was given, when the band retains no
+    cell, or when a retained cell carries a non-finite one -- an uncertainty
+    is not invented where the profile states none.  This is a SHOT SEM and is
+    not commensurate with the radial-scatter SEM the core-band density row
+    quotes.
+    """
+    if point_sem is None:
+        return float("nan")
+    cells = core_band & np.isfinite(prepared)
+    n_cells = int(np.count_nonzero(cells))
+    if n_cells == 0:
+        return float("nan")
+    sem_values = np.asarray(point_sem, dtype=np.float64)[cells]
+    if not np.all(np.isfinite(sem_values)):
+        return float("nan")
+    return float(np.sqrt(np.sum(sem_values**2)) / n_cells)
+
+
 def _flux_tube_profile_stats(
     profile: np.ndarray,
     x_cm: np.ndarray,
@@ -651,7 +687,9 @@ def _flux_tube_profile_stats(
 
     ``point_sem`` is an optional per-point uncertainty on the SAME samples; it
     is propagated through the quadrature weights in quadrature, treating the
-    points as independent.  The background's own sampling uncertainty is not
+    points as independent, and through the core-band mean the same way as
+    ``core_sem`` (``_core_band_point_sem``).  The background's own sampling
+    uncertainty is not
     propagated -- it is a small, fully correlated term.  ``scatter_sem`` is the
     other, always-available uncertainty: the scatter of the retained radial
     cells about their own weighted average (``_weighted_mean_and_sem``), the
@@ -676,6 +714,11 @@ def _flux_tube_profile_stats(
     so a non-positive total there means the retired subtraction erased the
     profile, and those rows keep returning ``NaN`` because they exist to
     reproduce that method exactly as it behaved.
+
+    ``core`` and ``core_sem`` are taken BEFORE the quadrature and are returned
+    on every path, the early exits included, so the core-band row of a profile
+    survives wherever the band retains a cell at all -- including the paths
+    that come back carrying no area average.
     """
     despiked, n_despiked = _despike_profile(profile)
     prepared = _subtract_background(despiked) if subtract_background else despiked
@@ -683,12 +726,14 @@ def _flux_tube_profile_stats(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         core_mean = float(np.nanmean(prepared[core_band]))
+    core_sem = _core_band_point_sem(prepared, core_band, point_sem)
 
     empty = dict(
         ftavg=np.nan,
         ftavg_sem=np.nan,
         scatter_sem=np.nan,
         core=core_mean,
+        core_sem=core_sem,
         centroid=np.nan,
         edge=np.nan,
         n_despiked=n_despiked,
@@ -757,6 +802,7 @@ def _flux_tube_profile_stats(
         ftavg_sem=ftavg_sem,
         scatter_sem=scatter_sem,
         core=core_mean,
+        core_sem=core_sem,
         centroid=centroid,
         edge=limit,
         n_despiked=n_despiked,
@@ -781,7 +827,15 @@ def _flux_tube_series(
     ``radius_cm``, ``normalize_radius_cm`` and ``subtract_background`` are
     passed through unchanged; see ``_flux_tube_profile_stats``.
     """
-    names = ("ftavg", "ftavg_sem", "scatter_sem", "core", "centroid", "edge")
+    names = (
+        "ftavg",
+        "ftavg_sem",
+        "scatter_sem",
+        "core",
+        "core_sem",
+        "centroid",
+        "edge",
+    )
     n_z, _, n_t = profiles.shape
     out = {
         name: np.full((n_z, n_t), np.nan, dtype=np.float64) for name in names
@@ -3007,6 +3061,14 @@ def export_overlay(
             reduced["ftavg"],
             reduced["ftavg_sem"],
         )
+        if convention == "ftavg":
+            # The core band is taken before the quadrature's outer limit is
+            # chosen, so it is the same number under both reductions; read it
+            # off the flux-tube pass rather than reducing the profiles twice.
+            decay_matrix_cells[(face, "core")] = (
+                reduced["core"],
+                reduced["core_sem"],
+            )
     decay_matrix = _isat_decay_matrix(
         isat_decay["time_ms"],
         decay_matrix_cells,
@@ -3476,6 +3538,16 @@ def export_overlay(
             "p50 geomean is NaN from there on.  That is the data and is NOT "
             "clipped."
         ),
+        isat_decay_core_upstream_a=decay_reduced[("upstream", "ftavg")]["core"],
+        isat_decay_core_upstream_sem_a=decay_reduced[("upstream", "ftavg")][
+            "core_sem"
+        ],
+        isat_decay_core_dn_a=decay_reduced[("downstream", "ftavg")]["core"],
+        isat_decay_core_dn_sem_a=decay_reduced[("downstream", "ftavg")]["core_sem"],
+        isat_decay_core_geomean_a_per_cm2=decay_reduced[("geomean", "ftavg")]["core"],
+        isat_decay_core_geomean_sem_a_per_cm2=decay_reduced[("geomean", "ftavg")][
+            "core_sem"
+        ],
         isat_decay_ftavg_upstream_a=decay_reduced[("upstream", "ftavg")]["ftavg"],
         isat_decay_ftavg_upstream_sem_a=decay_reduced[("upstream", "ftavg")][
             "ftavg_sem"
@@ -3517,20 +3589,34 @@ def export_overlay(
             "position gets its own high-current shot rejection by the same "
             "rule the x=0 rows use, so the x = 0 column of the line scan IS "
             "isat_decay_mean_a / isat_decay_sem_a bit for bit.  The families "
-            "are: isat_decay_ftavg_* (flux-tube area mean to "
+            "are: isat_decay_core_* (the CORE BAND -- the unweighted mean "
+            "over core_x_min_cm <= x <= core_x_max_cm, a diameter line cut "
+            "with no area weighting, the convention density_mean_cm3 and "
+            "isat_ftavg_*_core_a are in), isat_decay_ftavg_* (flux-tube area "
+            "mean to "
             "ftavg_radius_cm) and isat_decay_column_* (the column's inventory "
             "per unit length out to its own edge, expressed over the tube's "
-            "area; the per-sample limit is isat_decay_column_*_edge_cm).  All "
-            "three faces are carried under both -- upstream, dn (downstream) "
+            "area; the per-sample limit is isat_decay_column_*_edge_cm).  "
+            "EVERY radial convention the plateau rows are exported in "
+            "therefore has a decay counterpart.  The core band is taken "
+            "BEFORE the quadrature chooses its outer limit, so it is one "
+            "number under both area reductions and it survives at samples "
+            "where the area rows do not; its SEM is the per-point shot SEM "
+            "propagated through the unweighted band mean, "
+            "sqrt(sum sem^2) / N over the retained band cells, the band "
+            "companion of the _sem_a the area rows carry.  All "
+            "three faces are carried under all three -- upstream, dn (downstream) "
             "and geomean, the last built from the two faces' AREA-NORMALIZED "
             "line scans by the same function as isat_ftavg_geomean_*, so it "
-            "is in A cm^-2 and its ftavg/column rows are too.  Every row is on "
+            "is in A cm^-2 and its core/ftavg/column rows are too.  Every row "
+            "is on "
             "isat_decay_time_ms.  A face excluded by the late-afterglow "
             "probe-local-current registry is NaN at EVERY radius, so its "
-            "flux-tube and column rows are NaN too (isat_decay_excluded / "
+            "core, flux-tube and column rows are NaN too (isat_decay_excluded "
+            "/ "
             "isat_decay_dn_excluded, reasons in the matching _excluded_reason "
             "arrays).  These rows and isat_decay_mean_a / isat_decay_dn_mean_a "
-            "/ isat_decay_geomean_a_per_cm2 are the NINE time series the "
+            "/ isat_decay_geomean_a_per_cm2 are the TWELVE time series the "
             "e-fold matrix is fitted to."
         ),
         isat_decay_matrix_tau_ms=decay_matrix["tau_ms"],
@@ -3548,20 +3634,27 @@ def export_overlay(
             "THE AFTERGLOW E-FOLD MATRIX, indexed [face, convention, port] by "
             "isat_decay_matrix_face x isat_decay_matrix_convention x "
             "isat_decay_matrix_port, in ms, with isat_decay_matrix_tau_sem_ms "
-            "beside it.  Nine cells per port: three probe faces (upstream, "
-            "downstream, geomean) crossed with three radial conventions.  "
+            "beside it.  TWELVE cells per port: three probe faces (upstream, "
+            "downstream, geomean) crossed with four conventions, which run "
+            "outward from the axis.  "
             "NAMING, READ THIS FIRST: the convention labelled 'x0' is the "
             "x = 0 POINT trace -- isat_decay_mean_a, isat_decay_dn_mean_a and "
             "isat_decay_geomean_a_per_cm2, the rows the transport "
-            "comparison's stage (iii) already fits -- and it is NOT the "
-            "repo's CORE-BAND convention, which is the unweighted mean over "
+            "comparison's stage (iii) already fits -- and it is a DIFFERENT "
+            "quantity from the repo's CORE-BAND convention, which is the "
+            "unweighted mean over "
             "core_x_min_cm <= x <= core_x_max_cm and appears in this product "
-            "as density_mean_cm3 and isat_ftavg_*_core_a.  No core-band decay "
-            "row is carried.  'ftavg' is the flux-tube area mean to "
+            "as density_mean_cm3 and isat_ftavg_*_core_a.  Both are carried: "
+            "the core band is the convention labelled 'core' "
+            "(isat_decay_core_*), so 'x0' must not be read as it.  'ftavg' is "
+            "the flux-tube area mean to "
             "ftavg_radius_cm (isat_decay_ftavg_*) and 'column' the whole-column "
             "inventory over the tube's area (isat_decay_column_*); see "
-            "isat_decay_radial_definition for how those two are built.  "
-            "THE FIT IS ONE RECIPE FOR ALL NINE CELLS, and it is the recipe "
+            "isat_decay_radial_definition for how the three radial rows are "
+            "built.  The last three are the SAME three conventions the "
+            "plateau rows are exported in, so a decay and a plateau level can "
+            "be read in one convention.  "
+            "THE FIT IS ONE RECIPE FOR ALL TWELVE CELLS, and it is the recipe "
             "the transport comparison applies to isat_decay_mean_a: a noise "
             "floor of 5 x 1.4826 x MAD over the trace's OWN final 5 ms, then "
             "an unweighted least-squares line through log(I) over "
@@ -3576,7 +3669,10 @@ def export_overlay(
             "every upstream flux-tube and whole-column cell, whose radial "
             "quadrature reports nothing once the plasma is gone and the "
             "signed line scan sums non-positive, while its fit window stays "
-            "fully populated (see _decay_noise_floor_a).  A cell is NaN where "
+            "fully populated (see _decay_noise_floor_a).  The 'core' row is "
+            "not affected: the band mean is taken before the quadrature and "
+            "is defined at every sample, so it keeps its own tail and its own "
+            "floor.  A cell is NaN where "
             "fewer than 8 samples clear "
             "the positivity/noise-floor mask or where the fitted slope is not "
             "a decay; tau_sem is that fit's per-sample SEM propagated by the "
@@ -3589,7 +3685,7 @@ def export_overlay(
             "difference between the traces and not between two fits.  "
             "isat_decay_matrix_excluded / _excluded_reason are per (face, "
             "port) -- an exclusion belongs to a run's channel, so it takes "
-            "all three conventions of that face with it.  COMPARISON RULE: "
+            "all four conventions of that face with it.  COMPARISON RULE: "
             "these are Isat e-folds; the interferometer decay "
             "(interf_decay_*) is a line-integrated DENSITY decay on its own "
             "clock and is not a comparand for them."

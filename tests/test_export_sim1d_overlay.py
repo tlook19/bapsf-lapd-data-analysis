@@ -2353,10 +2353,11 @@ def _decay_profiles(tau_cm, t_ms, x_cm=X_CM, peak=1.0):
 
 
 def _decay_matrix_cells(profiles, sem_value=1.0e-4, x_cm=X_CM):
-    """Reduce one line scan into the nine (face, convention) matrix cells.
+    """Reduce one line scan into the twelve (face, convention) matrix cells.
 
-    The same wiring ``export_overlay`` uses: the x=0 column for ``x0`` and the
-    two radial quadratures for ``ftavg`` / ``column``.  All three faces are
+    The same wiring ``export_overlay`` uses: the x=0 column for ``x0``, the
+    flux-tube pass's core-band companion for ``core``, and the two radial
+    quadratures for ``ftavg`` / ``column``.  All three faces are
     handed the same traces here, so any difference between faces in a result
     would be the fit reading its own axis labels.
     """
@@ -2373,6 +2374,7 @@ def _decay_matrix_cells(profiles, sem_value=1.0e-4, x_cm=X_CM):
     axis = int(np.argmin(np.abs(x_cm)))
     per_convention = {
         "x0": (profiles[:, axis, :], sem[:, axis, :]),
+        "core": (ftavg["core"], ftavg["core_sem"]),
         "ftavg": (ftavg["ftavg"], ftavg["ftavg_sem"]),
         "column": (column["ftavg"], column["ftavg_sem"]),
     }
@@ -2415,7 +2417,7 @@ def test_the_matrix_x0_slice_is_the_existing_x0_decay_fit_byte_for_byte():
 
     matrix = _fit_matrix(cells, t_ms)
 
-    assert list(matrix["convention"]) == ["x0", "ftavg", "column"]
+    assert list(matrix["convention"]) == ["x0", "core", "ftavg", "column"]
     window = (t_ms >= ISAT_DECAY_FIT_WINDOW_MS[0]) & (
         t_ms <= ISAT_DECAY_FIT_WINDOW_MS[1]
     )
@@ -2438,11 +2440,11 @@ def test_the_matrix_x0_slice_is_the_existing_x0_decay_fit_byte_for_byte():
     assert matrix["tau_ms"][:, 0, :].tobytes() == independent.tobytes()
 
 
-def test_a_self_similar_decay_reads_the_same_tau_in_all_nine_cells():
+def test_a_self_similar_decay_reads_the_same_tau_in_all_twelve_cells():
     """One e-fold time at every radius must come back as one number.
 
     If the column decays at a single rate, no radial average can change that
-    rate, and neither can the choice of face: the nine cells differ only in
+    rate, and neither can the choice of face: the twelve cells differ only in
     which linear combination of the same exponentials they fit.
     """
     t_ms = _decay_time_grid()
@@ -2465,10 +2467,12 @@ def test_an_edge_that_cools_faster_shortens_the_column_tau_below_the_axis_tau():
     """The SIGN the matrix exists to read.
 
     With the e-fold time falling toward the edge, an average that counts the
-    outer column decays faster than the axis does.  The whole-column
-    convention counts the most of it, the flux tube less, and the x=0 point
-    none -- so the three must come out ordered, and a column tau SHORTER than
-    the x0 tau is the statement that the edge cools faster.
+    outer column decays faster than the axis does.  The four conventions reach
+    steadily further out -- the x=0 point not at all, the core band to
+    X_MAX_CM unweighted, the flux tube to ftavg_radius_cm with an area weight
+    that favours large radius, the whole column to the scan edge -- so they
+    must come out ordered, and a column tau SHORTER than the core tau is the
+    statement that the edge cools faster.
     """
     t_ms = _decay_time_grid()
     axis_tau_ms = 0.80
@@ -2482,9 +2486,9 @@ def test_an_edge_that_cools_faster_shortens_the_column_tau_below_the_axis_tau():
     tau = matrix["tau_ms"]
     assert np.all(np.isfinite(tau))
     for face in range(len(ISAT_DECAY_MATRIX_FACES)):
-        x0_tau, ftavg_tau, column_tau = tau[face, :, 0]
+        x0_tau, core_tau, ftavg_tau, column_tau = tau[face, :, 0]
         assert x0_tau == pytest.approx(axis_tau_ms, rel=1e-9)
-        assert column_tau < ftavg_tau < x0_tau
+        assert column_tau < ftavg_tau < core_tau < x0_tau
 
 
 def test_a_face_excluded_on_one_convention_is_excluded_on_all_three():
@@ -2500,6 +2504,7 @@ def test_a_face_excluded_on_one_convention_is_excluded_on_all_three():
     matrix = _isat_decay_matrix(t_ms, cells, ports, excluded, reasons)
 
     face_index = ISAT_DECAY_MATRIX_FACES.index("downstream")
+    assert matrix["tau_ms"].shape == (3, len(ISAT_DECAY_MATRIX_CONVENTIONS), 1)
     assert matrix["excluded"].shape == (3, 1)
     assert bool(matrix["excluded"][face_index, 0])
     assert not matrix["excluded"][[0, 2], 0].any()
