@@ -7,6 +7,11 @@ import pytest
 from scripts.export_es1_sim1d_overlay import (
     DESPIKE_MIN_PEAK_FRACTION,
     FLUX_TUBE_RADIUS_CM,
+    ISAT_DECAY_EDGE_DRIFT_MAX_CM,
+    ISAT_DECAY_FIT_WINDOW_MS,
+    ISAT_DECAY_MATRIX_CONVENTIONS,
+    ISAT_DECAY_MATRIX_FACES,
+    ISAT_DECAY_TAIL_BASELINE_MAX_FRAC,
     PLASMA_DIAMETER_CM,
     PORTS,
     RAW_PLATEAU_WINDOW_MS,
@@ -14,9 +19,13 @@ from scripts.export_es1_sim1d_overlay import (
     X_MIN_CM,
     _check_density_convention_pair,
     _column_edge_cm,
+    _decay_efold_ms,
+    _decay_noise_floor_a,
+    _decay_tau_by_position,
     _despike_profile,
     _discharge_stats,
     _flux_tube_profile_stats,
+    _flux_tube_series,
     _flux_tube_te_series,
     _flux_tube_te_stats,
     _flow_symmetrized_profiles,
@@ -24,6 +33,7 @@ from scripts.export_es1_sim1d_overlay import (
     _interp_onto_time_grid,
     _interferometer_decay_stats,
     _isat_decay_geomean,
+    _isat_decay_matrix,
     _measured_coverage_cm,
     _weighted_mean_and_sem,
     _plateau_current_a,
@@ -398,8 +408,16 @@ def test_a_non_positive_column_reports_an_axial_area_mean_and_no_temperature():
     # No centroid exists; the extent the weights were formed over is reported.
     assert np.isnan(density["centroid"])
     assert density["edge"] == pytest.approx(FLUX_TUBE_RADIUS_CM)
+    # ftavg_sem is the per-point SEM carried through the CENTROID-folded
+    # weights, which do not exist here.  scatter_sem does exist: the axial
+    # weights are non-negative, so they are a proper measure and the scatter
+    # of the retained cells about their own weighted average is defined
+    # whatever sign their total has.  The row keeps an uncertainty rather than
+    # going bare, and it is the same statistic every other sample carries.
     assert np.isnan(density["ftavg_sem"])
-    assert np.isnan(density["scatter_sem"])
+    expected_scatter = _weighted_mean_and_sem(column, axial_weights)[1]
+    assert np.isfinite(expected_scatter)
+    assert density["scatter_sem"] == pytest.approx(expected_scatter, rel=1e-12)
 
     # The whole-column convention folds about the same axis, out to the scan
     # limit, and does NOT take the tube-area renormalization there -- which is
@@ -2313,3 +2331,363 @@ def test_a_spike_after_the_window_does_not_move_the_level_or_the_crossings():
     assert not np.array_equal(
         spiked_stats["raw"]["current_mean_a"], clean_stats["raw"]["current_mean_a"]
     )
+
+
+# ---------------------------------------------------------------------------
+# The afterglow e-fold matrix: face x radial convention x port
+# ---------------------------------------------------------------------------
+DECAY_DT_MS = 0.1
+DECAY_SPAN_MS = 10.0
+
+
+def _decay_time_grid():
+    """A trace grid long enough to carry both the fit window and its tail."""
+    start = float(ISAT_DECAY_FIT_WINDOW_MS[0])
+    n = int(round(DECAY_SPAN_MS / DECAY_DT_MS)) + 1
+    return start + DECAY_DT_MS * np.arange(n, dtype=np.float64)
+
+
+def _decay_profiles(tau_cm, t_ms, x_cm=X_CM, peak=1.0):
+    """One port's synthetic afterglow line scan, shaped ``(port, x, time)``.
+
+    A fixed Gaussian radial shape decaying with a per-radius e-fold time
+    ``tau_cm(|x|)``, so a convention that weights the outer column more heavily
+    sees a different effective decay from one that reads the axis alone.
+    """
+    shape = peak * np.exp(-((x_cm / 8.0) ** 2))
+    tau = np.asarray(tau_cm(np.abs(x_cm)), dtype=np.float64)
+    elapsed = t_ms - t_ms[0]
+    return (
+        shape[None, :, None]
+        * np.exp(-elapsed[None, None, :] / tau[None, :, None])
+    )
+
+
+def _decay_matrix_cells(profiles, sem_value=1.0e-4, x_cm=X_CM):
+    """Reduce one line scan into the twelve (face, convention) matrix cells.
+
+    The same wiring ``export_overlay`` uses: the x=0 column for ``x0``, the
+    flux-tube pass's core-band companion for ``core``, and the two radial
+    quadratures for ``ftavg`` / ``column``.  All three faces are
+    handed the same traces here, so any difference between faces in a result
+    would be the fit reading its own axis labels.
+    """
+    sem = np.full_like(profiles, sem_value)
+    ftavg = _flux_tube_series(profiles, x_cm, sem, subtract_background=False)
+    column = _flux_tube_series(
+        profiles,
+        x_cm,
+        sem,
+        radius_cm=None,
+        normalize_radius_cm=FLUX_TUBE_RADIUS_CM,
+        subtract_background=False,
+    )
+    axis = int(np.argmin(np.abs(x_cm)))
+    per_convention = {
+        "x0": (profiles[:, axis, :], sem[:, axis, :]),
+        "core": (ftavg["core"], ftavg["core_sem"]),
+        "ftavg": (ftavg["ftavg"], ftavg["ftavg_sem"]),
+        "column": (column["ftavg"], column["ftavg_sem"]),
+    }
+    return {
+        (face, convention): per_convention[convention]
+        for face in ISAT_DECAY_MATRIX_FACES
+        for convention in ISAT_DECAY_MATRIX_CONVENTIONS
+    }
+
+
+def _fit_matrix(cells, t_ms, ports=(11,)):
+    ports = np.asarray(ports, dtype=np.int16)
+    clear = {face: np.zeros(ports.size, dtype=bool) for face in ISAT_DECAY_MATRIX_FACES}
+    reasons = {face: np.asarray([""] * ports.size) for face in ISAT_DECAY_MATRIX_FACES}
+    return _isat_decay_matrix(t_ms, cells, ports, clear, reasons)
+
+
+def test_the_matrix_x0_slice_is_the_existing_x0_decay_fit_byte_for_byte():
+    """The proof that the nine cells share ONE fit.
+
+    The ``x0`` convention is the ``isat_decay_*`` family the transport
+    comparison's stage (iii) already fits, so fitting those traces
+    independently -- outside the matrix, through the same two helpers -- must
+    reproduce the ``[:, 0, :]`` slice exactly, not merely closely.  Each face
+    is given a DIFFERENT x=0 trace so the check cannot pass by the three
+    happening to coincide.
+    """
+    t_ms = _decay_time_grid()
+    elapsed = t_ms - t_ms[0]
+    x0_traces = {
+        "upstream": 0.030 * np.exp(-elapsed / 0.62),
+        "downstream": 0.012 * np.exp(-elapsed / 1.15),
+        "geomean": 0.190 * np.exp(-elapsed / 0.83),
+    }
+    sem = np.full(t_ms.size, 1.0e-5)
+    profiles = _decay_profiles(lambda r: 0.8 - 0.01 * r, t_ms)
+    cells = _decay_matrix_cells(profiles)
+    for face, trace in x0_traces.items():
+        cells[(face, "x0")] = (trace[None, :], sem[None, :])
+
+    matrix = _fit_matrix(cells, t_ms)
+
+    assert list(matrix["convention"]) == ["x0", "core", "ftavg", "column"]
+    window = (t_ms >= ISAT_DECAY_FIT_WINDOW_MS[0]) & (
+        t_ms <= ISAT_DECAY_FIT_WINDOW_MS[1]
+    )
+    tail = t_ms >= t_ms.max() - 5.0
+    independent = np.array(
+        [
+            [
+                _decay_efold_ms(
+                    t_ms[window],
+                    x0_traces[face][window],
+                    _decay_noise_floor_a(x0_traces[face], tail),
+                )
+            ]
+            for face in ISAT_DECAY_MATRIX_FACES
+        ],
+        dtype=np.float64,
+    )
+
+    assert np.all(np.isfinite(independent))
+    assert matrix["tau_ms"][:, 0, :].tobytes() == independent.tobytes()
+
+
+def test_a_self_similar_decay_reads_the_same_tau_in_all_twelve_cells():
+    """One e-fold time at every radius must come back as one number.
+
+    If the column decays at a single rate, no radial average can change that
+    rate, and neither can the choice of face: the twelve cells differ only in
+    which linear combination of the same exponentials they fit.
+    """
+    t_ms = _decay_time_grid()
+    tau_ms = 0.80
+    uniform = _decay_profiles(lambda r: np.full_like(r, tau_ms), t_ms)
+    cells = _decay_matrix_cells(uniform)
+
+    matrix = _fit_matrix(cells, t_ms)
+
+    # The noise floor must not have removed a sample; otherwise the cells
+    # would be fitted over different sample sets and the equality would be
+    # about the mask rather than about the decay.
+    assert np.all(matrix["n_fit"] == matrix["n_window"])
+    tau = matrix["tau_ms"]
+    assert np.all(np.isfinite(tau))
+    assert tau == pytest.approx(np.full_like(tau, tau_ms), rel=1e-9)
+
+
+def test_an_edge_that_cools_faster_shortens_the_column_tau_below_the_axis_tau():
+    """The SIGN the matrix exists to read.
+
+    With the e-fold time falling toward the edge, an average that counts the
+    outer column decays faster than the axis does.  The four conventions reach
+    steadily further out -- the x=0 point not at all, the core band to
+    X_MAX_CM unweighted, the flux tube to ftavg_radius_cm with an area weight
+    that favours large radius, the whole column to the scan edge -- so they
+    must come out ordered, and a column tau SHORTER than the core tau is the
+    statement that the edge cools faster.
+    """
+    t_ms = _decay_time_grid()
+    axis_tau_ms = 0.80
+    cells = _decay_matrix_cells(
+        _decay_profiles(lambda r: axis_tau_ms / (1.0 + 0.05 * r), t_ms)
+    )
+
+    matrix = _fit_matrix(cells, t_ms)
+
+    assert np.all(matrix["n_fit"] == matrix["n_window"])
+    tau = matrix["tau_ms"]
+    assert np.all(np.isfinite(tau))
+    for face in range(len(ISAT_DECAY_MATRIX_FACES)):
+        x0_tau, core_tau, ftavg_tau, column_tau = tau[face, :, 0]
+        assert x0_tau == pytest.approx(axis_tau_ms, rel=1e-9)
+        assert column_tau < ftavg_tau < core_tau < x0_tau
+
+
+def test_a_face_excluded_on_one_convention_is_excluded_on_all_three():
+    """An exclusion belongs to the run's channel, not to a radial average."""
+    t_ms = _decay_time_grid()
+    cells = _decay_matrix_cells(_decay_profiles(lambda r: np.full_like(r, 0.8), t_ms))
+    ports = np.array([11], dtype=np.int16)
+    excluded = {face: np.zeros(1, dtype=bool) for face in ISAT_DECAY_MATRIX_FACES}
+    reasons = {face: np.asarray([""]) for face in ISAT_DECAY_MATRIX_FACES}
+    excluded["downstream"] = np.ones(1, dtype=bool)
+    reasons["downstream"] = np.asarray(["probe-local current"])
+
+    matrix = _isat_decay_matrix(t_ms, cells, ports, excluded, reasons)
+
+    face_index = ISAT_DECAY_MATRIX_FACES.index("downstream")
+    assert matrix["tau_ms"].shape == (3, len(ISAT_DECAY_MATRIX_CONVENTIONS), 1)
+    assert matrix["excluded"].shape == (3, 1)
+    assert bool(matrix["excluded"][face_index, 0])
+    assert not matrix["excluded"][[0, 2], 0].any()
+    assert str(matrix["excluded_reason"][face_index, 0]) == "probe-local current"
+
+
+def test_the_matrix_refuses_a_cell_that_is_not_on_the_exported_grid():
+    t_ms = _decay_time_grid()
+    cells = _decay_matrix_cells(_decay_profiles(lambda r: np.full_like(r, 0.8), t_ms))
+    short = cells[("upstream", "x0")][0][:, :-1]
+    cells[("upstream", "x0")] = (short, short)
+
+    with pytest.raises(ValueError, match="decay matrix cell"):
+        _fit_matrix(cells, t_ms)
+
+
+def _fit_matrix_with_edges(cells, t_ms, edges, ports=(11,)):
+    ports = np.asarray(ports, dtype=np.int16)
+    clear = {face: np.zeros(ports.size, dtype=bool) for face in ISAT_DECAY_MATRIX_FACES}
+    reasons = {face: np.asarray([""] * ports.size) for face in ISAT_DECAY_MATRIX_FACES}
+    return _isat_decay_matrix(t_ms, cells, ports, clear, reasons, edges)
+
+
+def _steady_edges(t_ms, value=FLUX_TUBE_RADIUS_CM):
+    return {
+        (face, convention): np.full((1, t_ms.size), value)
+        for face in ISAT_DECAY_MATRIX_FACES
+        for convention in ("ftavg", "column")
+    }
+
+
+def test_a_clean_decay_with_a_steady_edge_is_reportable_in_every_cell():
+    """The gate must not fire on the case it exists to pass."""
+    t_ms = _decay_time_grid()
+    # tau(x) falling outward gives a positive outside series; the trace decays
+    # to nothing, so the tail baseline is negligible.
+    cells = _decay_matrix_cells(
+        _decay_profiles(lambda r: 0.8 / (1.0 + 0.05 * r), t_ms)
+    )
+    matrix = _fit_matrix_with_edges(cells, t_ms, _steady_edges(t_ms))
+
+    assert matrix["reportable"].all()
+    area = [ISAT_DECAY_MATRIX_CONVENTIONS.index(c) for c in ("ftavg", "column")]
+    assert np.all(matrix["outside_min_a"][:, area, :] > 0.0)
+    assert np.all(
+        matrix["tail_baseline_frac"] < ISAT_DECAY_TAIL_BASELINE_MAX_FRAC
+    )
+    assert np.all(matrix["edge_drift_cm"][:, area, :] == 0.0)
+    # (i) and (iii) are area properties and say nothing about a point row.
+    point = [ISAT_DECAY_MATRIX_CONVENTIONS.index(c) for c in ("x0", "core")]
+    assert np.all(np.isnan(matrix["outside_min_a"][:, point, :]))
+    assert np.all(np.isnan(matrix["edge_drift_cm"][:, point, :]))
+
+
+def test_an_outside_inventory_that_turns_negative_fails_the_area_cells_only():
+    """Condition (i): no inventory outside the tube, no area row."""
+    t_ms = _decay_time_grid()
+    cells = _decay_matrix_cells(_decay_profiles(lambda r: np.full_like(r, 0.8), t_ms))
+    # Push the column below the tube for part of the window; the point rows
+    # are untouched, so only the two area cells may move.
+    tube = cells[("upstream", "ftavg")][0]
+    column, column_sem = cells[("upstream", "column")]
+    cells[("upstream", "column")] = (tube - 0.01 * np.abs(tube), column_sem)
+
+    matrix = _fit_matrix_with_edges(cells, t_ms, _steady_edges(t_ms))
+
+    face = ISAT_DECAY_MATRIX_FACES.index("upstream")
+    for convention in ("ftavg", "column"):
+        ci = ISAT_DECAY_MATRIX_CONVENTIONS.index(convention)
+        assert matrix["outside_min_a"][face, ci, 0] < 0.0
+        assert not matrix["reportable"][face, ci, 0]
+    for convention in ("x0", "core"):
+        ci = ISAT_DECAY_MATRIX_CONVENTIONS.index(convention)
+        assert matrix["reportable"][face, ci, 0]
+    # The tau is still fitted and returned; the gate flags, it does not drop.
+    assert np.all(np.isfinite(matrix["tau_ms"][face, :, 0]))
+
+
+def test_an_edge_that_retreats_mid_window_fails_condition_three():
+    """Condition (iii): two integrals fitted as one trace is not a decay."""
+    t_ms = _decay_time_grid()
+    cells = _decay_matrix_cells(_decay_profiles(lambda r: np.full_like(r, 0.8), t_ms))
+    edges = _steady_edges(t_ms)
+    retreating = np.full((1, t_ms.size), 26.0)
+    window = (t_ms >= ISAT_DECAY_FIT_WINDOW_MS[0]) & (
+        t_ms <= ISAT_DECAY_FIT_WINDOW_MS[1]
+    )
+    retreating[0, np.where(window)[0][len(np.where(window)[0]) // 2:]] = 21.0
+    edges[("geomean", "column")] = retreating
+
+    matrix = _fit_matrix_with_edges(cells, t_ms, edges)
+
+    face = ISAT_DECAY_MATRIX_FACES.index("geomean")
+    ci = ISAT_DECAY_MATRIX_CONVENTIONS.index("column")
+    assert matrix["edge_drift_cm"][face, ci, 0] == pytest.approx(5.0)
+    assert matrix["edge_drift_cm"][face, ci, 0] > ISAT_DECAY_EDGE_DRIFT_MAX_CM
+    assert not matrix["reportable"][face, ci, 0]
+    # Its own flux-tube cell keeps a steady edge and stays reportable.
+    assert matrix["reportable"][face, ISAT_DECAY_MATRIX_CONVENTIONS.index("ftavg"), 0]
+
+
+def test_a_trace_that_does_not_return_to_zero_fails_condition_two():
+    """Condition (ii): a pedestal under the trace is not plasma."""
+    t_ms = _decay_time_grid()
+    cells = _decay_matrix_cells(_decay_profiles(lambda r: np.full_like(r, 0.8), t_ms))
+    trace, trace_sem = cells[("downstream", "x0")]
+    start = float(trace[0, 0])
+    cells[("downstream", "x0")] = (trace + 0.5 * start, trace_sem)
+
+    matrix = _fit_matrix_with_edges(cells, t_ms, _steady_edges(t_ms))
+
+    face = ISAT_DECAY_MATRIX_FACES.index("downstream")
+    ci = ISAT_DECAY_MATRIX_CONVENTIONS.index("x0")
+    assert matrix["tail_baseline_frac"][face, ci, 0] > (
+        ISAT_DECAY_TAIL_BASELINE_MAX_FRAC
+    )
+    assert not matrix["reportable"][face, ci, 0]
+
+
+def test_the_signed_geomean_matches_the_comparand_where_the_comparand_reports():
+    """The discriminator's convention is a widening, not a different number."""
+    # Area-normalized: up/2 = [3, 2, -0.5], dn/4 = [2, 0.5, 0.25].  The third
+    # cell has ONE face through zero, so their product is negative and the
+    # comparand rule reports nothing there.  (Two negative faces make a
+    # positive product and the comparand already reports them; that behaviour
+    # is untouched by the flag.)
+    faces = (
+        _decay_face("i_sweep", [6.0, 4.0, -1.0]),
+        _decay_face("isat", [8.0, 2.0, 1.0]),
+    )
+    default = _flow_symmetrized_profiles(
+        {**faces[0], "isat_a": faces[0]["mean_a"], "sem_a": faces[0]["sem_a"],
+         "x_cm": np.zeros(1)},
+        {**faces[1], "isat_a": faces[1]["mean_a"], "sem_a": faces[1]["sem_a"],
+         "x_cm": np.zeros(1)},
+        AREAS,
+    )
+    signed = _flow_symmetrized_profiles(
+        {**faces[0], "isat_a": faces[0]["mean_a"], "sem_a": faces[0]["sem_a"],
+         "x_cm": np.zeros(1)},
+        {**faces[1], "isat_a": faces[1]["mean_a"], "sem_a": faces[1]["sem_a"],
+         "x_cm": np.zeros(1)},
+        AREAS,
+        signed=True,
+    )
+
+    reported = np.isfinite(default["profiles"])
+    assert reported.tolist() == [[True, True, False]]
+    # Bit for bit where the comparand speaks at all.
+    assert (
+        signed["profiles"][reported].tobytes()
+        == default["profiles"][reported].tobytes()
+    )
+    # And it keeps the cell the comparand drops, carrying the faces' sign.
+    assert np.isfinite(signed["profiles"][0, 2])
+    assert signed["profiles"][0, 2] < 0.0
+
+
+def test_tau_by_position_returns_the_decay_at_each_radius():
+    """Discriminator (b): no averaging between the measurement and the tau."""
+    t_ms = _decay_time_grid()
+    profiles = _decay_profiles(lambda r: 0.8 / (1.0 + 0.05 * r), t_ms)
+    sem = np.full_like(profiles, 1.0e-4)
+
+    tau, tau_sem = _decay_tau_by_position(t_ms, profiles, sem)
+
+    assert tau.shape == (1, X_CM.size)
+    assert np.all(np.isfinite(tau))
+    expected = 0.8 / (1.0 + 0.05 * np.abs(X_CM))
+    assert tau[0] == pytest.approx(expected, rel=1e-9)
+    # Falling outward from the axis on both sides, with no convention in it.
+    axis = int(np.argmin(np.abs(X_CM)))
+    assert tau[0, axis] == pytest.approx(max(expected), rel=1e-9)
+    assert tau[0, 0] < tau[0, axis] and tau[0, -1] < tau[0, axis]
+    assert np.all(np.isfinite(tau_sem))

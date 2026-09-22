@@ -11,6 +11,11 @@ The NPZ product is self-contained and uses simulation-facing units:
   per-sample count of semi-quantitative cells behind each T_e row;
 * offset-corrected ion-saturation current at x=0 in A for BOTH Mach-probe
   faces, and the flow-symmetrized geometric mean of the two in A cm^-2;
+* the same afterglow decay for the same three faces under all three radial
+  conventions -- core band, flux tube and whole column -- and the e-fold
+  matrix fitted over the scored decay window across the three faces and the
+  four conventions, the x=0 point included (see
+  ``isat_decay_radial_definition`` and ``isat_decay_matrix_definition``);
 * shot-averaged interferometer line-integrated density in cm^-2 for the
   three chords, on the raw interferometer clock;
 * offset-corrected discharge current in A and cathode-anode voltage in V,
@@ -89,7 +94,8 @@ from a diameter line scan requires assuming the column is axisymmetric about
 its own centroid, which is an ASSUMPTION and not a measurement -- see
 ``ftavg_axisymmetry`` in the exported product.
 
-``density_column_cm3`` and ``te_column_ev`` are the WHOLE-COLUMN convention:
+``density_column_cm3``, ``te_column_ev`` and the three ``isat_column_*`` face
+rows are the WHOLE-COLUMN convention:
 the same quadrature taken from the density centroid out to the COLUMN EDGE --
 which is the SCAN LIMIT in the folded frame, not a measured column boundary --
 and then, for the density row, divided by ``pi * ftavg_radius_cm^2`` rather
@@ -213,7 +219,7 @@ from es4_upstream_rows_rot180_isat import (
 #: the CURRENT schema by importing it: a literal pinned in one test is a pin
 #: on whatever vintage happened to be on disk the day it was written, and
 #: goes stale silently the next time the product is placed.
-SCHEMA_VERSION = 41
+SCHEMA_VERSION = 43
 
 MANIFEST = Path("config/may2026_run_manifest.toml")
 DENSITY_HDF5 = Path("processed/density_profiles_isweep.hdf5")
@@ -276,6 +282,53 @@ ISAT_DECAY_STOP_S = 47.5e-3
 ISAT_DECAY_FILTER_PAD_S = 0.1e-3
 ISAT_DECAY_CUTOFF_HZ = 100.0e3
 ISAT_DECAY_BIN_S = 10.0e-6
+
+#: Fit window for the afterglow e-fold matrix, in ms on the trigger-referenced
+#: grid ``isat_decay_time_ms`` is already on.  It is the transport
+#: comparison's stage (iii) decay window, inherited from that convention
+#: rather than chosen here: the discharge ends at 20 ms, so this is the first
+#: 1.5 ms OF THE AFTERGLOW, the early decay both the model and these traces
+#: resolve.  Two windows are not comparable, so this must stay the same
+#: interval as the window the transport side fits over; it is exported with
+#: the matrix as ``isat_decay_matrix_window_ms`` so a consumer can check
+#: rather than assume.
+ISAT_DECAY_FIT_WINDOW_MS = (20.0, 21.5)
+
+#: Length of the trace tail the e-fold fit's noise floor is estimated over, in
+#: ms, and the multiple of the tail's robust sigma that floor is set at.
+ISAT_DECAY_NOISE_TAIL_MS = 5.0
+ISAT_DECAY_NOISE_SIGMAS = 5.0
+
+#: REPORTABILITY GATE for an AREA-AVERAGED e-fold cell.  A radial average of
+#: the afterglow stops measuring a decay once the quantity it integrates stops
+#: being a decaying plasma signal, and it does that silently: the fit still
+#: converges and still returns a tau.  Three conditions say whether the number
+#: means what its name says, and a cell is flagged rather than dropped.
+#:
+#: (i)   the OUTSIDE series, column minus tube, stays POSITIVE across the fit
+#:       window.  Where it turns negative the column is not the tube plus what
+#:       sits outside it, and neither area row is an inventory;
+#: (ii)  the late-tail baseline is under this fraction of that trace's own
+#:       level at the window's start -- a trace that does not return to zero
+#:       is sitting on something that is not plasma;
+#: (iii) the integration EDGE moves less than this within the window.  The
+#:       whole-column limit is re-chosen per sample, so an edge that retreats
+#:       mid-window fits two different integrals as if they were one trace.
+ISAT_DECAY_TAIL_BASELINE_MAX_FRAC = 0.05
+ISAT_DECAY_EDGE_DRIFT_MAX_CM = 1.0
+
+#: Fixed outer radius, in cm, for the DISCRIMINATOR column rows: a
+#: whole-column reduction whose limit cannot move, so condition (iii) cannot
+#: bite and the edge's contribution to a tau is separable from the plasma's.
+ISAT_DECAY_FIXED_EDGE_CM = 22.0
+
+#: The two axes of the afterglow e-fold matrix, in the order they are stored.
+#: ``isat_decay_matrix_tau_ms`` is indexed ``[face, convention, port]``.  The
+#: conventions run outward: the x = 0 POINT, then the three radial averages
+#: the plateau rows are already exported in, so every plateau convention has a
+#: decay counterpart.
+ISAT_DECAY_MATRIX_FACES = ("upstream", "downstream", "geomean")
+ISAT_DECAY_MATRIX_CONVENTIONS = ("x0", "core", "ftavg", "column")
 
 #: Runs whose LATE-AFTERGLOW Isat decay trace (the ``isat_decay_*`` /
 #: ``isat_decay_dn_*`` family ``_isat_decay_stats`` builds from
@@ -579,6 +632,38 @@ def _column_edge_cm(folded_radius_cm: np.ndarray) -> float:
     return float(np.max(folded_radius_cm))
 
 
+def _core_band_point_sem(
+    prepared: np.ndarray,
+    core_band: np.ndarray,
+    point_sem: np.ndarray | None,
+) -> float:
+    """Return the per-point SEM of one profile's CORE-BAND mean.
+
+    The core-band companion of ``ftavg_sem``, composed the same way and under
+    the same assumption: the per-point uncertainties are propagated through
+    the average that produced the row and the points are treated as
+    INDEPENDENT.  That average is the unweighted ``nanmean`` over the retained
+    cells of ``X_MIN_CM <= x <= X_MAX_CM``, so the weights are ``1/N`` and the
+    propagation is ``sqrt(sum sem_i^2) / N`` over exactly those cells.
+
+    ``nan`` when no per-point uncertainty was given, when the band retains no
+    cell, or when a retained cell carries a non-finite one -- an uncertainty
+    is not invented where the profile states none.  This is a SHOT SEM and is
+    not commensurate with the radial-scatter SEM the core-band density row
+    quotes.
+    """
+    if point_sem is None:
+        return float("nan")
+    cells = core_band & np.isfinite(prepared)
+    n_cells = int(np.count_nonzero(cells))
+    if n_cells == 0:
+        return float("nan")
+    sem_values = np.asarray(point_sem, dtype=np.float64)[cells]
+    if not np.all(np.isfinite(sem_values)):
+        return float("nan")
+    return float(np.sqrt(np.sum(sem_values**2)) / n_cells)
+
+
 def _flux_tube_profile_stats(
     profile: np.ndarray,
     x_cm: np.ndarray,
@@ -625,7 +710,9 @@ def _flux_tube_profile_stats(
 
     ``point_sem`` is an optional per-point uncertainty on the SAME samples; it
     is propagated through the quadrature weights in quadrature, treating the
-    points as independent.  The background's own sampling uncertainty is not
+    points as independent, and through the core-band mean the same way as
+    ``core_sem`` (``_core_band_point_sem``).  The background's own sampling
+    uncertainty is not
     propagated -- it is a small, fully correlated term.  ``scatter_sem`` is the
     other, always-available uncertainty: the scatter of the retained radial
     cells about their own weighted average (``_weighted_mean_and_sem``), the
@@ -642,14 +729,25 @@ def _flux_tube_profile_stats(
     row, so a decayed port reads beside a port that has plasma.  ``centroid``
     stays ``NaN`` because there is none; ``edge`` is the extent the weights
     were formed over -- the scan limit under the whole-column convention, the
-    tube radius under the flux-tube one; ``ftavg_sem`` and ``scatter_sem``
-    stay ``NaN``.  ``normalize_radius_cm`` is NOT applied: the mean is over the
+    tube radius under the flux-tube one.  ``scatter_sem`` IS reported: the
+    axial weights are non-negative, so they are a proper measure and the
+    scatter of the retained cells about their own weighted average is defined
+    whatever sign their total has, and the row keeps the same uncertainty
+    statistic every other sample of it carries.  ``ftavg_sem`` stays ``NaN``
+    -- it is the per-point SEM propagated through the CENTROID-folded weights,
+    which do not exist here.
+    ``normalize_radius_cm`` is NOT applied: the mean is over the
     disc it was integrated over, so a whole-column consumer multiplying by
     ``pi * ftavg_radius_cm^2`` gets a consistent inventory.  This is the SIGNED
     chain's rule only: ``subtract_background=True`` clips its values at zero,
     so a non-positive total there means the retired subtraction erased the
     profile, and those rows keep returning ``NaN`` because they exist to
     reproduce that method exactly as it behaved.
+
+    ``core`` and ``core_sem`` are taken BEFORE the quadrature and are returned
+    on every path, the early exits included, so the core-band row of a profile
+    survives wherever the band retains a cell at all -- including the paths
+    that come back carrying no area average.
     """
     despiked, n_despiked = _despike_profile(profile)
     prepared = _subtract_background(despiked) if subtract_background else despiked
@@ -657,12 +755,14 @@ def _flux_tube_profile_stats(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", category=RuntimeWarning)
         core_mean = float(np.nanmean(prepared[core_band]))
+    core_sem = _core_band_point_sem(prepared, core_band, point_sem)
 
     empty = dict(
         ftavg=np.nan,
         ftavg_sem=np.nan,
         scatter_sem=np.nan,
         core=core_mean,
+        core_sem=core_sem,
         centroid=np.nan,
         edge=np.nan,
         n_despiked=n_despiked,
@@ -700,7 +800,20 @@ def _flux_tube_profile_stats(
                 return empty
             weight_sum = float(np.sum(axial_weights))
             if weight_sum > 0.0:
+                # The axial weights are NON-NEGATIVE -- 2 r dr about x = 0,
+                # with nothing weighting by the signed intensity -- so they
+                # are a proper measure and the scatter of the retained cells
+                # about their own weighted average IS defined here, even
+                # though the values it runs over sum non-positive.  It is the
+                # same statistic every other sample of the row carries, so the
+                # row keeps an uncertainty instead of going bare.  ftavg_sem
+                # stays NaN: that one is the per-point SEM propagated through
+                # the CENTROID-folded weights, and those do not exist here.
                 empty["ftavg"] = float(axial_weights @ values) / weight_sum
+                _, axial_scatter_sem = _weighted_mean_and_sem(
+                    values, axial_weights
+                )
+                empty["scatter_sem"] = axial_scatter_sem
                 empty["edge"] = limit
         return empty
     centroid = float(np.sum(values * positions) / total)
@@ -731,6 +844,7 @@ def _flux_tube_profile_stats(
         ftavg_sem=ftavg_sem,
         scatter_sem=scatter_sem,
         core=core_mean,
+        core_sem=core_sem,
         centroid=centroid,
         edge=limit,
         n_despiked=n_despiked,
@@ -755,7 +869,15 @@ def _flux_tube_series(
     ``radius_cm``, ``normalize_radius_cm`` and ``subtract_background`` are
     passed through unchanged; see ``_flux_tube_profile_stats``.
     """
-    names = ("ftavg", "ftavg_sem", "scatter_sem", "core", "centroid", "edge")
+    names = (
+        "ftavg",
+        "ftavg_sem",
+        "scatter_sem",
+        "core",
+        "core_sem",
+        "centroid",
+        "edge",
+    )
     n_z, _, n_t = profiles.shape
     out = {
         name: np.full((n_z, n_t), np.nan, dtype=np.float64) for name in names
@@ -1773,6 +1895,8 @@ def _flow_symmetrized_profiles(
     upstream: dict,
     downstream: dict,
     areas_cm2: dict[str, dict[str, float]],
+    *,
+    signed: bool = False,
 ) -> dict[str, np.ndarray]:
     """Return the flow-artifact-cancelled current density from both probe faces.
 
@@ -1790,6 +1914,19 @@ def _flow_symmetrized_profiles(
     wherever either face is non-finite or non-positive, since a geometric mean
     of a non-positive current is not defined; ``_flux_tube_profile_stats`` then
     drops those cells from the quadrature.
+
+    ``signed=True`` keeps that cell instead, as
+    ``copysign(sqrt(|J_up J_dn|), J_up + J_dn)``: the magnitude is the same
+    geometric mean and the sign is the one the two faces agree on through
+    their sum.  Wherever the default rule reports a value -- both faces finite
+    and positive -- the two agree BIT FOR BIT, since the default already takes
+    the root of the absolute product and the sum of two positive faces is
+    positive; they differ only where the default reports nothing.  A zero sum
+    takes the positive sign.  This is a DISCRIMINATOR convention and NOT the
+    comparand: it exists so a reduction's outer cells do not leave the
+    quadrature one at a time as the afterglow decays through zero, which is a
+    change in what is being integrated wearing the clothes of a change in the
+    plasma.  The comparand rows keep the default.
     """
     if not np.array_equal(upstream["port"], downstream["port"]):
         raise ValueError(
@@ -1838,8 +1975,18 @@ def _flow_symmetrized_profiles(
             with np.errstate(invalid="ignore", divide="ignore"):
                 relatives.append(current_sem / current)
         product = densities[0] * densities[1]
-        usable = np.isfinite(product) & (product > 0.0)
-        geomean[index] = np.where(usable, np.sqrt(np.abs(product)), np.nan)
+        if signed:
+            usable = np.isfinite(product)
+            geomean[index] = np.where(
+                usable,
+                np.copysign(
+                    np.sqrt(np.abs(product)), densities[0] + densities[1]
+                ),
+                np.nan,
+            )
+        else:
+            usable = np.isfinite(product) & (product > 0.0)
+            geomean[index] = np.where(usable, np.sqrt(np.abs(product)), np.nan)
         # d(sqrt(ab))/sqrt(ab) = 0.5 * hypot(da/a, db/b)
         sem[index] = geomean[index] * 0.5 * np.hypot(relatives[0], relatives[1])
         pairing.append(
@@ -1861,11 +2008,28 @@ def _isat_decay_stats(
     profile_path: Path,
     zero_offsets_path: Path,
     experiment_set_id: int,
+    *,
+    radial: bool = False,
 ) -> dict[str, np.ndarray | float | int | str]:
-    """Return offset-corrected x=0 upstream Isat mean and shot SEM."""
+    """Return offset-corrected x=0 upstream Isat mean and shot SEM.
+
+    ``radial=True`` additionally reduces EVERY scanned x position of the same
+    afterglow traces and returns the full line scan as ``profile_mean_a`` /
+    ``profile_sem_a``, shaped ``(port, x, time)`` on ``x_cm`` and on the same
+    ``time_ms`` grid, so the radial-averaging conventions can be taken on the
+    decay the way they are already taken on the dead-time line scans.  Each
+    position is reduced by the SAME statements as ``x = 0``, against its OWN
+    per-position high-current shot rejection -- which at ``x = 0`` is the mask
+    the x=0 rows already use -- so the ``x = 0`` column of the returned profile
+    is the exported ``mean_a`` / ``sem_a`` bit for bit.  It costs one raw read
+    and one filter pass per position, so it is off by default and the x=0-only
+    caller is unaffected.
+    """
     zero_offsets = _load_zero_offsets(zero_offsets_path)
     means = []
     sems = []
+    profile_means = []
+    profile_sems = []
     ports = []
     run_ids = []
     n_used = []
@@ -1909,18 +2073,12 @@ def _isat_decay_stats(
             channel_kind=channel,
             invert_polarity=invert_polarity,
         )
-        flagged = _high_shot_outlier_mask(
+        flag_grid = _high_shot_outlier_mask(
             deadtime_means,
             sigma=sigma,
             ratio=ratio,
             min_shots_used=min_shots,
-        )[x_idx]
-        reject_shot = np.any(flagged, axis=1)
-        if np.sum(~reject_shot) < min_shots:
-            flag_counts = np.sum(flagged, axis=1)
-            keep = np.argsort(flag_counts)[:min_shots]
-            reject_shot[:] = True
-            reject_shot[keep] = False
+        )
 
         sweep = run.config.sweep
         decay_start_s = sweep.t0_s + sweep.n_cycles * sweep.tau_cycle_s
@@ -1931,31 +2089,72 @@ def _isat_decay_stats(
             ISAT_DECAY_FILTER_PAD_S,
         )
         channel_config = run.config.channel(channel)
-        shot_start = run.flat_shot_index(x_idx, 0)
-        shot_stop = shot_start + run.shots_per_position()
-        with run.open() as raw_hdf:
-            raw = raw_hdf[channel_config.hdf5_path][shot_start:shot_stop, sample].astype(
-                np.float64
-            )
-            headers = raw_hdf[f"{channel_config.hdf5_path} headers"][shot_start:shot_stop]
-
         offset_v = _zero_offset_v(run, channel, zero_offsets)
-        voltage = raw * headers["Scale"][:, None] + headers["Offset"][:, None]
-        voltage -= offset_v
-        current = channel_config.apply_calibration(voltage)
-        if invert_polarity:
-            current = -current
-        current = butterworth_lowpass(
-            current,
-            sample_rate_hz=run.sample_rate_hz(),
-            cutoff_hz=ISAT_DECAY_CUTOFF_HZ,
-            axis=-1,
-        )[:, crop]
-
         samples_per_bin = max(1, int(round(ISAT_DECAY_BIN_S / run.sample_dt_s())))
-        n_bins = current.shape[1] // samples_per_bin
-        current = current[:, : n_bins * samples_per_bin]
-        current = current.reshape(current.shape[0], n_bins, samples_per_bin).mean(axis=2)
+
+        def _reduce_position(position: int, raw_hdf):
+            """Shot mean and SEM of one scanned position's afterglow trace."""
+            flagged = flag_grid[position]
+            reject_shot = np.any(flagged, axis=1)
+            if np.sum(~reject_shot) < min_shots:
+                flag_counts = np.sum(flagged, axis=1)
+                keep = np.argsort(flag_counts)[:min_shots]
+                reject_shot[:] = True
+                reject_shot[keep] = False
+
+            shot_start = run.flat_shot_index(position, 0)
+            shot_stop = shot_start + run.shots_per_position()
+            raw = raw_hdf[channel_config.hdf5_path][
+                shot_start:shot_stop, sample
+            ].astype(np.float64)
+            headers = raw_hdf[f"{channel_config.hdf5_path} headers"][
+                shot_start:shot_stop
+            ]
+
+            voltage = raw * headers["Scale"][:, None] + headers["Offset"][:, None]
+            voltage -= offset_v
+            current = channel_config.apply_calibration(voltage)
+            if invert_polarity:
+                current = -current
+            current = butterworth_lowpass(
+                current,
+                sample_rate_hz=run.sample_rate_hz(),
+                cutoff_hz=ISAT_DECAY_CUTOFF_HZ,
+                axis=-1,
+            )[:, crop]
+
+            n_bins = current.shape[1] // samples_per_bin
+            current = current[:, : n_bins * samples_per_bin]
+            current = current.reshape(
+                current.shape[0], n_bins, samples_per_bin
+            ).mean(axis=2)
+
+            retained = current[~reject_shot]
+            mean = np.mean(retained, axis=0)
+            std = np.std(retained, axis=0, ddof=1)
+            return (
+                mean,
+                std / np.sqrt(retained.shape[0]),
+                retained.shape[0],
+                int(np.sum(reject_shot)),
+                n_bins,
+            )
+
+        scanned = range(x_cm.size) if radial else (x_idx,)
+        position_means: dict[int, np.ndarray] = {}
+        position_sems: dict[int, np.ndarray] = {}
+        with run.open() as raw_hdf:
+            for position in scanned:
+                (
+                    position_means[position],
+                    position_sems[position],
+                    kept,
+                    dropped,
+                    n_bins,
+                ) = _reduce_position(position, raw_hdf)
+                if position == x_idx:
+                    x0_kept, x0_dropped = kept, dropped
+
         start_index = sample.start + crop.start
         time_s = run.time_axis(n_bins * samples_per_bin, start_index=start_index)
         time_ms = (
@@ -1965,18 +2164,29 @@ def _isat_decay_stats(
             * 1000.0
         )
 
-        retained = current[~reject_shot]
         if reference_time_ms is None:
             reference_time_ms = time_ms
         elif not np.allclose(time_ms, reference_time_ms, rtol=0.0, atol=1e-9):
             raise ValueError(f"Isat decay time grid differs for run {run_id}")
-        mean = np.mean(retained, axis=0)
-        std = np.std(retained, axis=0, ddof=1)
-        sem = std / np.sqrt(retained.shape[0])
+        mean = position_means[x_idx]
+        sem = position_sems[x_idx]
+        profile_mean = (
+            np.stack([position_means[i] for i in scanned], axis=0) if radial else None
+        )
+        profile_sem = (
+            np.stack([position_sems[i] for i in scanned], axis=0) if radial else None
+        )
         registered = LATE_AFTERGLOW_PROBE_LOCAL_CURRENT.get((run_id, channel.value))
         if registered is not None:
             mean = np.full_like(mean, np.nan)
             sem = np.full_like(sem, np.nan)
+            if radial:
+                # The registered exclusion is a property of the RUN's channel,
+                # not of one scanned position, so it takes the whole line scan
+                # with it: a face excluded at x=0 is excluded at every radius
+                # and therefore under every radial-averaging convention.
+                profile_mean = np.full_like(profile_mean, np.nan)
+                profile_sem = np.full_like(profile_sem, np.nan)
             excluded.append(True)
             excluded_reason.append(str(registered["source"]))
         else:
@@ -1984,10 +2194,13 @@ def _isat_decay_stats(
             excluded_reason.append("")
         means.append(mean)
         sems.append(sem)
+        if radial:
+            profile_means.append(profile_mean)
+            profile_sems.append(profile_sem)
         ports.append(int(run.config.probe.port or 0))
         run_ids.append(run_id)
-        n_used.append(retained.shape[0])
-        n_rejected.append(int(np.sum(reject_shot)))
+        n_used.append(x0_kept)
+        n_rejected.append(x0_dropped)
         zero_offset_v.append(offset_v)
         source_channels.append(channel.value)
         source_inverted.append(invert_polarity)
@@ -1998,10 +2211,20 @@ def _isat_decay_stats(
             f"No experiment-set-{experiment_set_id} upstream Isat decay traces found"
         )
     order = np.argsort(ports)
+    radial_fields = (
+        {
+            "x_cm": x_cm,
+            "profile_mean_a": np.asarray(profile_means)[order],
+            "profile_sem_a": np.asarray(profile_sems)[order],
+        }
+        if radial
+        else {}
+    )
     return {
         "time_ms": reference_time_ms,
         "mean_a": np.asarray(means)[order],
         "sem_a": np.asarray(sems)[order],
+        **radial_fields,
         "port": np.asarray(ports, dtype=np.int16)[order],
         "run_id": np.asarray(run_ids)[order],
         "n_shots_used": np.asarray(n_used, dtype=np.int16)[order],
@@ -2108,6 +2331,327 @@ def _isat_decay_geomean(
         "sem_a_per_cm2": sem,
         "area_cm2": np.asarray(used_areas, dtype=np.float64),
         "pairing": np.asarray(pairing),
+    }
+
+
+def _decay_noise_floor_a(trace: np.ndarray, tail_mask: np.ndarray) -> float:
+    """Return the e-fold fit's noise floor for one decay trace.
+
+    ``ISAT_DECAY_NOISE_SIGMAS`` times the robust sigma (1.4826 x MAD) of the
+    trace's OWN final ``ISAT_DECAY_NOISE_TAIL_MS``, where the plasma is gone.
+    Each trace carries its own floor, so a convention that averages more of
+    the column -- and therefore more of the outer noise -- is not fitted
+    against another convention's floor.
+
+    Returns 0.0 -- positivity only, which is ``_decay_efold_ms``'s own default
+    mode -- when the tail carries NO finite sample, because then the trace
+    states no noise level and one must not be manufactured from another
+    trace's.  The substitution is visible in the product: the floor actually
+    used is ``isat_decay_matrix_noise_floor_a`` and the sample count that
+    entered each fit is ``isat_decay_matrix_n_fit``, so a reader can see both
+    that it happened and whether it mattered.
+
+    A NEGATIVE floor cannot arise -- it is a scaled MAD -- but a NEGATIVE
+    TAIL can, since the signed chain reports a non-positive area average as
+    the measurement it is.  The MAD is taken about the tail's own median, so
+    it measures that tail's spread whatever level the tail sits at; whether
+    the level itself is plasma is a separate question, and it is the one
+    ``isat_decay_matrix_tail_baseline_frac`` answers.
+    """
+    tail = np.asarray(trace, dtype=np.float64)[tail_mask]
+    if not np.any(np.isfinite(tail)):
+        return 0.0
+    return float(
+        ISAT_DECAY_NOISE_SIGMAS
+        * 1.4826
+        * np.nanmedian(np.abs(tail - np.nanmedian(tail)))
+    )
+
+
+def _decay_efold_ms(
+    t_ms: np.ndarray,
+    y: np.ndarray,
+    floor: float = 0.0,
+) -> float:
+    """Return the log-linear e-folding decay time [ms] of ``y`` over ``t_ms``.
+
+    Positive for a decaying signal.  NaN when fewer than 8 samples survive the
+    positivity/noise-floor mask, or when the fitted slope is not a decay.  One
+    unweighted least-squares line through ``log(y)``; the SAME estimator the
+    transport comparison's stage (iii) applies to ``isat_decay_mean_a``, so a
+    tau exported here and a tau quoted there are the same number computed the
+    same way rather than two fits that happen to be described alike.
+    """
+    t_ms = np.asarray(t_ms, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    good = np.isfinite(t_ms) & np.isfinite(y) & (y > max(floor, 0.0))
+    if np.count_nonzero(good) < 8:
+        return np.nan
+    slope = np.polyfit(t_ms[good], np.log(y[good]), 1)[0]
+    return -1.0 / slope if slope < 0.0 else np.nan
+
+
+def _decay_efold_sigma_ms(
+    t_ms: np.ndarray,
+    y: np.ndarray,
+    sem: np.ndarray,
+    floor: float = 0.0,
+) -> float:
+    """Return the 1-sigma measurement uncertainty [ms] of ``_decay_efold_ms``.
+
+    ESTIMATOR.  The per-sample SEM is propagated through the very fit
+    ``_decay_efold_ms`` performs.  That fit is an unweighted least-squares line
+    through ``log(y)`` over the same mask, so the fitted slope is a fixed
+    linear combination of the fitted samples::
+
+        slope = sum_i c_i log(y_i),   c_i = (t_i - tbar) / sum_j (t_j - tbar)^2
+
+    each ``log(y_i)`` carries ``sem_i / y_i`` by the delta method, and
+    ``tau = -1 / slope`` carries::
+
+        sigma_tau = tau^2 * sqrt( sum_i c_i^2 (sem_i / y_i)^2 )
+
+    Samples are treated as INDEPENDENT, which is what a per-sample SEM states
+    on its own; any sample-to-sample correlation left by the 100 kHz anti-alias
+    filter would make this an UNDER-estimate, so the returned sigma is a lower
+    bound on the measurement uncertainty in that sense.
+
+    NaN under exactly the conditions that make ``_decay_efold_ms`` NaN, and
+    additionally when a fitted sample carries a non-finite or non-positive
+    SEM -- an uncertainty is not invented where the trace states none.
+    """
+    t_ms = np.asarray(t_ms, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    sem = np.asarray(sem, dtype=np.float64)
+    good = np.isfinite(t_ms) & np.isfinite(y) & (y > max(floor, 0.0))
+    if np.count_nonzero(good) < 8:
+        return np.nan
+    t_fit, y_fit, sem_fit = t_ms[good], y[good], sem[good]
+    if not np.all(np.isfinite(sem_fit)) or np.any(sem_fit <= 0.0):
+        return np.nan
+    slope = np.polyfit(t_fit, np.log(y_fit), 1)[0]
+    if not slope < 0.0:
+        return np.nan
+    dt = t_fit - t_fit.mean()
+    s_tt = float(np.sum(dt * dt))
+    if not s_tt > 0.0:
+        return np.nan
+    var_slope = float(np.sum((dt / s_tt) ** 2 * (sem_fit / y_fit) ** 2))
+    tau = -1.0 / slope
+    return float(tau * tau * np.sqrt(var_slope))
+
+
+def _decay_tau_by_position(
+    time_ms: np.ndarray,
+    profiles: np.ndarray,
+    profile_sem: np.ndarray,
+    window_ms: tuple[float, float] = ISAT_DECAY_FIT_WINDOW_MS,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return ``(tau, tau_sem)`` [ms] per port and per SCANNED POSITION.
+
+    ``profiles`` / ``profile_sem`` are shaped ``(port, x, time)``; both
+    returned arrays are ``(port, x)``.  The e-fold of each position's own
+    trace, by the same recipe every matrix cell uses -- so this is the decay
+    as a function of radius with NO averaging convention between the
+    measurement and the number, and the convention rows can be read against
+    it rather than against each other.
+    """
+    t = np.asarray(time_ms, dtype=np.float64)
+    t0, t1 = float(window_ms[0]), float(window_ms[1])
+    window = (t >= t0) & (t <= t1)
+    tail = t >= t.max() - ISAT_DECAY_NOISE_TAIL_MS
+    n_port, n_x, _ = profiles.shape
+    tau = np.full((n_port, n_x), np.nan, dtype=np.float64)
+    tau_sem = np.full((n_port, n_x), np.nan, dtype=np.float64)
+    for p in range(n_port):
+        for xi in range(n_x):
+            trace = np.asarray(profiles[p, xi], dtype=np.float64)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                floor = _decay_noise_floor_a(trace, tail)
+            tau[p, xi] = _decay_efold_ms(t[window], trace[window], floor)
+            tau_sem[p, xi] = _decay_efold_sigma_ms(
+                t[window],
+                trace[window],
+                np.asarray(profile_sem[p, xi], dtype=np.float64)[window],
+                floor,
+            )
+    return tau, tau_sem
+
+
+def _isat_decay_matrix(
+    time_ms: np.ndarray,
+    cells: dict[tuple[str, str], tuple[np.ndarray, np.ndarray]],
+    ports: np.ndarray,
+    excluded: dict[str, np.ndarray],
+    excluded_reason: dict[str, np.ndarray],
+    edges: dict[tuple[str, str], np.ndarray] | None = None,
+    window_ms: tuple[float, float] = ISAT_DECAY_FIT_WINDOW_MS,
+) -> dict[str, np.ndarray]:
+    """Return the afterglow e-fold matrix over face x convention x port.
+
+    ``cells`` maps ``(face, convention)`` -- one key per entry of
+    ``ISAT_DECAY_MATRIX_FACES`` x ``ISAT_DECAY_MATRIX_CONVENTIONS`` -- to that
+    cell's ``(mean, sem)`` traces, each shaped ``(port, time)`` on ``time_ms``.
+    EVERY cell is fitted by the one recipe: a noise floor from its own final
+    ``ISAT_DECAY_NOISE_TAIL_MS``, then ``_decay_efold_ms`` over
+    ``window_ms`` on this grid's own clock.  Nothing about the fit knows which
+    face or which radial average it was handed, which is what makes the nine
+    numbers comparable with each other.
+
+    ``excluded`` / ``excluded_reason`` are per FACE, keyed by face label: an
+    exclusion is a property of the run's channel, so a face excluded on one
+    convention is excluded on all four and the reason travels with it.
+
+    ``edges`` optionally maps the same keys to that cell's per-sample
+    integration limit, shaped ``(port, time)``; it is what condition (iii) of
+    the REPORTABILITY GATE is read from.  The gate does not change a single
+    tau -- every cell is fitted and returned either way -- it only says which
+    of them mean what their name says.  Its three measurements come back as
+    ``outside_min_a``, ``tail_baseline_frac`` and ``edge_drift_cm``, and the
+    verdict as ``reportable``; see ISAT_DECAY_TAIL_BASELINE_MAX_FRAC and
+    ISAT_DECAY_EDGE_DRIFT_MAX_CM for what each one tests and why.  Conditions
+    (i) and (iii) are properties of an AREA integral, so they are ``nan`` on
+    the ``x0`` and ``core`` rows, which are not one; (ii) applies to every
+    trace.  An excluded face is never reportable.
+    """
+    t = np.asarray(time_ms, dtype=np.float64)
+    t0, t1 = float(window_ms[0]), float(window_ms[1])
+    window = (t >= t0) & (t <= t1)
+    tail = t >= t.max() - ISAT_DECAY_NOISE_TAIL_MS
+    n_face = len(ISAT_DECAY_MATRIX_FACES)
+    n_conv = len(ISAT_DECAY_MATRIX_CONVENTIONS)
+    n_port = len(ports)
+
+    tau = np.full((n_face, n_conv, n_port), np.nan, dtype=np.float64)
+    tau_sem = np.full((n_face, n_conv, n_port), np.nan, dtype=np.float64)
+    noise_floor = np.full((n_face, n_conv, n_port), np.nan, dtype=np.float64)
+    n_fit = np.zeros((n_face, n_conv, n_port), dtype=np.int16)
+    outside_min = np.full((n_face, n_conv, n_port), np.nan, dtype=np.float64)
+    baseline_frac = np.full((n_face, n_conv, n_port), np.nan, dtype=np.float64)
+    edge_drift = np.full((n_face, n_conv, n_port), np.nan, dtype=np.float64)
+    area_conventions = ("ftavg", "column")
+    first_in_window = int(np.argmax(window))
+    for fi, face in enumerate(ISAT_DECAY_MATRIX_FACES):
+        for ci, convention in enumerate(ISAT_DECAY_MATRIX_CONVENTIONS):
+            mean, sem = cells[(face, convention)]
+            mean = np.asarray(mean, dtype=np.float64)
+            sem = np.asarray(sem, dtype=np.float64)
+            if mean.shape != (n_port, t.size) or sem.shape != mean.shape:
+                raise ValueError(
+                    f"decay matrix cell ({face}, {convention}) is shaped "
+                    f"{mean.shape}/{sem.shape}, not {(n_port, t.size)}"
+                )
+            for p in range(n_port):
+                with warnings.catch_warnings():
+                    # An all-NaN tail is an expected state of an area-averaged
+                    # row; _decay_noise_floor_a answers it explicitly.
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    floor = _decay_noise_floor_a(mean[p], tail)
+                windowed = mean[p, window]
+                noise_floor[fi, ci, p] = floor
+                n_fit[fi, ci, p] = int(
+                    np.count_nonzero(
+                        np.isfinite(windowed) & (windowed > max(floor, 0.0))
+                    )
+                )
+                tau[fi, ci, p] = _decay_efold_ms(t[window], windowed, floor)
+                tau_sem[fi, ci, p] = _decay_efold_sigma_ms(
+                    t[window], windowed, sem[p, window], floor
+                )
+
+                # (ii) does the trace come back to nothing?  The late tail's
+                # own level against the level this trace starts the window at.
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", category=RuntimeWarning)
+                    tail_level = float(np.nanmedian(mean[p, tail]))
+                start_level = float(mean[p, first_in_window])
+                if np.isfinite(tail_level) and np.isfinite(start_level):
+                    if start_level != 0.0:
+                        baseline_frac[fi, ci, p] = abs(tail_level) / abs(
+                            start_level
+                        )
+
+                # (iii) does the integral keep its extent across the window?
+                if edges is not None and (face, convention) in edges:
+                    limits = np.asarray(
+                        edges[(face, convention)], dtype=np.float64
+                    )[p, window]
+                    if np.any(np.isfinite(limits)):
+                        with warnings.catch_warnings():
+                            warnings.simplefilter(
+                                "ignore", category=RuntimeWarning
+                            )
+                            edge_drift[fi, ci, p] = float(
+                                np.nanmax(limits) - np.nanmin(limits)
+                            )
+
+    # (i) is a property of the PAIR of area rows, so it is measured once per
+    # face and port and carried onto both of them: where the column stops
+    # exceeding the tube there is no inventory outside the tube, and neither
+    # area row is the thing its name says.
+    for fi, face in enumerate(ISAT_DECAY_MATRIX_FACES):
+        if (face, "ftavg") not in cells or (face, "column") not in cells:
+            continue
+        tube = np.asarray(cells[(face, "ftavg")][0], dtype=np.float64)
+        column = np.asarray(cells[(face, "column")][0], dtype=np.float64)
+        for p in range(n_port):
+            outside = (column[p] - tube[p])[window]
+            if not np.any(np.isfinite(outside)):
+                continue
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", category=RuntimeWarning)
+                smallest = float(np.nanmin(outside))
+            for convention in area_conventions:
+                ci = ISAT_DECAY_MATRIX_CONVENTIONS.index(convention)
+                outside_min[fi, ci, p] = smallest
+
+    reportable = np.ones((n_face, n_conv, n_port), dtype=np.bool_)
+    for fi, face in enumerate(ISAT_DECAY_MATRIX_FACES):
+        face_excluded = np.asarray(excluded[face], dtype=np.bool_)
+        for ci in range(n_conv):
+            for p in range(n_port):
+                passes = (
+                    np.isfinite(baseline_frac[fi, ci, p])
+                    and baseline_frac[fi, ci, p]
+                    < ISAT_DECAY_TAIL_BASELINE_MAX_FRAC
+                )
+                if ISAT_DECAY_MATRIX_CONVENTIONS[ci] in area_conventions:
+                    passes = (
+                        passes
+                        and np.isfinite(outside_min[fi, ci, p])
+                        and outside_min[fi, ci, p] > 0.0
+                        and np.isfinite(edge_drift[fi, ci, p])
+                        and edge_drift[fi, ci, p] < ISAT_DECAY_EDGE_DRIFT_MAX_CM
+                    )
+                reportable[fi, ci, p] = bool(
+                    passes
+                    and not face_excluded[p]
+                    and np.isfinite(tau[fi, ci, p])
+                )
+
+    return {
+        "outside_min_a": outside_min,
+        "tail_baseline_frac": baseline_frac,
+        "edge_drift_cm": edge_drift,
+        "reportable": reportable,
+        "tau_ms": tau,
+        "tau_sem_ms": tau_sem,
+        "noise_floor_a": noise_floor,
+        "n_fit": n_fit,
+        "window_ms": np.asarray([t0, t1], dtype=np.float64),
+        "face": np.asarray(ISAT_DECAY_MATRIX_FACES),
+        "convention": np.asarray(ISAT_DECAY_MATRIX_CONVENTIONS),
+        "port": np.asarray(ports, dtype=np.int16),
+        "excluded": np.stack(
+            [np.asarray(excluded[f], dtype=np.bool_) for f in ISAT_DECAY_MATRIX_FACES],
+            axis=0,
+        ),
+        "excluded_reason": np.stack(
+            [np.asarray(excluded_reason[f]) for f in ISAT_DECAY_MATRIX_FACES],
+            axis=0,
+        ),
+        "n_window": int(np.count_nonzero(window)),
     }
 
 
@@ -2629,6 +3173,7 @@ def export_overlay(
         isat_profile_path,
         zero_offsets_path,
         experiment_set_id,
+        radial=True,
     )
     if not np.array_equal(isat_decay["port"], PORTS):
         raise ValueError(
@@ -2640,6 +3185,7 @@ def export_overlay(
         rot0_isat_profile_path,
         zero_offsets_path,
         experiment_set_id,
+        radial=True,
     )
     if not np.array_equal(isat_decay_dn["port"], PORTS):
         raise ValueError(
@@ -2651,6 +3197,171 @@ def export_overlay(
         isat_decay_dn,
         face_areas_cm2,
     )
+    # The afterglow line scans, reduced under the two AREA conventions.  The
+    # geometric mean is taken on the profiles by the same function the
+    # dead-time scans use, so the decay geomean and the drive geomean are the
+    # same construction on two clocks.
+    if not np.allclose(isat_decay["x_cm"], isat_decay_dn["x_cm"]):
+        raise ValueError("Isat decay faces disagree on the x grid")
+    decay_geomean_scans = _flow_symmetrized_profiles(
+        {
+            "port": isat_decay["port"],
+            "run_id": isat_decay["run_id"],
+            "x_cm": isat_decay["x_cm"],
+            "time_ms": isat_decay["time_ms"],
+            "isat_a": isat_decay["profile_mean_a"],
+            "sem_a": isat_decay["profile_sem_a"],
+            "source_channel": isat_decay["source_channel"],
+        },
+        {
+            "port": isat_decay_dn["port"],
+            "run_id": isat_decay_dn["run_id"],
+            "x_cm": isat_decay_dn["x_cm"],
+            "time_ms": isat_decay_dn["time_ms"],
+            "isat_a": isat_decay_dn["profile_mean_a"],
+            "sem_a": isat_decay_dn["profile_sem_a"],
+            "source_channel": isat_decay_dn["source_channel"],
+        },
+        face_areas_cm2,
+    )
+    decay_face_profiles = {
+        "upstream": (isat_decay["profile_mean_a"], isat_decay["profile_sem_a"]),
+        "downstream": (
+            isat_decay_dn["profile_mean_a"],
+            isat_decay_dn["profile_sem_a"],
+        ),
+        "geomean": (decay_geomean_scans["profiles"], decay_geomean_scans["sem"]),
+    }
+    decay_reduced: dict[tuple[str, str], dict[str, np.ndarray]] = {}
+    for face, (profiles, profile_sem) in decay_face_profiles.items():
+        decay_reduced[(face, "ftavg")] = _flux_tube_series(
+            profiles,
+            isat_decay["x_cm"],
+            profile_sem,
+            subtract_background=False,
+        )
+        decay_reduced[(face, "column")] = _flux_tube_series(
+            profiles,
+            isat_decay["x_cm"],
+            profile_sem,
+            radius_cm=None,
+            normalize_radius_cm=FLUX_TUBE_RADIUS_CM,
+            subtract_background=False,
+        )
+    decay_matrix_cells = {
+        ("upstream", "x0"): (isat_decay["mean_a"], isat_decay["sem_a"]),
+        ("downstream", "x0"): (isat_decay_dn["mean_a"], isat_decay_dn["sem_a"]),
+        ("geomean", "x0"): (
+            isat_decay_geomean["geomean_a_per_cm2"],
+            isat_decay_geomean["sem_a_per_cm2"],
+        ),
+    }
+    for (face, convention), reduced in decay_reduced.items():
+        decay_matrix_cells[(face, convention)] = (
+            reduced["ftavg"],
+            reduced["ftavg_sem"],
+        )
+        if convention == "ftavg":
+            # The core band is taken before the quadrature's outer limit is
+            # chosen, so it is the same number under both reductions; read it
+            # off the flux-tube pass rather than reducing the profiles twice.
+            decay_matrix_cells[(face, "core")] = (
+                reduced["core"],
+                reduced["core_sem"],
+            )
+    decay_matrix_edges = {
+        key: reduced["edge"] for key, reduced in decay_reduced.items()
+    }
+    decay_matrix = _isat_decay_matrix(
+        isat_decay["time_ms"],
+        decay_matrix_cells,
+        isat_decay["port"],
+        {
+            "upstream": isat_decay["excluded"],
+            "downstream": isat_decay_dn["excluded"],
+            "geomean": isat_decay["excluded"] | isat_decay_dn["excluded"],
+        },
+        {
+            "upstream": isat_decay["excluded_reason"],
+            "downstream": isat_decay_dn["excluded_reason"],
+            "geomean": np.asarray(
+                [
+                    " | ".join(part for part in (up, dn) if part)
+                    for up, dn in zip(
+                        isat_decay["excluded_reason"],
+                        isat_decay_dn["excluded_reason"],
+                    )
+                ]
+            ),
+        },
+        decay_matrix_edges,
+    )
+    # DISCRIMINATOR (a): a whole-column geomean whose outer limit CANNOT move
+    # and whose outer cells cannot drop out one at a time.  Both failure modes
+    # the gate tests for are removed by construction, so what is left in its
+    # tau is the plasma.
+    decay_signed_geomean = _flow_symmetrized_profiles(
+        {
+            "port": isat_decay["port"],
+            "run_id": isat_decay["run_id"],
+            "x_cm": isat_decay["x_cm"],
+            "time_ms": isat_decay["time_ms"],
+            "isat_a": isat_decay["profile_mean_a"],
+            "sem_a": isat_decay["profile_sem_a"],
+            "source_channel": isat_decay["source_channel"],
+        },
+        {
+            "port": isat_decay_dn["port"],
+            "run_id": isat_decay_dn["run_id"],
+            "x_cm": isat_decay_dn["x_cm"],
+            "time_ms": isat_decay_dn["time_ms"],
+            "isat_a": isat_decay_dn["profile_mean_a"],
+            "sem_a": isat_decay_dn["profile_sem_a"],
+            "source_channel": isat_decay_dn["source_channel"],
+        },
+        face_areas_cm2,
+        signed=True,
+    )
+    decay_fixed_column = _flux_tube_series(
+        decay_signed_geomean["profiles"],
+        isat_decay["x_cm"],
+        decay_signed_geomean["sem"],
+        radius_cm=ISAT_DECAY_FIXED_EDGE_CM,
+        normalize_radius_cm=FLUX_TUBE_RADIUS_CM,
+        subtract_background=False,
+    )
+    decay_fixed_tau = np.full(len(isat_decay["port"]), np.nan, dtype=np.float64)
+    decay_fixed_tau_sem = np.full_like(decay_fixed_tau, np.nan)
+    _decay_t = np.asarray(isat_decay["time_ms"], dtype=np.float64)
+    _decay_window = (_decay_t >= ISAT_DECAY_FIT_WINDOW_MS[0]) & (
+        _decay_t <= ISAT_DECAY_FIT_WINDOW_MS[1]
+    )
+    _decay_tail = _decay_t >= _decay_t.max() - ISAT_DECAY_NOISE_TAIL_MS
+    for _p in range(decay_fixed_tau.size):
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=RuntimeWarning)
+            _floor = _decay_noise_floor_a(
+                decay_fixed_column["ftavg"][_p], _decay_tail
+            )
+        decay_fixed_tau[_p] = _decay_efold_ms(
+            _decay_t[_decay_window],
+            decay_fixed_column["ftavg"][_p, _decay_window],
+            _floor,
+        )
+        decay_fixed_tau_sem[_p] = _decay_efold_sigma_ms(
+            _decay_t[_decay_window],
+            decay_fixed_column["ftavg"][_p, _decay_window],
+            decay_fixed_column["ftavg_sem"][_p, _decay_window],
+            _floor,
+        )
+    # DISCRIMINATOR (b): the e-fold as a function of RADIUS, with no averaging
+    # convention between the measurement and the number.
+    decay_tau_x = {}
+    decay_tau_x_sem = {}
+    for _face, (_profiles, _profile_sem) in decay_face_profiles.items():
+        decay_tau_x[_face], decay_tau_x_sem[_face] = _decay_tau_by_position(
+            isat_decay["time_ms"], _profiles, _profile_sem
+        )
     interf_decay = _interferometer_decay_stats(
         dataset,
         experiment_set_id,
@@ -2782,6 +3493,34 @@ def export_overlay(
         geomean_scans["profiles"],
         upstream_scans["x_cm"],
         geomean_scans["sem"],
+    )
+    # The WHOLE-COLUMN convention for the same three Isat faces: the same
+    # quadrature over the same comparand profiles, integrated to each sample's
+    # own column edge and expressed over the tube's area, so the Isat rows
+    # exist in all three conventions the density rows already do.
+    upstream_column = _flux_tube_series(
+        upstream_scans["isat_a"],
+        upstream_scans["x_cm"],
+        upstream_scans["sem_a"],
+        radius_cm=None,
+        normalize_radius_cm=FLUX_TUBE_RADIUS_CM,
+        subtract_background=False,
+    )
+    isat_column = _flux_tube_series(
+        rot0_isat["isat_a"],
+        rot0_isat["x_cm"],
+        rot0_isat["sem_a"],
+        radius_cm=None,
+        normalize_radius_cm=FLUX_TUBE_RADIUS_CM,
+        subtract_background=False,
+    )
+    geomean_column = _flux_tube_series(
+        geomean_scans["profiles"],
+        upstream_scans["x_cm"],
+        geomean_scans["sem"],
+        radius_cm=None,
+        normalize_radius_cm=FLUX_TUBE_RADIUS_CM,
+        subtract_background=False,
     )
     discharge_raw_fields: dict[str, np.ndarray] = {}
     if raw_discharge_ensemble:
@@ -3069,6 +3808,244 @@ def export_overlay(
             "p50 geomean is NaN from there on.  That is the data and is NOT "
             "clipped."
         ),
+        isat_decay_core_upstream_a=decay_reduced[("upstream", "ftavg")]["core"],
+        isat_decay_core_upstream_sem_a=decay_reduced[("upstream", "ftavg")][
+            "core_sem"
+        ],
+        isat_decay_core_dn_a=decay_reduced[("downstream", "ftavg")]["core"],
+        isat_decay_core_dn_sem_a=decay_reduced[("downstream", "ftavg")]["core_sem"],
+        isat_decay_core_geomean_a_per_cm2=decay_reduced[("geomean", "ftavg")]["core"],
+        isat_decay_core_geomean_sem_a_per_cm2=decay_reduced[("geomean", "ftavg")][
+            "core_sem"
+        ],
+        isat_decay_ftavg_upstream_a=decay_reduced[("upstream", "ftavg")]["ftavg"],
+        isat_decay_ftavg_upstream_sem_a=decay_reduced[("upstream", "ftavg")][
+            "ftavg_sem"
+        ],
+        isat_decay_ftavg_dn_a=decay_reduced[("downstream", "ftavg")]["ftavg"],
+        isat_decay_ftavg_dn_sem_a=decay_reduced[("downstream", "ftavg")]["ftavg_sem"],
+        isat_decay_ftavg_geomean_a_per_cm2=decay_reduced[("geomean", "ftavg")][
+            "ftavg"
+        ],
+        isat_decay_ftavg_geomean_sem_a_per_cm2=decay_reduced[("geomean", "ftavg")][
+            "ftavg_sem"
+        ],
+        isat_decay_column_upstream_a=decay_reduced[("upstream", "column")]["ftavg"],
+        isat_decay_column_upstream_sem_a=decay_reduced[("upstream", "column")][
+            "ftavg_sem"
+        ],
+        isat_decay_column_upstream_edge_cm=decay_reduced[("upstream", "column")][
+            "edge"
+        ],
+        isat_decay_column_dn_a=decay_reduced[("downstream", "column")]["ftavg"],
+        isat_decay_column_dn_sem_a=decay_reduced[("downstream", "column")][
+            "ftavg_sem"
+        ],
+        isat_decay_column_dn_edge_cm=decay_reduced[("downstream", "column")]["edge"],
+        isat_decay_column_geomean_a_per_cm2=decay_reduced[("geomean", "column")][
+            "ftavg"
+        ],
+        isat_decay_column_geomean_sem_a_per_cm2=decay_reduced[("geomean", "column")][
+            "ftavg_sem"
+        ],
+        isat_decay_column_geomean_edge_cm=decay_reduced[("geomean", "column")]["edge"],
+        isat_decay_radial_definition=np.array(
+            "THE AFTERGLOW DECAY IN ALL THREE RADIAL CONVENTIONS.  The same "
+            "continuous afterglow traces behind isat_decay_mean_a are read at "
+            "EVERY scanned x position, not only at x = 0, and reduced by the "
+            "radial-averaging chain the dead-time line scans already use "
+            "(_flux_tube_series on the unsubtracted, despiked profile; see "
+            "ftavg_background, ftavg_definition and column_definition).  Each "
+            "position gets its own high-current shot rejection by the same "
+            "rule the x=0 rows use, so the x = 0 column of the line scan IS "
+            "isat_decay_mean_a / isat_decay_sem_a bit for bit.  The families "
+            "are: isat_decay_core_* (the CORE BAND -- the unweighted mean "
+            "over core_x_min_cm <= x <= core_x_max_cm, a diameter line cut "
+            "with no area weighting, the convention density_mean_cm3 and "
+            "isat_ftavg_*_core_a are in), isat_decay_ftavg_* (flux-tube area "
+            "mean to "
+            "ftavg_radius_cm) and isat_decay_column_* (the column's inventory "
+            "per unit length out to its own edge, expressed over the tube's "
+            "area; the per-sample limit is isat_decay_column_*_edge_cm).  "
+            "EVERY radial convention the plateau rows are exported in "
+            "therefore has a decay counterpart.  The core band is taken "
+            "BEFORE the quadrature chooses its outer limit, so it is one "
+            "number under both area reductions and it survives at samples "
+            "where the area rows do not; its SEM is the per-point shot SEM "
+            "propagated through the unweighted band mean, "
+            "sqrt(sum sem^2) / N over the retained band cells, the band "
+            "companion of the _sem_a the area rows carry.  All "
+            "three faces are carried under all three -- upstream, dn (downstream) "
+            "and geomean, the last built from the two faces' AREA-NORMALIZED "
+            "line scans by the same function as isat_ftavg_geomean_*, so it "
+            "is in A cm^-2 and its core/ftavg/column rows are too.  Every row "
+            "is on "
+            "isat_decay_time_ms.  A face excluded by the late-afterglow "
+            "probe-local-current registry is NaN at EVERY radius, so its "
+            "core, flux-tube and column rows are NaN too (isat_decay_excluded "
+            "/ "
+            "isat_decay_dn_excluded, reasons in the matching _excluded_reason "
+            "arrays).  These rows and isat_decay_mean_a / isat_decay_dn_mean_a "
+            "/ isat_decay_geomean_a_per_cm2 are the TWELVE time series the "
+            "e-fold matrix is fitted to."
+        ),
+        isat_decay_matrix_tau_ms=decay_matrix["tau_ms"],
+        isat_decay_matrix_tau_sem_ms=decay_matrix["tau_sem_ms"],
+        isat_decay_matrix_noise_floor_a=decay_matrix["noise_floor_a"],
+        isat_decay_matrix_n_fit=decay_matrix["n_fit"],
+        isat_decay_matrix_reportable=decay_matrix["reportable"],
+        isat_decay_matrix_outside_min_a=decay_matrix["outside_min_a"],
+        isat_decay_matrix_tail_baseline_frac=decay_matrix["tail_baseline_frac"],
+        isat_decay_matrix_edge_drift_cm=decay_matrix["edge_drift_cm"],
+        isat_decay_matrix_tail_baseline_max_frac=np.array(
+            ISAT_DECAY_TAIL_BASELINE_MAX_FRAC
+        ),
+        isat_decay_matrix_edge_drift_max_cm=np.array(
+            ISAT_DECAY_EDGE_DRIFT_MAX_CM
+        ),
+        isat_decay_column_fixed_geomean_a_per_cm2=decay_fixed_column["ftavg"],
+        isat_decay_column_fixed_geomean_sem_a_per_cm2=decay_fixed_column[
+            "ftavg_sem"
+        ],
+        isat_decay_column_fixed_geomean_tau_ms=decay_fixed_tau,
+        isat_decay_column_fixed_geomean_tau_sem_ms=decay_fixed_tau_sem,
+        isat_decay_column_fixed_edge_cm=np.array(ISAT_DECAY_FIXED_EDGE_CM),
+        isat_decay_tau_x_cm=isat_decay["x_cm"],
+        isat_decay_tau_x_ms=np.stack(
+            [decay_tau_x[face] for face in ISAT_DECAY_MATRIX_FACES], axis=0
+        ),
+        isat_decay_tau_x_sem_ms=np.stack(
+            [decay_tau_x_sem[face] for face in ISAT_DECAY_MATRIX_FACES], axis=0
+        ),
+        isat_decay_discriminator_definition=np.array(
+            "TWO READINGS THAT DO NOT DEPEND ON THE GATE, for use where an "
+            "area cell is not reportable (isat_decay_matrix_reportable).  "
+            "(a) isat_decay_column_fixed_geomean_* is a whole-column geomean "
+            "taken to a FIXED isat_decay_column_fixed_edge_cm instead of to "
+            "each sample's own column edge, over a geomean that keeps a "
+            "non-positive face instead of dropping it -- "
+            "copysign(sqrt(|J_up J_dn|), J_up + J_dn), which equals the "
+            "comparand geomean bit for bit wherever the comparand reports a "
+            "value and differs only where it reports none.  Both gate "
+            "failures an area row can suffer are removed by construction: the "
+            "limit cannot drift and the outer cells cannot leave the "
+            "quadrature one at a time, so what remains in its tau "
+            "(isat_decay_column_fixed_geomean_tau_ms, same recipe, same "
+            "window) is the plasma.  It is a DISCRIMINATOR, not a comparand, "
+            "and must not be scored against a model row.  "
+            "(b) isat_decay_tau_x_ms [face, port, x] on isat_decay_tau_x_cm "
+            "is the e-fold of EACH SCANNED POSITION's own trace, by the same "
+            "recipe -- the decay against radius with no averaging convention "
+            "between the measurement and the number.  A tau(x) that falls "
+            "with |x| is the edge cooling faster, stated without reference to "
+            "any convention; the convention rows can be read against it "
+            "rather than against each other.  Its faces are "
+            "isat_decay_matrix_face and its ports isat_decay_matrix_port."
+        ),
+        isat_decay_matrix_n_window=np.array(decay_matrix["n_window"]),
+        isat_decay_matrix_window_ms=decay_matrix["window_ms"],
+        isat_decay_matrix_face=decay_matrix["face"],
+        isat_decay_matrix_convention=decay_matrix["convention"],
+        isat_decay_matrix_port=decay_matrix["port"],
+        isat_decay_matrix_excluded=decay_matrix["excluded"],
+        isat_decay_matrix_excluded_reason=decay_matrix["excluded_reason"],
+        isat_decay_matrix_definition=np.array(
+            "THE AFTERGLOW E-FOLD MATRIX, indexed [face, convention, port] by "
+            "isat_decay_matrix_face x isat_decay_matrix_convention x "
+            "isat_decay_matrix_port, in ms, with isat_decay_matrix_tau_sem_ms "
+            "beside it.  TWELVE cells per port: three probe faces (upstream, "
+            "downstream, geomean) crossed with four conventions, which run "
+            "outward from the axis.  "
+            "NAMING, READ THIS FIRST: the convention labelled 'x0' is the "
+            "x = 0 POINT trace -- isat_decay_mean_a, isat_decay_dn_mean_a and "
+            "isat_decay_geomean_a_per_cm2, the rows the transport "
+            "comparison's stage (iii) already fits -- and it is a DIFFERENT "
+            "quantity from the repo's CORE-BAND convention, which is the "
+            "unweighted mean over "
+            "core_x_min_cm <= x <= core_x_max_cm and appears in this product "
+            "as density_mean_cm3 and isat_ftavg_*_core_a.  Both are carried: "
+            "the core band is the convention labelled 'core' "
+            "(isat_decay_core_*), so 'x0' must not be read as it.  'ftavg' is "
+            "the flux-tube area mean to "
+            "ftavg_radius_cm (isat_decay_ftavg_*) and 'column' the whole-column "
+            "inventory over the tube's area (isat_decay_column_*); see "
+            "isat_decay_radial_definition for how the three radial rows are "
+            "built.  The last three are the SAME three conventions the "
+            "plateau rows are exported in, so a decay and a plateau level can "
+            "be read in one convention.  "
+            "THE FIT IS ONE RECIPE FOR ALL TWELVE CELLS, and it is the recipe "
+            "the transport comparison applies to isat_decay_mean_a: a noise "
+            "floor of 5 x 1.4826 x MAD over the trace's OWN final 5 ms, then "
+            "an unweighted least-squares line through log(I) over "
+            "isat_decay_matrix_window_ms on the isat_decay_time_ms clock, "
+            "tau = -1/slope.  The floor actually used is "
+            "isat_decay_matrix_noise_floor_a and the number of window samples "
+            "that entered each fit is isat_decay_matrix_n_fit, against "
+            "isat_decay_matrix_n_window in the window; where the two agree "
+            "the floor removed nothing.  A cell whose trace has NO FINITE "
+            "TAIL states no noise level and is fitted on positivity alone "
+            "(floor 0.0) rather than against another trace's floor -- that is "
+            "every upstream flux-tube and whole-column cell, whose radial "
+            "quadrature reports nothing once the plasma is gone and the "
+            "signed line scan sums non-positive, while its fit window stays "
+            "fully populated (see _decay_noise_floor_a).  The 'core' row is "
+            "not affected: the band mean is taken before the quadrature and "
+            "is defined at every sample, so it keeps its own tail and its own "
+            "floor.  A cell is NaN where "
+            "fewer than 8 samples clear "
+            "the positivity/noise-floor mask or where the fitted slope is not "
+            "a decay; tau_sem is that fit's per-sample SEM propagated by the "
+            "delta method, samples treated as INDEPENDENT, which the "
+            "100 kHz anti-alias filter makes a LOWER BOUND, and it is NaN "
+            "additionally where a fitted sample carries a non-positive or "
+            "non-finite SEM.  Because every cell shares the recipe, the "
+            "[:, 0, :] slice reproduces the stage (iii) measured tau of "
+            "record exactly, and a difference between two cells is a "
+            "difference between the traces and not between two fits.  "
+            "isat_decay_matrix_excluded / _excluded_reason are per (face, "
+            "port) -- an exclusion belongs to a run's channel, so it takes "
+            "all four conventions of that face with it.  "
+            "THE REPORTABILITY GATE, AND IT IS NOT OPTIONAL READING.  A "
+            "radial average stops measuring a decay before it stops returning "
+            "a tau, so isat_decay_matrix_reportable says per cell whether the "
+            "number means what its name says, and the three measurements "
+            "behind it are exported so the verdict can be checked rather than "
+            "trusted: (i) isat_decay_matrix_outside_min_a, the smallest value "
+            "the OUTSIDE series column-minus-tube takes across the window, "
+            "which must stay POSITIVE or the column is not the tube plus what "
+            "lies outside it; (ii) isat_decay_matrix_tail_baseline_frac, the "
+            "late tail's own level over that trace's level at the window's "
+            "start, which must be under "
+            "isat_decay_matrix_tail_baseline_max_frac or the trace is sitting "
+            "on something that is not plasma; (iii) "
+            "isat_decay_matrix_edge_drift_cm, how far the integration limit "
+            "moves within the window, which must be under "
+            "isat_decay_matrix_edge_drift_max_cm or two different integrals "
+            "were fitted as one trace.  (i) and (iii) are properties of an "
+            "AREA integral and are NaN on the x0 and core rows, which are not "
+            "one; (ii) applies to every cell; an excluded face is never "
+            "reportable.  NOTHING IS DROPPED -- every cell is fitted and "
+            "returned, flagged rather than removed, because a cell that fails "
+            "the gate is evidence about the reduction and deleting it would "
+            "hide that.  WHAT FAILS AT ES1, MEASURED: the UPSTREAM area cells "
+            "fail (i) -- that face's outside inventory turns NEGATIVE inside "
+            "the window, first at p11 at 20.84 ms and at four of the five "
+            "ports -- and its whole-column cells fail (iii) as well at "
+            "p11/p21/p29; both upstream families PASS (ii).  The GEOMEAN "
+            "column fails (iii) at EVERY port, its integration edge "
+            "retreating from about 26 cm to 20-22 cm as either face decays "
+            "through zero and its outer cells leave the quadrature one at a "
+            "time.  The DOWNSTREAM cells pass (i) and (ii) at every port and "
+            "fail (iii) at three of them.  Neither the flux-tube rows nor the "
+            "x0/core rows can fail (iii) at all: their extent is fixed.  That "
+            "pattern is PER SET and this sentence is not the authority for "
+            "any other one -- the exported diagnostics are.  For a reading "
+            "that does not depend on the gate, see "
+            "isat_decay_discriminator_definition.  COMPARISON RULE: "
+            "these are Isat e-folds; the interferometer decay "
+            "(interf_decay_*) is a line-integrated DENSITY decay on its own "
+            "clock and is not a comparand for them."
+        ),
         interf_decay_time_ms=interf_decay["time_ms"],
         interf_decay_line_density_cm2=interf_decay["line_density_cm2"],
         interf_decay_sem_cm2=interf_decay["sem_cm2"],
@@ -3223,10 +4200,22 @@ def export_overlay(
             "where the negative nodes cancel the positive ones the row is NaN. "
             " Measured at this vintage: under the flux-tube convention 0/1/1/1 "
             "samples leave their bound at ES1/ES2/ES3/ES4 and none is in the "
-            "10-19 ms plateau; under the whole-column convention 2/5/1/2 "
-            "leave it and 2/1/2/1 go NaN on a non-positive total weight, all "
-            "at t <= 9 ms where there is nearly no plasma to weight with.  "
-            "te_ftavg_weight_density_cm3 and te_column_weight_density_cm3 are "
+            "SCORING PLATEAU WINDOW, 15.0-19.5 ms (the window the transport "
+            "comparison scores the plateau over, and the one "
+            "RAW_PLATEAU_WINDOW_MS pins); under the whole-column convention "
+            "2/5/1/2 leave it and 2/1/2/1 go NaN on a non-positive total "
+            "weight, all at t <= 9 ms where there is nearly no plasma to "
+            "weight with.  A FOURTH CONSEQUENCE DOES REACH THE PLATEAU: a "
+            "signed weight can make the SEM's weighted variance NEGATIVE, "
+            "which is not a scatter and is reported as NaN rather than "
+            "floored at zero, and at ES3 p50 te_column_sem_ev is NaN at "
+            "t = 16.0 and 17.0 ms -- 2 of the 5 T_e samples that set carries "
+            "in 15.0-19.5 ms, its row's mean finite at both.  A consumer "
+            "averaging that row's SEM over the plateau therefore averages 3 "
+            "samples, not 5, and must say so; every other plateau NaN in "
+            "these rows is ES4 p50, which carries no flux-tube or column row "
+            "at all.  te_ftavg_weight_density_cm3 and "
+            "te_column_weight_density_cm3 are "
             "the denominators, exported so a consumer can see when one is "
             "small.  Nothing is clipped back into range: a clip at zero is the "
             "sign test again under another name.  (4) A WHOLE COLUMN CAN SUM "
@@ -3596,7 +4585,14 @@ def export_overlay(
             "reduction.  column_over_ftavg_ratio is "
             "density_column_cm3 / density_ftavg_cm3 PER SAMPLE: the factor by "
             "which the column's inventory exceeds the tube's, one plus the "
-            "share outside the tube.  THE LEVEL IS THE RATIO OF THE PLATEAU "
+            "share outside the tube -- BUT THAT READING HOLDS ONLY WHILE BOTH "
+            "ROWS ARE POSITIVE.  The signed chain reports a non-positive "
+            "column as the measurement it is, so either row can go negative "
+            "at a sample where the plasma is gone, and there the ratio is one "
+            "noise excursion divided by another: it is NOT a share of "
+            "anything, its sign carries no direction, and a magnitude read "
+            "off it means nothing.  Check the two rows, not the ratio.  "
+            "THE LEVEL IS THE RATIO OF THE PLATEAU "
             "MEANS, not the plateau mean of this field; the per-sample field "
             "is for time-resolved inspection, and where the denominator is at "
             "the noise floor NEITHER is a level -- at ES4 p50 the mean of the "
@@ -3706,7 +4702,18 @@ def export_overlay(
             "fractional total error transferred whole, which is what "
             "ftavg_comparand_map tells a consumer to do with density_ftavg_cm3 "
             "and which gives a different number; a result must say which it "
-            "used.  NEITHER SEM CONTAINS THE SCAN-EXTENT CAVEAT: plasma "
+            "used.  AT A NON-POSITIVE-COLUMN SAMPLE the radial term is still "
+            "reported and is the same statistic: that fallback folds about "
+            "the geometric axis with NON-NEGATIVE weights, which are a proper "
+            "measure whatever sign the values they run over sum to, so the "
+            "scatter of the retained cells about their own weighted average "
+            "is defined and the row does not go bare.  What differs there is "
+            "the AREA: the fallback applies no tube-area renormalization to "
+            "either the row or its radial term, so the two stay consistent "
+            "with each other but sit on the disc they were integrated over "
+            "rather than on pi * ftavg_radius_cm^2.  The calibration term is "
+            "the relative one, as everywhere else.  NEITHER SEM CONTAINS THE "
+            "SCAN-EXTENT CAVEAT: plasma "
             "beyond the |x| = 25 cm scan edge is in no column row and is not "
             "a scatter term (see column_edge_definition)."
         ),
@@ -3881,6 +4888,47 @@ def export_overlay(
             "with "
             "density_total_sem_cm3, which is a radial-scatter SEM plus the "
             "Probe-A area calibration."
+        ),
+        isat_column_upstream_a=upstream_column["ftavg"],
+        isat_column_upstream_sem_a=upstream_column["ftavg_sem"],
+        isat_column_upstream_edge_cm=upstream_column["edge"],
+        isat_column_a=isat_column["ftavg"],
+        isat_column_sem_a=isat_column["ftavg_sem"],
+        isat_column_edge_cm=isat_column["edge"],
+        isat_column_geomean_a_per_cm2=geomean_column["ftavg"],
+        isat_column_geomean_sem_a_per_cm2=geomean_column["ftavg_sem"],
+        isat_column_geomean_edge_cm=geomean_column["edge"],
+        isat_column_definition=np.array(
+            "THE WHOLE-COLUMN CONVENTION FOR THE THREE Isat FACES, the twin of "
+            "the isat_ftavg_* families and the Isat counterpart of "
+            "density_column_cm3.  Same profiles, same despiking, same "
+            "comparand chain (NO background subtraction -- see "
+            "ftavg_background), same quadrature; only the outer limit and the "
+            "normalization move.  The integral runs from the profile centroid "
+            "to that sample's own COLUMN EDGE, which is the scan limit in the "
+            "folded frame and not a measured column boundary "
+            "(isat_column_upstream_edge_cm, isat_column_edge_cm and "
+            "isat_column_geomean_edge_cm, per port and per sample -- the same "
+            "rule as column_edge_cm), and the result is divided by "
+            "pi * ftavg_radius_cm^2 rather than by the area integrated over.  "
+            "Each row is therefore the face's CURRENT PER UNIT LENGTH "
+            "expressed as the current density the transport model's tube would "
+            "carry if all of it were inside the tube, in A for the two single "
+            "faces and A cm^-2 for the geomean, on isat_ftavg_upstream_time_ms "
+            "/ isat_ftavg_time_ms.  Their SEMs are composed exactly as their "
+            "flux-tube twins' are (see isat_ftavg_sem_definition): the "
+            "per-point shot SEM propagated through the quadrature weights in "
+            "quadrature, points treated as independent.  Every OTHER companion "
+            "of these rows is identical to the flux-tube family's by "
+            "construction and is NOT duplicated here -- the port roster, run "
+            "ids, source file and channel, the face rulings, the despike "
+            "counts, the centroid and the core-band companion are all taken "
+            "before the outer limit is chosen, so read them from "
+            "isat_ftavg_upstream_*, isat_ftavg_* and isat_ftavg_geomean_*.  "
+            "The two faces must not be ratioed against each other "
+            "(isat_ftavg_face), and the column and flux-tube rows are NOT "
+            "interchangeable: a consumer must state which convention a number "
+            "came from (see column_definition, column_edge_definition)."
         ),
         port_map=np.array(port_map),
         **discharge_raw_fields,
