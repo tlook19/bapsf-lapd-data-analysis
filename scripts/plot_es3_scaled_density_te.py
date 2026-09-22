@@ -54,7 +54,15 @@ def _pcolormesh_edges(centers: np.ndarray) -> np.ndarray:
 
 
 def _line_integral_cm2(profile_m3: np.ndarray, x_m: np.ndarray) -> float:
-    valid = np.isfinite(profile_m3) & (profile_m3 > 0)
+    """Integrate a SIGNED radial density profile across the scan, in cm^-2.
+
+    Every cell that carries a measurement enters with its measured sign.  A
+    negative far-skirt cell is noise about zero, not a missing measurement, and
+    dropping it would keep only the upward half of that noise and bias the
+    integral high -- the retired sign test, by another route.  NaN means no
+    usable measurement and is the only thing excluded.
+    """
+    valid = np.isfinite(profile_m3)
     if valid.sum() < 2:
         return np.nan
     return float(np.trapezoid(profile_m3[valid], x_m[valid]) / 1e4)

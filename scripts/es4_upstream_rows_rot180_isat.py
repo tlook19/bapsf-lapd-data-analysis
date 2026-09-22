@@ -259,8 +259,15 @@ def sqrt_te_rescale(te_old_ev: float, te_new_ev: float) -> float:
 def line_integral_m2(profile_m3: np.ndarray, x_m: np.ndarray) -> float:
     """Trapezoidal line integral of a radial density profile, in m^-2.
 
-    Matches ``_line_integral_cm2`` of ``scripts/plot_es3_scaled_density_te.py``
-    (finite and positive cells only) without its cm^-2 conversion.
+    FINITE AND POSITIVE CELLS ONLY, and this no longer matches the plotting
+    chain: ``_line_integral_cm2`` in ``plot_es3_scaled_density_te.py``,
+    ``plot_line_integrated_density_vs_z.py`` and
+    ``plot_line_integrated_density_vs_z_rot180.py`` now integrate the SIGNED
+    profile, keeping a negative far-skirt cell as the noise-about-zero
+    measurement it is.  This gate is deliberately left as it was: it belongs
+    to the open probe-A area-calibration question and is pinned by its own
+    tests.  A number taken here is therefore NOT commensurate with one taken
+    there.
     """
     profile = np.asarray(profile_m3, dtype=np.float64)
     x = np.asarray(x_m, dtype=np.float64)

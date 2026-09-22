@@ -213,7 +213,7 @@ from es4_upstream_rows_rot180_isat import (
 #: the CURRENT schema by importing it: a literal pinned in one test is a pin
 #: on whatever vintage happened to be on disk the day it was written, and
 #: goes stale silently the next time the product is placed.
-SCHEMA_VERSION = 37
+SCHEMA_VERSION = 41
 
 MANIFEST = Path("config/may2026_run_manifest.toml")
 DENSITY_HDF5 = Path("processed/density_profiles_isweep.hdf5")
@@ -632,16 +632,23 @@ def _flux_tube_profile_stats(
     weighted generalization of the core-band radial SEM.
 
     A NON-POSITIVE COLUMN IS A MEASUREMENT AND IS REPORTED AS ONE.  Where the
-    retained cells sum to zero or less there is no centroid to fold about and
-    no quadrature, but the scan did measure the column: ``ftavg`` then carries
-    the SIGNED TOTAL of those cells rather than ``NaN``, which would say no
-    measurement exists.  That number is a SUM -- no ``2 r dr`` weighting, no
-    ``normalize_radius_cm``, no ``centroid``, ``edge``, ``ftavg_sem`` or
-    ``scatter_sem`` beside it -- and its sign is the content: a negative column
-    is one with no plasma left in it, sitting on noise about zero.  This is
-    the SIGNED chain's rule only: ``subtract_background=True`` clips its values
-    at zero, so a non-positive total there means the retired subtraction erased
-    the profile, and those rows keep returning ``NaN`` because they exist to
+    retained cells sum to zero or less the CENTROID does not exist -- an
+    intensity-weighted mean position is undefined for a non-positive intensity
+    -- but the scan did measure the column, and ``NaN`` would say it did not.
+    The row is reported on the one fold centre that needs no intensity: the
+    port's GEOMETRIC AXIS, ``x = 0``.  The same ``2 r dr`` trapezoidal
+    quadrature is formed about it and ``ftavg`` carries the SIGNED AREA MEAN
+    ``sum(w n) / sum(w)``, which is in the units of every other sample of that
+    row, so a decayed port reads beside a port that has plasma.  ``centroid``
+    stays ``NaN`` because there is none; ``edge`` is the extent the weights
+    were formed over -- the scan limit under the whole-column convention, the
+    tube radius under the flux-tube one; ``ftavg_sem`` and ``scatter_sem``
+    stay ``NaN``.  ``normalize_radius_cm`` is NOT applied: the mean is over the
+    disc it was integrated over, so a whole-column consumer multiplying by
+    ``pi * ftavg_radius_cm^2`` gets a consistent inventory.  This is the SIGNED
+    chain's rule only: ``subtract_background=True`` clips its values at zero,
+    so a non-positive total there means the retired subtraction erased the
+    profile, and those rows keep returning ``NaN`` because they exist to
     reproduce that method exactly as it behaved.
     """
     despiked, n_despiked = _despike_profile(profile)
@@ -671,20 +678,30 @@ def _flux_tube_profile_stats(
     positions = x_cm[finite]
     total = float(np.sum(values))
     if total <= 0.0:
-        # A column that sums non-positive has no centroid to fold about, so no
-        # quadrature can be formed -- but that is a MEASUREMENT, not a missing
-        # one, and NaN would say the opposite.  ``ftavg`` therefore carries the
-        # SIGNED TOTAL of the retained cells, which is what the whole column
-        # measured: a negative number reads "no plasma here, plus noise about
-        # zero".  It is a sum and not an area average, it carries neither the
-        # quadrature's 2 r dr weighting nor ``normalize_radius_cm``, and there
-        # is no centroid, edge or uncertainty to report beside it.  See
-        # density_sign_convention.  ONLY ON THE SIGNED CHAIN: the clipped
-        # legacy chain's values are non-negative, so a non-positive total there
-        # means the retired subtraction erased the profile, and those rows
-        # exist to reproduce that method exactly as it behaved.
+        # A column whose intensity sums non-positive has NO CENTROID -- the
+        # intensity-weighted mean position is not defined for it -- but it IS a
+        # MEASUREMENT, and NaN would say the opposite.  The row is reported on
+        # the ONE fold centre that needs no intensity: the port's GEOMETRIC
+        # AXIS, x = 0.  The same 2 r dr quadrature is formed about it and the
+        # row carries the SIGNED AREA MEAN sum(w n)/sum(w), in the units of
+        # every other sample of that row, so a decayed port can be read beside
+        # a port that has plasma.  ``centroid`` stays NaN because there is
+        # none; ``edge`` is the extent the weights were formed over.
+        # ONLY ON THE SIGNED CHAIN: the clipped legacy chain's values are
+        # non-negative, so a non-positive total there means the retired
+        # subtraction erased the profile, and those rows exist to reproduce
+        # that method exactly as it behaved.
         if not subtract_background:
-            empty["ftavg"] = total
+            axial = np.abs(positions)
+            limit = _column_edge_cm(axial) if radius_cm is None else float(radius_cm)
+            try:
+                axial_weights = _flux_tube_weights(axial, limit)
+            except ValueError:
+                return empty
+            weight_sum = float(np.sum(axial_weights))
+            if weight_sum > 0.0:
+                empty["ftavg"] = float(axial_weights @ values) / weight_sum
+                empty["edge"] = limit
         return empty
     centroid = float(np.sum(values * positions) / total)
     folded = np.abs(positions - centroid)
@@ -910,13 +927,14 @@ def _flux_tube_te_stats(
     ``plain`` row is unweighted and stays a convex combination throughout.
 
     WHERE THE RETAINED DENSITY CELLS SUM TO ZERO OR LESS, BOTH T_e ROWS STAY
-    ``NaN``.  There is no centroid to fold about and no denominator to divide
-    by, and a ratio reported anyway would assert a temperature at a port with
-    no plasma to carry one.  ``weight_density`` is reported instead: it carries
-    the SIGNED TOTAL of the retained density cells -- the same number
-    ``_flux_tube_profile_stats`` puts in its ``ftavg`` there, a sum and not the
-    quadrature's ``w @ n`` -- so a consumer reading a ``NaN`` T_e row can see
-    the non-positive denominator that produced it.
+    ``NaN``.  The denominator is non-positive and there is no centroid, and a
+    ratio reported anyway would assert a temperature at a port with no plasma
+    to carry one.  ``weight_density`` is reported instead: it carries the
+    SIGNED AREA MEAN of the retained density cells, folded about the GEOMETRIC
+    AXIS ``x = 0`` -- the same number ``_flux_tube_profile_stats`` puts in its
+    ``ftavg`` there, in the same units -- with ``edge`` giving the extent it
+    was formed over, so a consumer reading a ``NaN`` T_e row can see the
+    non-positive denominator that produced it.
     """
     despiked_density, _ = _despike_profile(density_profile)
     prepared_density = (
@@ -956,16 +974,28 @@ def _flux_tube_te_stats(
     total = float(np.sum(values))
     if total <= 0.0:
         # The T_e ROWS STAY NaN.  Both averages are ratios whose denominator is
-        # the density weight, and a column that sums non-positive has no
-        # centroid to fold about, so neither ratio exists -- reporting one
-        # anyway would be asserting a temperature where there is no plasma to
-        # carry it.  The DENOMINATOR is reported instead: ``weight_density``
-        # carries the signed total of the retained density cells, the same
-        # number the density rows carry there, so a consumer can see why the
-        # ratio refused.  It is a sum, not the quadrature's ``w @ n``, and as
-        # on the density side it is carried on the SIGNED chain only.
+        # the density weight, and where that weight is non-positive neither
+        # ratio exists -- reporting one anyway would be asserting a temperature
+        # where there is no plasma to carry it.  The DENOMINATOR is reported
+        # instead: ``weight_density`` carries the SIGNED AREA MEAN of the
+        # retained density cells, folded about the GEOMETRIC AXIS x = 0 since
+        # the intensity centroid is undefined -- the same number the density
+        # rows carry there, in the same units -- so a consumer can see why the
+        # ratio refused.  Carried on the SIGNED chain only, as on the density
+        # side.
         if not subtract_background:
-            empty["weight_density"] = total
+            axial = np.abs(positions)
+            limit = _column_edge_cm(axial) if radius_cm is None else float(radius_cm)
+            try:
+                axial_weights = _flux_tube_weights(axial, limit)
+            except ValueError:
+                return empty
+            weight_sum = float(np.sum(axial_weights))
+            if weight_sum > 0.0:
+                empty["weight_density"] = (
+                    float(axial_weights @ values) / weight_sum
+                )
+                empty["edge"] = limit
         return empty
     centroid = float(np.sum(values * positions) / total)
     folded = np.abs(positions - centroid)
@@ -3200,35 +3230,47 @@ def export_overlay(
             "the denominators, exported so a consumer can see when one is "
             "small.  Nothing is clipped back into range: a clip at zero is the "
             "sign test again under another name.  (4) A WHOLE COLUMN CAN SUM "
-            "NON-POSITIVE, and at ES4 p50 it does at every sample.  Such a "
-            "column has no centroid to fold about, so no quadrature is formed "
-            "-- but it IS a measurement, and NaN would say the opposite.  The "
-            "DENSITY INVENTORY ROWS THEREFORE CARRY THE SIGNED TOTAL of the "
-            "retained cells there: density_ftavg_cm3, density_column_cm3 and "
-            "column_inventory_per_cm (the last still pi * ftavg_radius_cm^2 "
-            "times the second, by construction).  The same reduction reduces "
-            "the Isat families, so isat_ftavg_upstream_a and isat_ftavg_a "
-            "carry their own signed total on the same rule, in A.  THAT "
-            "NUMBER IS A SUM OVER "
-            "CELLS, NOT AN AREA AVERAGE -- it carries neither the 2 r dr "
-            "weighting nor the tube-area normalization the row carries "
-            "everywhere else, so it is NOT commensurate with the same row at a "
-            "port that has plasma and must not be levelled, ratioed or plotted "
-            "against one; its SIGN is the content, and the correctly scaled "
-            "signed number at those samples is density_mean_cm3.  The "
-            "companions stay NaN, since there is no centroid, edge or spread "
-            "to report: density_ftavg_centroid_cm, density_column_sem_cm3, "
-            "density_column_radial_sem_cm3 and column_over_ftavg_ratio.  THE "
-            "T_e ROWS STAY NaN: te_ftavg_ev, te_column_ev and their plain and "
-            "prior-weight companions are ratios whose denominator is that same "
-            "non-positive weight, and a temperature is not measured where "
-            "there is no plasma to weight with.  The denominator is exported "
-            "beside them -- te_ftavg_weight_density_cm3 and "
-            "te_column_weight_density_cm3 carry the same signed total -- so a "
-            "NaN T_e row says WHY it refused.  The rule is the SIGNED chain's: "
-            "the legacy density_ftavg_subtracted_cm3 and "
-            "density_column_subtracted_cm3 clip at zero and still read NaN "
-            "there, because they reproduce the retired method as it behaved."
+            "NON-POSITIVE, and at ES4 p50 it does at every sample (schema "
+            "v41).  Such a column HAS NO CENTROID -- an intensity-weighted "
+            "mean position is not defined for a non-positive intensity -- but "
+            "it IS a measurement, and NaN would say the opposite.  THE ROW IS "
+            "THEREFORE REPORTED ON THE ONE FOLD CENTRE THAT NEEDS NO "
+            "INTENSITY: THE PORT'S GEOMETRIC AXIS, x = 0.  The same 2 r dr "
+            "trapezoidal quadrature is formed about it and the row carries the "
+            "SIGNED AREA MEAN sum(w n)/sum(w) -- density_ftavg_cm3 and "
+            "density_column_cm3 in cm^-3, column_inventory_per_cm as "
+            "pi * ftavg_radius_cm^2 times the second, and the Isat families "
+            "isat_ftavg_upstream_a and isat_ftavg_a in A on the same rule.  IT "
+            "IS IN THE UNITS OF EVERY OTHER SAMPLE OF ITS OWN ROW, so a "
+            "decayed port can be read beside a port that has plasma; at ES4 "
+            "p50 the plateau reads of order -1e11 cm^-3 against p41's +3e11, "
+            "and density_mean_cm3, the unweighted core-band mean, reads the "
+            "same order.  WHAT IT IS NOT: it is not folded about the column's "
+            "own centre, because there is not one, so it is an AXIAL area "
+            "mean and not the centroid-folded quantity the row carries "
+            "elsewhere; and the whole-column row does not carry the tube-area "
+            "renormalization there, which is why multiplying it by the tube "
+            "area is the consistent inventory.  The companions that need the "
+            "centroid or a spread stay NaN: density_ftavg_centroid_cm, "
+            "density_column_sem_cm3 and density_column_radial_sem_cm3; "
+            "column_edge_cm and te_column_edge_cm give the extent the weights "
+            "were formed over.  column_over_ftavg_ratio is NOT a level at "
+            "these samples and can be finite and NEGATIVE: the tube stops at "
+            "ftavg_radius_cm while the column runs to the scan edge, so where "
+            "the negative cells sit outside the tube the flux-tube mean comes "
+            "out POSITIVE while the column mean is negative.  Measured at this "
+            "vintage that is 2 ES3 and 2 ES4 samples, all at t <= 4.75 ms.  "
+            "THE T_e ROWS STAY "
+            "NaN: te_ftavg_ev, te_column_ev and their plain and prior-weight "
+            "companions are ratios whose denominator is that same non-positive "
+            "weight, and a temperature is not measured where there is no "
+            "plasma to weight with.  The denominator is exported beside them "
+            "-- te_ftavg_weight_density_cm3 and te_column_weight_density_cm3 "
+            "carry that same signed area mean -- so a NaN T_e row says WHY it "
+            "refused.  The rule is the SIGNED chain's: the legacy "
+            "density_ftavg_subtracted_cm3 and density_column_subtracted_cm3 "
+            "clip at zero and still read NaN there, because they reproduce the "
+            "retired method as it behaved."
         ),
         ftavg_background=np.array(
             "NO BACKGROUND IS SUBTRACTED FROM ANY DENSITY ROW OF RECORD, AND "
@@ -3580,15 +3622,18 @@ def export_overlay(
             "convention would be a fourth way to say the same thing.  The "
             "three conventions are NOT interchangeable and a result must say "
             "which one it quoted -- see ftavg_comparand_map.  WHERE THE COLUMN "
-            "SUMS NON-POSITIVE there is no centroid and no quadrature, and "
+            "SUMS NON-POSITIVE there is no centroid, so the quadrature is "
+            "formed about the GEOMETRIC AXIS x = 0 instead, and "
             "density_column_cm3, column_inventory_per_cm and "
-            "density_ftavg_cm3 carry the SIGNED TOTAL of the retained cells "
-            "instead of NaN -- a SUM, not an area average, not levellable "
-            "against a port that has plasma -- while te_column_ev and "
-            "te_ftavg_ev stay NaN with te_column_weight_density_cm3 and "
-            "te_ftavg_weight_density_cm3 carrying that same total as the "
-            "denominator that refused.  This is the ES4 p50 state at every "
-            "sample; that port is not scored.  See density_sign_convention."
+            "density_ftavg_cm3 carry the SIGNED AREA MEAN sum(w n)/sum(w) "
+            "instead of NaN -- in the row's own units, so it can be read "
+            "beside a port that has plasma, but AXIAL rather than "
+            "centroid-folded and without the tube-area renormalization -- "
+            "while te_column_ev and te_ftavg_ev stay NaN with "
+            "te_column_weight_density_cm3 and te_ftavg_weight_density_cm3 "
+            "carrying that same signed mean as the denominator that refused.  "
+            "This is the ES4 p50 state at every sample; that port is not "
+            "scored.  See density_sign_convention."
         ),
         column_edge_definition=np.array(
             "WHERE THE COLUMN INTEGRAL STOPS, per port and per sample.  "
