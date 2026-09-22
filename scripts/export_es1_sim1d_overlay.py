@@ -79,8 +79,8 @@ unweighted arithmetic mean of the 51-point line scan over the core band
 ``X_MIN_CM <= x <= X_MAX_CM``.  It is a line cut through the column, so it
 carries no radial area weighting at all.  Nothing about it changes here.
 
-``density_ftavg_cm3``, ``isat_ftavg_upstream_a`` and ``isat_ftavg_a`` are the
-FLUX-TUBE convention:
+``density_ftavg_cm3``, ``te_ftavg_ev``, ``isat_ftavg_upstream_a`` and
+``isat_ftavg_a`` are the FLUX-TUBE convention:
 ``int_0^R 2 pi r f(r) dr / (pi R^2)`` with ``R = FLUX_TUBE_RADIUS_CM``, the
 measured cathode frame opening.  This is the quantity a 1D transport model
 that carries one radial cell of radius R reports, so it is the convention in
@@ -91,6 +91,17 @@ its own centroid, which is an ASSUMPTION and not a measurement -- see
 
 The two conventions are exported side by side and are NOT interchangeable; a
 consumer must state which one a number came from.
+
+T_e is the one row where the two conventions differ by more than a weighting.
+``te_ftavg_ev`` is the DENSITY-WEIGHTED flux-tube mean, which is what a 1D
+cell carries (its ``E_e / (3/2 n)``); ``te_ftavg_plain_ev`` is the unweighted
+area mean of the same profile and is printed beside it, not scored.  Both
+integrate over a disc the measurement does not always fill: the filled T_e
+product reports the MEASUREMENT only out to a per-port trust radius and the
+scrape-off-layer prior beyond it, so every T_e flux-tube sample carries
+``ftavg_coverage_cm`` and ``ftavg_prior_beyond_coverage`` saying how far the
+measurement actually reached.  See ``te_ftavg_definition``,
+``te_ftavg_sem_definition`` and ``ftavg_coverage_definition``.
 
 Which probe face the Isat flux-tube average comes from
 ------------------------------------------------------
@@ -576,6 +587,272 @@ def _flux_tube_series(
                 out[name][zi, ti] = stats[name]
             out["n_despiked"][zi, ti] = stats["n_despiked"]
     return out
+
+
+def _weighted_mean_and_sem(
+    values: np.ndarray,
+    weights: np.ndarray,
+) -> tuple[float, float]:
+    """Return a weighted mean and the SCATTER SEM of that mean.
+
+    ``weights`` are non-negative and need not be normalized; they are
+    normalized here to ``a_i``.  The returned SEM is the weighted
+    generalization of the core-band convention (``_nan_core_stats``: the
+    sample standard deviation over the retained cells divided by the square
+    root of their count):
+
+        s^2  = sum_i a_i (f_i - m)^2 / (1 - sum_i a_i^2)
+        sem  = sqrt(s^2 * sum_i a_i^2)
+
+    With equal weights ``a_i = 1/N`` this reduces EXACTLY to
+    ``std(f, ddof=1) / sqrt(N)``, so the flux-tube row and the core-band row
+    report the same kind of quantity: the scatter of the retained radial
+    cells about their own average, not a shot or cycle SEM.
+
+    Returns ``(nan, nan)`` for a non-positive total weight and a finite mean
+    with a ``nan`` SEM where one node carries all of it.
+    """
+    values = np.asarray(values, dtype=np.float64)
+    weights = np.asarray(weights, dtype=np.float64)
+    total = float(np.sum(weights))
+    if not np.isfinite(total) or total <= 0.0:
+        return float("nan"), float("nan")
+    normalized = weights / total
+    mean = float(normalized @ values)
+    sum_squares = float(normalized @ normalized)
+    if not np.isfinite(mean) or sum_squares >= 1.0:
+        return mean, float("nan")
+    variance = float(normalized @ (values - mean) ** 2) / (1.0 - sum_squares)
+    return mean, float(np.sqrt(max(variance, 0.0) * sum_squares))
+
+
+def _flux_tube_te_stats(
+    te_profile: np.ndarray,
+    density_profile: np.ndarray,
+    x_cm: np.ndarray,
+    *,
+    semi_quantitative: np.ndarray | None = None,
+    radius_cm: float = FLUX_TUBE_RADIUS_CM,
+) -> dict[str, float | int]:
+    """Return the flux-tube T_e of one radial profile pair, both weightings.
+
+    The DENSITY side runs the identical pipeline as
+    ``_flux_tube_profile_stats`` -- despike, subtract the effective-width
+    ledger's scalar background, clip at zero, drop non-finite cells, fold about
+    the profile centroid, integrate to ``radius_cm`` -- so the returned
+    ``weight_density`` is the same number that function returns as ``ftavg``,
+    and the quadrature nodes and weights are the same ones.  That holds WHERE
+    T_e IS FINITE WHEREVER THE DENSITY IS, since a non-finite T_e cell would
+    drop a node the density chain keeps; it is true of every filled T_e
+    product in this repo, which carry zero non-finite cells by construction of
+    the fill.
+
+    The T_e side is despiked on the same gate and then NOT
+    background-subtracted and NOT clipped: T_e does not fall to zero at the
+    scan edge, and subtracting an edge median from it would remove a real
+    pedestal rather than a background.  T_e is folded about the DENSITY
+    centroid, because the flux tube is centred on the column and T_e has no
+    centroid of its own.
+
+    Two averages come out of the one quadrature:
+
+    ``ftavg``  = sum_i w_i n_i T_i / sum_i w_i n_i, the DENSITY-WEIGHTED area
+                 mean, which is the quantity a 1D cell carries by construction
+                 (its E_e / (3/2 n));
+    ``plain``  = sum_i w_i T_i, the unweighted area mean, reported beside it.
+
+    ``semi_quantitative`` is an optional boolean on the same samples; the
+    count of marked cells carrying quadrature weight and the total weight they
+    carry are returned so a consumer can see how much of the average is at the
+    swept diagnostic's limit.
+    """
+    despiked_density, _ = _despike_profile(density_profile)
+    subtracted = _subtract_background(despiked_density)
+    despiked_te, n_despiked = _despike_profile(te_profile)
+
+    empty = dict(
+        ftavg=np.nan,
+        ftavg_sem=np.nan,
+        plain=np.nan,
+        plain_sem=np.nan,
+        weight_density=np.nan,
+        centroid=np.nan,
+        n_despiked=n_despiked,
+        node_count=0,
+        semi_quant_count=0,
+        semi_quant_weight=np.nan,
+    )
+    finite = np.isfinite(subtracted) & np.isfinite(despiked_te)
+    if np.count_nonzero(finite) < 5:
+        return empty
+    values = np.clip(subtracted[finite], 0.0, None)
+    te_values = despiked_te[finite]
+    positions = x_cm[finite]
+    total = float(np.sum(values))
+    if total <= 0.0:
+        return empty
+    centroid = float(np.sum(values * positions) / total)
+    try:
+        weights = _flux_tube_weights(np.abs(positions - centroid), radius_cm)
+    except ValueError:
+        empty["centroid"] = centroid
+        return empty
+
+    plain, plain_sem = _weighted_mean_and_sem(te_values, weights)
+    ftavg, ftavg_sem = _weighted_mean_and_sem(te_values, weights * values)
+    carrying = weights > 0.0
+    semi_quant_count = 0
+    semi_quant_weight = 0.0
+    if semi_quantitative is not None:
+        marked = np.asarray(semi_quantitative, dtype=bool)[finite] & carrying
+        semi_quant_count = int(np.count_nonzero(marked))
+        semi_quant_weight = float(np.sum(weights[marked]))
+    return dict(
+        ftavg=ftavg,
+        ftavg_sem=ftavg_sem,
+        plain=plain,
+        plain_sem=plain_sem,
+        weight_density=float(weights @ values),
+        centroid=centroid,
+        n_despiked=n_despiked,
+        node_count=int(np.count_nonzero(carrying)),
+        semi_quant_count=semi_quant_count,
+        semi_quant_weight=semi_quant_weight,
+    )
+
+
+def _flux_tube_te_series(
+    te_profiles: np.ndarray,
+    density_profiles: np.ndarray,
+    x_cm: np.ndarray,
+    semi_quantitative: np.ndarray | None = None,
+) -> dict[str, np.ndarray]:
+    """Apply ``_flux_tube_te_stats`` to every (z, time) profile pair.
+
+    Both grids are shaped ``(z, x, time)`` on the SAME time base; every
+    returned array is shaped ``(z, time)``.
+    """
+    if te_profiles.shape != density_profiles.shape:
+        raise ValueError(
+            f"T_e grid {te_profiles.shape} and density grid "
+            f"{density_profiles.shape} must be reduced over the same "
+            "(z, x, time) grid"
+        )
+    n_z, _, n_t = te_profiles.shape
+    out = {
+        name: np.full((n_z, n_t), np.nan, dtype=np.float64)
+        for name in (
+            "ftavg",
+            "ftavg_sem",
+            "plain",
+            "plain_sem",
+            "weight_density",
+            "centroid",
+            "semi_quant_weight",
+        )
+    }
+    out["n_despiked"] = np.zeros((n_z, n_t), dtype=np.int16)
+    out["node_count"] = np.zeros((n_z, n_t), dtype=np.int16)
+    out["semi_quant_count"] = np.zeros((n_z, n_t), dtype=np.int16)
+    for zi in range(n_z):
+        for ti in range(n_t):
+            marks = (
+                None if semi_quantitative is None else semi_quantitative[zi, :, ti]
+            )
+            stats = _flux_tube_te_stats(
+                te_profiles[zi, :, ti],
+                density_profiles[zi, :, ti],
+                x_cm,
+                semi_quantitative=marks,
+            )
+            for name in (
+                "ftavg",
+                "ftavg_sem",
+                "plain",
+                "plain_sem",
+                "weight_density",
+                "centroid",
+                "semi_quant_weight",
+            ):
+                out[name][zi, ti] = stats[name]
+            out["n_despiked"][zi, ti] = stats["n_despiked"]
+            out["node_count"][zi, ti] = stats["node_count"]
+            out["semi_quant_count"][zi, ti] = stats["semi_quant_count"]
+    return out
+
+
+def _interp_onto_time_grid(
+    profiles: np.ndarray,
+    source_time_ms: np.ndarray,
+    target_time_ms: np.ndarray,
+) -> np.ndarray:
+    """Return ``(z, x, time)`` profiles put on ``target_time_ms``, cell by cell.
+
+    A target sample takes a value only where the source samples BRACKETING it
+    are both finite; anywhere else the cell stays non-finite.  That is what
+    keeps the source product's own "this cell is unusable here" pattern
+    intact: filling a non-finite cell from a distant finite sample of the same
+    cell would invent a measurement, and at the scan edges -- where these
+    products' non-finite cells actually are -- it would also move the scalar
+    background baseline and with it the whole flux-tube average.  The
+    bracketing test is done by interpolating the finite MASK: a target between
+    a finite and a non-finite source sample reads below one and is dropped.
+
+    ``np.interp`` holds the end values, so a target sample outside the source
+    span takes the nearest source value rather than an extrapolation, and is
+    kept when that end sample is finite.
+    """
+    n_z, n_x, _ = profiles.shape
+    out = np.full((n_z, n_x, target_time_ms.size), np.nan, dtype=np.float64)
+    for zi in range(n_z):
+        for xi in range(n_x):
+            series = profiles[zi, xi]
+            finite = np.isfinite(series)
+            if np.count_nonzero(finite) < 2:
+                continue
+            bracketed = np.interp(
+                target_time_ms, source_time_ms, finite.astype(np.float64)
+            )
+            out[zi, xi] = np.where(
+                bracketed >= 1.0 - 1e-12,
+                np.interp(target_time_ms, source_time_ms[finite], series[finite]),
+                np.nan,
+            )
+    return out
+
+
+def _measured_coverage_cm(
+    measured_te: np.ndarray,
+    x_cm: np.ndarray,
+    trust_radius_cm: np.ndarray,
+    row_measured_cells: np.ndarray,
+) -> np.ndarray:
+    """Return how far out each T_e row reports its own MEASUREMENT, in cm.
+
+    ``measured_te`` is the filled product's ``te_masked`` grid, ``(z, x,
+    time)``, finite exactly where a QC-surviving measurement stands behind the
+    cell.  The answer per port and sample is the outermost ``|x|`` carrying
+    such a cell, CAPPED at that port's ``te_trust_radius_cm``: beyond the trust
+    radius the filled product mixes the measurement into the scrape-off-layer
+    prior and past the blend radius it reports the prior alone, so a measured
+    cell out there is not what the product reports.  A row the product itself
+    calls prior-derived at that sample (``te_row_measured_cells == 0``) has no
+    coverage at all and is ``NaN``.
+
+    The radius is in SCAN ``|x|``, the frame the trust model and the line scan
+    are both stated in, NOT in the flux-tube quadrature's centroid-folded
+    radius; the two differ by the per-sample centroid offset, which is exported
+    beside them.
+    """
+    finite = np.isfinite(measured_te)
+    radius = np.abs(np.asarray(x_cm, dtype=np.float64))[np.newaxis, :, np.newaxis]
+    reach = np.where(finite, radius, -np.inf).max(axis=1)
+    coverage = np.minimum(reach, np.asarray(trust_radius_cm)[:, np.newaxis])
+    return np.where(
+        np.isfinite(reach) & (np.asarray(row_measured_cells) > 0),
+        coverage,
+        np.nan,
+    )
 
 
 def _es4_upstream_definitions() -> dict[str, np.ndarray]:
@@ -1623,6 +1900,14 @@ REQUIRED_TE_RECORDS = (
     "te_window_dln_core_control_source",
     "te_row_measured_cells",
     "te_row_measured_core_cells",
+    # The two per-CELL grids the flux-tube T_e rows stand on: the strict
+    # measured mask, which says how far out each row reports its own
+    # measurement, and the per-cell semi-quantitative marks, which say how
+    # much of the flux-tube average sits at the diagnostic's limit.  Required
+    # for the same reason as the rest of this list: a product exported without
+    # them is indistinguishable from one where nothing was measured or marked.
+    "te_masked",
+    "te_semi_quantitative",
 )
 
 
@@ -1691,6 +1976,10 @@ def _te_trust_records(
         ),
         "row_measured_core_cells": np.asarray(
             te_group["te_row_measured_core_cells"][()], dtype=np.int16
+        ),
+        "measured_te": np.asarray(te_group["te_masked"][()], dtype=np.float64),
+        "semi_quantitative": np.asarray(
+            te_group["te_semi_quantitative"][()], dtype=bool
         ),
         "row_provenance_definition": str(
             te_group.attrs["te_row_provenance_definition"]
@@ -1945,6 +2234,14 @@ def export_overlay(
         )
         te_group = te_hdf[f"experiment_sets/{experiment_set_key}"]
         te_records = _te_trust_records(te_group, te_path, experiment_set_id)
+        te_x_cm = te_group["x_cm"][()]
+        te_filled_profiles = np.asarray(te_group["te_filled"][()], dtype=np.float64)
+        if not np.allclose(te_x_cm, density_x_cm):
+            raise ValueError(
+                f"ES{experiment_set_id} T_e radial grid {te_x_cm} and density "
+                f"radial grid {density_x_cm} differ; the flux-tube T_e rows "
+                "weight one profile by the other and need one grid"
+            )
         if not np.allclose(density.z_cm, te.z_cm):
             raise ValueError(
                 f"ES{experiment_set_id} density and temperature z grids differ"
@@ -2005,6 +2302,25 @@ def export_overlay(
     )
 
     density_ftavg = _flux_tube_series(density_profiles_m3, density_x_cm)
+
+    # The flux-tube T_e rows.  T_e lives on the sweep-cycle clock and the
+    # density on the inter-sweep dead-time clock, so the DENSITY -- which is
+    # only the weight here -- is the grid that moves: it is interpolated onto
+    # te_time_ms cell by cell, and the T_e rows stay on the clock every other
+    # te_* field is already exported on.
+    te_ftavg = _flux_tube_te_series(
+        te_filled_profiles,
+        _interp_onto_time_grid(density_profiles_m3, density.time_ms, te.time_ms),
+        density_x_cm,
+        te_records["semi_quantitative"],
+    )
+    ftavg_coverage_cm = _measured_coverage_cm(
+        te_records["measured_te"],
+        density_x_cm,
+        te_records["trust_radius_cm"],
+        te_records["row_measured_cells"],
+    )
+    ftavg_prior_beyond_coverage = ~(ftavg_coverage_cm >= FLUX_TUBE_RADIUS_CM)
 
     def _face_ftavg(path: Path, label: str) -> tuple[dict, dict]:
         scans = _rot0_isat_profiles(path, experiment_set_id, density.z_cm)
@@ -2115,7 +2431,7 @@ def export_overlay(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
-        schema_version=np.array(27, dtype=np.int16),
+        schema_version=np.array(29, dtype=np.int16),
         experiment_set_id=np.array(experiment_set_id, dtype=np.int16),
         experiment_label=np.array(experiment_label),
         port=PORTS,
@@ -2460,6 +2776,167 @@ def export_overlay(
         density_ftavg_core_cm3=density_ftavg["core"] * M3_TO_CM3,
         density_ftavg_centroid_cm=density_ftavg["centroid"],
         density_ftavg_n_despiked=density_ftavg["n_despiked"],
+        te_ftavg_time_ms=te.time_ms,
+        te_ftavg_ev=te_ftavg["ftavg"],
+        te_ftavg_sem_ev=np.hypot(
+            te_ftavg["ftavg_sem"],
+            np.nan_to_num(te_records["window_sem_ev"], nan=0.0),
+        ),
+        te_ftavg_radial_sem_ev=te_ftavg["ftavg_sem"],
+        te_ftavg_plain_ev=te_ftavg["plain"],
+        te_ftavg_plain_sem_ev=np.hypot(
+            te_ftavg["plain_sem"],
+            np.nan_to_num(te_records["window_sem_ev"], nan=0.0),
+        ),
+        te_ftavg_plain_radial_sem_ev=te_ftavg["plain_sem"],
+        te_ftavg_weight_density_cm3=te_ftavg["weight_density"] * M3_TO_CM3,
+        te_ftavg_centroid_cm=te_ftavg["centroid"],
+        te_ftavg_n_despiked=te_ftavg["n_despiked"],
+        te_ftavg_node_count=te_ftavg["node_count"],
+        te_ftavg_semi_quantitative_count=te_ftavg["semi_quant_count"],
+        te_ftavg_semi_quantitative_weight=te_ftavg["semi_quant_weight"],
+        te_ftavg_definition=np.array(
+            "THE FLUX-TUBE T_e COMPARAND, in eV, shaped (port, sample) on "
+            "te_ftavg_time_ms, which IS te_time_ms.  te_ftavg_ev is the "
+            "DENSITY-WEIGHTED area mean out to ftavg_radius_cm, "
+            "int 2 pi r n T_e dr / int 2 pi r n dr: the quantity a 1D "
+            "transport cell of that radius carries by construction, since its "
+            "T_e is E_e / (3/2 n).  te_ftavg_plain_ev is the UNWEIGHTED area "
+            "mean of the same profile over the same quadrature, "
+            "int 2 pi r T_e dr / (pi R^2); it is printed beside the weighted "
+            "row as the weighting's size and is NOT the comparand.  WHICH OF "
+            "THE TWO IS LARGER IS NOT FIXED.  With w the quadrature weights "
+            "and <.> the w-normalized average, te_ftavg_ev - te_ftavg_plain_ev "
+            "= cov_w(n, T_e) / <n> exactly, so the weighted row sits ABOVE the "
+            "plain one only where n and T_e correlate POSITIVELY across the "
+            "disc -- the ordinary peaked-column case -- and BELOW it wherever "
+            "they anti-correlate, which happens at a hollow density profile "
+            "and wherever the density is at the noise floor and its shape is "
+            "no longer the column's.  Both orderings occur in these products, "
+            "sample by sample; it is the PLATEAU-WINDOW MEAN that is ordered "
+            "plain < weighted < core at every port of every set, and a "
+            "per-sample ordering must not be assumed.  The same caveat "
+            "applies to te_mean_ev as an upper bound: a sample can read "
+            "te_ftavg_ev above its own core-band row where the profile is "
+            "flat or inverted across the band edge.  Both are "
+            "reduced with the same machinery as density_ftavg_cm3 -- same "
+            "despike gate, same trapezoidal quadrature closed at r = 0 and "
+            "r = R, same centroid fold -- and BOTH fold about the DENSITY "
+            "centroid (te_ftavg_centroid_cm), because the flux tube is "
+            "centred on the column and T_e has no centroid of its own.  Two "
+            "differences from the density chain, both deliberate: the T_e "
+            "profile is NOT background-subtracted and NOT clipped at zero (it "
+            "does not fall to zero at the scan edge, and the ledger's edge "
+            "baseline would remove a real pedestal), and the quadrature nodes "
+            "are the cells where the DENSITY is usable, so the weighted and "
+            "the plain average sit on one node set.  te_ftavg_weight_density_"
+            "cm3 is the denominator sum_i w_i n_i in cm^-3, the weighting the "
+            "row actually used.  CLOCKS: T_e is measured on the sweep cycles "
+            "and the density on the inter-sweep dead times, 0.375 ms apart on "
+            "the same 0.5 ms pitch.  The WEIGHT is what moves: the density "
+            "grid is linearly interpolated cell by cell onto te_time_ms, a "
+            "target sample kept only where the source samples bracketing it "
+            "are both finite, and the T_e rows stay on the clock te_mean_ev "
+            "and te_sem_ev are already on.  te_ftavg_weight_density_cm3 is "
+            "therefore the SAME reduction as density_ftavg_cm3 taken over an "
+            "interpolated profile, which is not density_ftavg_cm3 "
+            "interpolated: the reduction is nonlinear in the profile "
+            "(centroid, scalar background, clipping), and the two part "
+            "company by a few percent where the scan is clean and by tens of "
+            "percent where it is not -- at the far ports of the high-puff "
+            "sets, where the density is at the noise floor and the scan "
+            "carries non-finite edge cells.  The field is exported so that "
+            "disagreement can be MEASURED rather than assumed away; the "
+            "weighted mean is a ratio and is insensitive to an overall scale "
+            "of the weight, though not to its shape.  "
+            "te_ftavg_node_count is the number of quadrature nodes carrying "
+            "weight and te_ftavg_n_despiked the T_e cells the despike gate "
+            "repaired."
+        ),
+        te_ftavg_sem_definition=np.array(
+            "te_ftavg_sem_ev is te_ftavg_radial_sem_ev and the fit-window "
+            "convention term te_window_sem_ev added in quadrature, the SAME "
+            "composition as the core-band te_sem_ev, and "
+            "te_ftavg_plain_sem_ev is that composition for the unweighted "
+            "row.  WHAT THE FIRST TERM IS: the scatter of the retained radial "
+            "cells about their own weighted average, propagated through the "
+            "quadrature weights -- s^2 = sum a_i (T_i - m)^2 / (1 - sum a_i^2) "
+            "and sem = sqrt(s^2 sum a_i^2) with a_i the normalized weights, "
+            "which reduces exactly to std(ddof=1)/sqrt(N) at equal weights and "
+            "is therefore the weighted generalization of te_radial_sem_ev.  It "
+            "is a RADIAL-SCATTER term, not a shot or cycle SEM; the filled T_e "
+            "product carries no per-cell uncertainty, so the per-point "
+            "propagation the Isat flux-tube rows use (isat_ftavg_sem_"
+            "definition) is NOT available here and no cycle-to-cycle term "
+            "enters either row.  WHAT THE SECOND TERM IS NOT: te_window_sem_ev "
+            "is defined over the CORE BAND only -- the export refuses a filled "
+            "product whose window-spread band is not core_x_min_cm to "
+            "core_x_max_cm -- so it is TRANSFERRED onto the flux-tube row "
+            "unchanged and is not re-derived over the flux tube.  The "
+            "sweep-systematics term for the band between the core and "
+            "ftavg_radius_cm is MISSING, and the exported total understates "
+            "the flux-tube uncertainty by however large it is."
+        ),
+        ftavg_coverage_cm=ftavg_coverage_cm,
+        ftavg_prior_beyond_coverage=ftavg_prior_beyond_coverage,
+        ftavg_coverage_definition=np.array(
+            "HOW MUCH OF THE FLUX TUBE IS MEASURED, per port and per sample, "
+            "for the T_e rows -- the only flux-tube rows with a prior in them. "
+            " ftavg_coverage_cm is the outermost scan |x| carrying a "
+            "QC-surviving MEASURED T_e cell, capped at that port's "
+            "te_trust_radius_cm: beyond the trust radius the filled product "
+            "mixes the measurement into the scrape-off-layer prior and past "
+            "te_trust_blend_cm it reports the prior alone, so a measured cell "
+            "out there is not what the product reports.  It is NaN where the "
+            "row is prior-derived at that sample (te_row_measured == False), "
+            "and it is stated in scan |x|, NOT in the quadrature's "
+            "centroid-folded radius r = |x - x_c|.  THE TWO FRAMES ARE NOT "
+            "INTERCHANGEABLE AND THE OFFSET IS NOT SMALL: the shift is "
+            "te_ftavg_centroid_cm, whose magnitude runs to several cm at the "
+            "clean sets (ES1 median 0.7 cm, 95th percentile 2.3 cm) and to "
+            "TENS of cm at the high-puff sets, where the density profile is "
+            "at the noise floor and its intensity centroid wanders -- ES3 "
+            "reaches a 95th percentile of 6.7 cm and a maximum of 24.0 cm, "
+            "past the scan edge itself, and ES4 a 95th percentile of 11.1 cm. "
+            " Where the centroid is offset by that much, a coverage of "
+            "10.0 cm in scan |x| does not map onto a 10.0 cm annulus of the "
+            "integrated disc, and the flag is the reliable statement while "
+            "the radius is indicative.  "
+            "ftavg_prior_beyond_coverage is True wherever "
+            "ftavg_coverage_cm < ftavg_radius_cm, including where the coverage "
+            "is NaN: True means part of the disc the T_e average integrates "
+            "over is the repo's SOL prior rather than a measurement of that "
+            "port.  It is True at EVERY p50 row and across experiment sets 3 "
+            "and 4, whose ports keep the historical 10 cm trust radius, and "
+            "False only at the ES1/ES2 p11/p21/p29/p41 rows that adopted the "
+            "18.415 cm aperture radius -- which is ftavg_radius_cm itself, so "
+            "those rows are measured to the edge of the tube and no further.  "
+            "The density and Isat flux-tube rows carry no such field because "
+            "they are measured at every radius; where their scan does not "
+            "reach ftavg_radius_cm the average is NaN rather than "
+            "prior-filled.  te_ftavg_semi_quantitative_count and "
+            "te_ftavg_semi_quantitative_weight are the second disclosure over "
+            "the same disc: how many weight-carrying cells behind a T_e row "
+            "are semi-quantitative (sub-eV T_e, or a fit-window spread at or "
+            "above the threshold -- see te_semi_quantitative_rule) and what "
+            "fraction of the total quadrature weight they carry."
+        ),
+        ftavg_comparand_map=np.array(
+            "WHICH FIELD IS THE FLUX-TUBE COMPARAND FOR EACH SCORED ROW, so a "
+            "consumer does not have to choose.  Density: density_ftavg_cm3 "
+            "(cm^-3), the plain area mean, with the core-band fractional error "
+            "density_total_sem_cm3 / density_mean_cm3 transferred onto it.  "
+            "T_e: te_ftavg_ev (eV), the density-weighted area mean, with "
+            "te_ftavg_sem_ev.  Isat: isat_ftavg_upstream_a (A), the plain area "
+            "mean of the measured Isat(r) on the UPSTREAM probe face, with "
+            "isat_ftavg_upstream_sem_a -- that is the truth channel and the "
+            "face the density chain reads; isat_ftavg_a is the SHADOWED "
+            "downstream face and isat_ftavg_geomean_a_per_cm2 the "
+            "flow-cancelled estimator in A cm^-2 (see ftavg_face_ruling).  The "
+            "core-band rows density_mean_cm3 and te_mean_ev are the LEGACY "
+            "comparand and are unchanged; the two conventions are not "
+            "interchangeable and a result must say which it quoted."
+        ),
         isat_ftavg_geomean_time_ms=upstream_scans["time_ms"],
         isat_ftavg_geomean_a_per_cm2=geomean_ftavg["ftavg"],
         isat_ftavg_geomean_sem_a_per_cm2=geomean_ftavg["ftavg_sem"],
