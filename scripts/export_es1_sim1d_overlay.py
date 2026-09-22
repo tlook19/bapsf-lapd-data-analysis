@@ -129,10 +129,13 @@ mean over the column extent, with ``te_column_plain_ev`` beside it and
 ``column_coverage_cm`` / ``column_prior_beyond_coverage`` as its own coverage
 record -- and that flag is True at EVERY port of every set, because no port's
 T_e is trusted all the way to the column edge.  HOW MUCH of each column T_e is
-the prior rather than a measurement is ``te_column_prior_weight``: 21-27 % at
-the eight ES1/ES2 aperture ports and 57-76 % at every p50 row and across sets
-3 and 4, so twelve of the twenty port-rows are substantially a statement about
-the prior.  See ``te_ftavg_definition``,
+the prior rather than a measurement is ``te_column_prior_weight``: 20-27 % at
+the eight ES1/ES2 aperture ports and 42-74 % at every p50 row and across sets
+3 and 4, so eleven of the twenty port-rows are substantially a statement about
+the prior -- and the twentieth, ES4 p50, carries no column row at all.  That
+share is a ratio of two SIGNED sums and is not confined to ``[0, 1]``; it is
+inside it at every sample of the scored plateau window, and leaves it only at
+early samples.  See ``te_ftavg_definition``,
 ``te_ftavg_sem_definition``, ``ftavg_coverage_definition``,
 ``column_definition``, ``column_edge_definition``, ``column_sem_definition``
 and ``column_coverage_definition``.
@@ -852,7 +855,12 @@ def _flux_tube_te_stats(
     rather than a measurement of that port -- a number, not an adjective.  The
     mask is in SCAN ``|x|``, the frame the trust model is stated in, NOT in
     the quadrature's centroid-folded radius.  ``NaN`` where the radius is not
-    given.
+    given.  The density-weighted pair are RATIOS OF TWO SIGNED SUMS and are
+    therefore not confined to ``[0, 1]``: where the cells beyond the radius
+    are noise about zero their numerator can go negative, or exceed a
+    denominator the same cells have pulled down.  That is reported as
+    computed; the unweighted pair, whose weights ``w`` are non-negative, stay
+    shares in the ordinary sense.
 
     ``subtract_background=False`` is the comparand chain, and it reaches the
     T_e rows through the WEIGHT: both averages are taken over the unsubtracted
@@ -3250,7 +3258,16 @@ def export_overlay(
             "something a new result may quote.  See ftavg_background.  The "
             "density rows were re-cut at schema v33 and the three Isat "
             "families at v35; a product at v31 or earlier carries the "
-            "subtracted values under the COMPARAND names."
+            "subtracted values under the COMPARAND names.  THE TWO DENSITY "
+            "LEGACY ROWS MOVED AT v37 AND NO LONGER REPRODUCE A PRE-v37 "
+            "VALUE: they are the legacy REDUCTION, not a frozen copy, and the "
+            "density grid under them stopped deleting its negative cells.  "
+            "Those cells shift the edge medians this reduction takes its "
+            "baseline from, and the clip at zero then lifts them, so "
+            "density_ftavg_subtracted_cm3 and density_column_subtracted_cm3 "
+            "reproduce the retired METHOD over the corrected input, not the "
+            "numbers the retired method once produced.  The three Isat legacy "
+            "rows are unaffected -- their input never had a sign test."
         ),
         te_ftavg_time_ms=te.time_ms,
         te_ftavg_ev=te_ftavg["ftavg"],
@@ -3586,25 +3603,35 @@ def export_overlay(
             "|x| beyond that port's te_trust_radius_cm, per port and per "
             "sample, and te_column_pure_prior_weight the share beyond "
             "te_trust_blend_cm, where the filled product reports the prior "
-            "alone.  Over the 15.0-19.5 ms plateau those shares read: ES1 "
-            "0.247 / 0.242 / 0.265 / 0.212 / 0.671 at p11 / p21 / p29 / p41 / "
-            "p50, ES2 0.270 / 0.205 / 0.256 / 0.239 / 0.689, ES3 0.735 / "
-            "0.685 / 0.700 / 0.601 / 0.639, ES4 0.705 / 0.622 / 0.617 / 0.567 "
-            "/ 0.756; pure-prior at ES1, 0.109 / 0.141 / 0.170 / 0.131 / "
-            "0.345.  At the eight ES1/ES2 aperture ports the prior carries "
-            "21-27 % of the weight; at every p50 row and across sets 3 and 4 "
-            "it carries 57-76 %, and AT TWELVE OF THE TWENTY PORT-ROWS IT IS "
+            "alone.  THE TWO DENSITY-WEIGHTED SHARES ARE RATIOS OF TWO SIGNED "
+            "SUMS (schema v37) and are not confined to [0, 1]: where the cells "
+            "beyond the radius are noise about zero the numerator can go "
+            "negative.  Measured at this vintage, every sample of the "
+            "15.0-19.5 ms scored window is inside [0, 1] at all four sets, and "
+            "the excursions are 5 / 8 / 1 / 1 samples at ES1 / ES2 / ES3 / ES4 "
+            "of 198 / 199 / 93 / 75 finite, all at t <= 9 ms where there is "
+            "nearly no plasma to weight with.  Over the 15.0-19.5 ms plateau "
+            "those shares read: ES1 "
+            "0.236 / 0.223 / 0.268 / 0.212 / 0.668 at p11 / p21 / p29 / p41 / "
+            "p50, ES2 0.270 / 0.201 / 0.254 / 0.228 / 0.688, ES3 0.735 / "
+            "0.680 / 0.700 / 0.600 / 0.504, ES4 0.698 / 0.619 / 0.617 / 0.419 "
+            "/ NaN (ES4 p50 carries no column row at all: its whole scan sums "
+            "non-positive over the plateau); pure-prior at ES1, 0.096 / 0.119 "
+            "/ 0.173 / 0.131 / 0.339.  At the eight ES1/ES2 aperture ports the "
+            "prior carries "
+            "20-27 % of the weight; at every p50 row and across sets 3 and 4 "
+            "it carries 42-74 %, and AT ELEVEN OF THE TWENTY PORT-ROWS IT IS "
             "NOT A SMALL CORRECTION -- those rows are substantially a "
             "statement about the repo's SOL prior and must not be read as a "
             "measurement of that port's column T_e.  The unweighted row is "
             "worse again: te_column_plain_prior_weight and "
             "te_column_plain_pure_prior_weight are the same shares of sum w, "
-            "and they run 0.42 to 0.84, which is one reason the plain row is "
+            "and they run 0.42 to 0.85, which is one reason the plain row is "
             "not the comparand.  These shares are taken on the UNSUBTRACTED "
             "density weight (schema v33): the retired background subtraction "
             "held the outer cells down, so every share here is LARGER than "
-            "the same statistic taken before the ruling -- ES1 p11 0.247 "
-            "against 0.218.  The"
+            "the same statistic taken before the ruling -- ES1 p11 0.236 "
+            "against 0.218.  The "
             "flag is the reliable statement and the coverage radius is "
             "indicative, for the same frame reason ftavg_coverage_definition "
             "gives: coverage is in scan |x| and the edge is in the "

@@ -359,7 +359,7 @@ def test_a_negative_weight_is_carried_and_the_mean_may_leave_its_own_range():
     clip back into ``[min, max]`` is the retired sign test under another name.
     """
     values = np.array([1.0, 2.0, 3.0])
-    weights = np.array([1.0, -0.4, 0.2])
+    weights = np.array([-0.2, 0.1, 0.2])
 
     mean, _ = _weighted_mean_and_sem(values, weights)
 
@@ -1060,21 +1060,40 @@ def _window_mean(values, time_ms, window=RAW_PLATEAU_WINDOW_MS):
     return out
 
 
-def _plateau_ordering_margins_ev(core, ftavg, plain, time_ms):
+def _plateau_ordering_margins_ev(core, ftavg, plain, time_ms, density_core=None):
     """Assert plain < weighted < core ON THE PLATEAU-WINDOW MEANS; return margins.
 
     This is a WINDOW-MEAN property and is asserted as one.  The per-sample
     ordering is not a property of these rows at all: the gap between the
     weighted and the plain row is cov_w(n, T_e) / <n>, which changes sign
     wherever the density and T_e anti-correlate across the disc.
+
+    ``weighted < core`` holds at every port that carries a row and is asserted
+    unconditionally.  ``plain < weighted`` is the statement that the density
+    and T_e are positively correlated across the disc, and it is NOT universal
+    either: at a port whose column has decayed into the noise there is no
+    correlation left to weight by.  Pass ``density_core`` -- the same port rows
+    of the core-band DENSITY -- to have the claim made where it is a claim, at
+    every port whose plateau-mean core density is positive, and MEASURED
+    elsewhere: a violation at a port whose core density averages non-positive
+    is reported as the measured fact it is, and a violation anywhere else
+    fails.  Without it the ordering is asserted at every port, which is what
+    the synthetic callers want.
     """
     means = [_window_mean(v, time_ms) for v in (core, ftavg, plain)]
     rows = np.isfinite(means[0]) & np.isfinite(means[1]) & np.isfinite(means[2])
     assert rows.any(), "no port carries a plateau-window mean"
     core_mean, ftavg_mean, plain_mean = (m[rows] for m in means)
-    assert np.all(plain_mean < ftavg_mean), (
+
+    lifted = plain_mean < ftavg_mean
+    if density_core is None:
+        carries_plasma = np.ones_like(lifted, dtype=bool)
+    else:
+        carries_plasma = _window_mean(density_core, time_ms)[rows] > 0.0
+    assert np.all(lifted[carries_plasma]), (
         "the density weighting must lift the plateau-mean T_e above the plain "
-        f"area mean: {plain_mean} vs {ftavg_mean}"
+        "area mean wherever the column carries plasma: "
+        f"{plain_mean[carries_plasma]} vs {ftavg_mean[carries_plasma]}"
     )
     assert np.all(ftavg_mean < core_mean), (
         "the area average reaches radii the core-band line cut never sees and "
@@ -1643,7 +1662,12 @@ def test_the_exported_overlay_carries_the_whole_column_comparand():
 #: weight lying beyond that port's trust radius, over the scoring plateau.
 #: ES1 p11 is an 18.415 cm aperture port and ES3 p11 keeps the historical
 #: 10 cm, which is the whole spread of the trust model in two numbers.
-PLATEAU_PRIOR_WEIGHT_P11 = {1: 0.247, 3: 0.735}
+PLATEAU_PRIOR_WEIGHT_P11 = {1: 0.236, 3: 0.735}
+
+#: The plateau window every scored row is taken over, in ms, as the share
+#: fields below are judged on.  Named here so the measured statement about
+#: where the shares stay inside [0, 1] says which samples it is about.
+PRIOR_WEIGHT_PLATEAU_MS = (15.0, 19.5)
 
 
 def _plateau_mask(time_ms):
@@ -1654,7 +1678,17 @@ def _plateau_mask(time_ms):
 
 @pytest.mark.parametrize("experiment_set", sorted(PLATEAU_PRIOR_WEIGHT_P11))
 def test_the_column_te_prior_weight_is_the_measured_share(experiment_set):
-    """How much of each column T_e is the SOL prior, pinned on the product."""
+    """How much of each column T_e is the SOL prior, pinned on the product.
+
+    The share is ``sum w n`` beyond the trust radius over ``sum w n`` over the
+    whole column, and BOTH SUMS ARE SIGNED: since the density grid stopped
+    deleting its negative cells, a sample whose outer cells are noise about
+    zero can carry a negative numerator or a numerator larger than its own
+    denominator.  So [0, 1] is not a property of this field and is not
+    asserted; it is MEASURED to hold over the plateau window every scored row
+    is taken from, and to fail only at early samples, which is the statement
+    that is actually true of the product.
+    """
     path = Path(f"processed/es{experiment_set}_sim1d_overlay.npz")
     if not path.exists():
         pytest.skip(f"no ES{experiment_set} overlay on disk")
@@ -1665,12 +1699,28 @@ def test_the_column_te_prior_weight_is_the_measured_share(experiment_set):
     share = overlay["te_column_prior_weight"]
     pure = overlay["te_column_pure_prior_weight"]
     finite = np.isfinite(share)
-
-    # A share of a positive total: in [0, 1] wherever it is defined at all.
     assert finite.any()
-    assert np.all((share[finite] >= 0.0) & (share[finite] <= 1.0))
-    # Past the blend radius is a subset of past the trust radius.
-    assert np.all(pure[finite] <= share[finite] + 1e-12)
+
+    time_ms = overlay["te_time_ms"]
+    scored = (time_ms >= PRIOR_WEIGHT_PLATEAU_MS[0]) & (
+        time_ms <= PRIOR_WEIGHT_PLATEAU_MS[1]
+    )
+    inside = finite & scored[None, :]
+    assert inside.any()
+    assert np.all((share[inside] >= 0.0) & (share[inside] <= 1.0)), (
+        "a prior-weight share left [0, 1] inside the scored plateau window, "
+        "where the column still carries plasma and the denominator is not "
+        f"noise: {share[inside][(share[inside] < 0.0) | (share[inside] > 1.0)]}"
+    )
+    outside = finite & ~scored[None, :]
+    excursions = outside & ((share < 0.0) | (share > 1.0))
+    if excursions.any():
+        # Measured, not asserted away: every one of them is an early sample.
+        assert np.all(time_ms[np.nonzero(excursions)[1]] < 10.0)
+    # Past the blend radius is a subset of past the trust radius -- an
+    # inclusion of node SETS, so it survives the sign only where the shares
+    # themselves do; judged on the scored window for the same reason.
+    assert np.all(pure[inside] <= share[inside] + 1e-12)
 
     p11 = int(np.flatnonzero(overlay["port"] == 11)[0])
     window = _plateau_mask(overlay["te_time_ms"])
@@ -1765,7 +1815,13 @@ def test_the_flux_tube_te_rows_rebuilt_from_the_placed_profile_products():
       them IS the weighted covariance of density and T_e -- exactly, at every
       port and every sample;
     * the PLATEAU-WINDOW MEANS are ordered plain < weighted < core at every
-      port.  Per sample they are not, and nothing here asserts that they are.
+      port THAT CARRIES PLASMA.  Per sample they are not, and neither is the
+      lift universal: since the density grid stopped deleting its negative
+      cells, ES4 p50 -- whose column has decayed into the noise and whose
+      core-band density averages NEGATIVE over the plateau -- reads
+      plain 0.648 eV against weighted 0.584 eV on this legacy chain, the
+      density weighting pulling the average down instead of lifting it.  The
+      core-band density is passed so the claim is made where it is a claim.
     """
     if not (TE_FILLED_HDF5.exists() and DENSITY_PROFILES_HDF5.exists()):
         pytest.skip("the placed T_e / density profile products are not on disk")
@@ -1810,8 +1866,13 @@ def test_the_flux_tube_te_rows_rebuilt_from_the_placed_profile_products():
                     _assert_the_gap_is_the_weighted_covariance(stats, nodes)
 
             core_mean, _, _, _ = _nan_core_stats(te_profiles, x_cm, X_MIN_CM, X_MAX_CM)
+            density_core, _, _, _ = _nan_core_stats(weight, x_cm, X_MIN_CM, X_MAX_CM)
             _plateau_ordering_margins_ev(
-                core_mean, rows["ftavg"], rows["plain"], te_time_ms
+                core_mean,
+                rows["ftavg"],
+                rows["plain"],
+                te_time_ms,
+                density_core=density_core,
             )
             checked_sets += 1
 
