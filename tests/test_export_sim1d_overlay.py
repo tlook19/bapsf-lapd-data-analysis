@@ -442,13 +442,78 @@ def test_a_cell_with_one_finite_sample_does_not_reach_the_te_clock():
 # ---------------------------------------------------------------------------
 # The WHOLE-COLUMN comparand: inventory out to the column edge, over the tube
 # ---------------------------------------------------------------------------
-def _column_density_stats(profile, x_cm=None):
-    """The density row's column reduction, spelled out once for the tests."""
+def _column_density_stats(profile, x_cm=None, subtract_background=False):
+    """The density row's column reduction, spelled out once for the tests.
+
+    ``subtract_background`` defaults to FALSE, which is the comparand chain:
+    the probe's own end-of-shot zeroing is the baseline, so the exporter's
+    density rows subtract nothing further.
+    """
     return _flux_tube_profile_stats(
         profile,
         X_CM if x_cm is None else x_cm,
         radius_cm=None,
         normalize_radius_cm=FLUX_TUBE_RADIUS_CM,
+        subtract_background=subtract_background,
+    )
+
+
+#: A scan whose own extent IS the flux-tube radius, so the column integral and
+#: the flux-tube integral have the same outer limit and nothing separates the
+#: three conventions but the profile itself.
+X_TUBE_CM = np.linspace(-FLUX_TUBE_RADIUS_CM, FLUX_TUBE_RADIUS_CM, 51)
+
+
+def test_a_flat_profile_reads_the_same_under_all_three_conventions():
+    """column == ftavg == core, exactly, with no background subtracted.
+
+    This identity was unreachable while the effective-width ledger's baseline
+    was still being removed: a profile flat to the scan edge had its own level
+    as that baseline, so the subtraction took it to zero and the row came back
+    NaN.  With the subtraction retired it is the plainest check there is --
+    a uniform column is one number under a line cut, an area mean over the
+    tube, and the tube-normalized inventory to the scan edge alike.
+    """
+    level = 3.0
+    flat = np.full(X_TUBE_CM.size, level)
+
+    column = _column_density_stats(flat, X_TUBE_CM)
+    flux_tube = _flux_tube_profile_stats(
+        flat, X_TUBE_CM, subtract_background=False
+    )
+
+    assert flux_tube["n_despiked"] == 0
+    assert column["edge"] == pytest.approx(FLUX_TUBE_RADIUS_CM, rel=1e-12)
+    assert flux_tube["ftavg"] == pytest.approx(level, rel=1e-12)
+    assert column["ftavg"] == pytest.approx(level, rel=1e-12)
+    assert flux_tube["core"] == pytest.approx(level, rel=1e-12)
+
+
+def test_the_retired_subtraction_erases_a_flat_profile_entirely():
+    """Why the identity above could not be written before the ruling."""
+    flat = np.full(X_TUBE_CM.size, 3.0)
+
+    subtracted = _flux_tube_profile_stats(
+        flat, X_TUBE_CM, subtract_background=True
+    )
+
+    assert np.isnan(subtracted["ftavg"])
+    assert subtracted["core"] == pytest.approx(0.0, abs=1e-12)
+
+
+def test_a_flat_column_wider_than_the_tube_carries_more_than_the_tube():
+    """The normalization, isolated: same level, more area, more inventory."""
+    level = 3.0
+    flat = np.full(X_CM.size, level)
+
+    column = _column_density_stats(flat)
+    flux_tube = _flux_tube_profile_stats(flat, X_CM, subtract_background=False)
+    edge = column["edge"]
+
+    assert edge == pytest.approx(25.0, rel=1e-12)
+    assert flux_tube["ftavg"] == pytest.approx(level, rel=1e-12)
+    assert column["ftavg"] == pytest.approx(
+        level * (edge / FLUX_TUBE_RADIUS_CM) ** 2, rel=1e-12
     )
 
 
@@ -471,21 +536,13 @@ def _top_hat(level=3.0, flat_to_cm=16.0):
 
 
 def test_a_column_that_stops_inside_the_tube_reads_the_flux_tube_row():
-    """Nothing outside the tube: the two area conventions are one number.
-
-    This is the flat-profile identity in the form that actually holds.  All
-    THREE conventions cannot coincide on a density row: the core-band row is a
-    line cut over |x| <= 10 cm and equals the flat level, while any area
-    average equals that level only if the profile is flat across the WHOLE
-    disc -- and a profile flat to the scan edge has the effective-width
-    ledger's baseline equal to its own level, so the background subtraction
-    takes it to zero and the row is NaN by construction.  The column and the
-    flux tube do coincide, exactly, whenever the annulus between them is empty.
-    """
+    """Nothing outside the tube: the two area conventions are one number."""
     profile = _top_hat()
 
     column = _column_density_stats(profile)
-    flux_tube = _flux_tube_profile_stats(profile, X_CM)
+    flux_tube = _flux_tube_profile_stats(
+        profile, X_CM, subtract_background=False
+    )
 
     assert flux_tube["n_despiked"] == 0
     assert column["edge"] == pytest.approx(np.max(np.abs(X_CM)), rel=1e-12)
@@ -515,8 +572,9 @@ def test_a_flat_te_reads_the_same_under_all_three_conventions():
         X_CM,
         radius_cm=None,
         normalize_radius_cm=FLUX_TUBE_RADIUS_CM,
+        subtract_background=False,
     )
-    flux_tube = _flux_tube_te_stats(te, density, X_CM)
+    flux_tube = _flux_tube_te_stats(te, density, X_CM, subtract_background=False)
 
     assert column["ftavg"] == pytest.approx(4.25, rel=1e-12)
     assert column["plain"] == pytest.approx(4.25, rel=1e-12)
@@ -528,48 +586,36 @@ def test_a_flat_te_reads_the_same_under_all_three_conventions():
     assert column["edge"] > flux_tube["edge"] == FLUX_TUBE_RADIUS_CM
 
 
-#: The radius whose sample the effective-width ledger's baseline is read at on
-#: ``X_CM``: the median of the outermost BACKGROUND_EDGE_POINTS = 3 samples,
-#: which on a monotone skirt is the middle one, |x| = 24 cm.
-_LEDGER_BASELINE_RADIUS_CM = 24.0
-
-
-def _gaussian_column_over_ftavg(width_cm):
+def _gaussian_column_over_ftavg(width_cm, edge_cm=25.0):
     """The analytic ``column_over_ftavg_ratio`` of a centred Gaussian.
 
-    For ``f(r) = exp(-(r/w)^2)`` the ledger removes ``b = f(24 cm)`` and the
-    clip at zero then empties everything beyond 24 cm, so with
+    Nothing is subtracted from the comparand chain, so for
+    ``f(r) = exp(-(r/w)^2)`` the closed form is the bare pair of integrals,
     ``int_0^a 2 r f dr = w^2 (1 - exp(-a^2/w^2))``:
 
-        ratio = [w^2 (1 - e^{-24^2/w^2}) - 24^2 b]
-              / [w^2 (1 - e^{-R^2/w^2}) - R^2 b]
+        ratio = (1 - e^{-edge^2/w^2}) / (1 - e^{-R^2/w^2})
 
     and ``1 - 1/ratio`` is the share of the column's inventory lying outside
     the tube.
     """
-    edge = _LEDGER_BASELINE_RADIUS_CM
-    baseline = np.exp(-((edge / width_cm) ** 2))
-
-    def integral(limit):
-        return width_cm**2 * (1.0 - np.exp(-((limit / width_cm) ** 2))) - (
-            limit**2 * baseline
-        )
-
-    return integral(edge) / integral(FLUX_TUBE_RADIUS_CM)
+    return (1.0 - np.exp(-((edge_cm / width_cm) ** 2))) / (
+        1.0 - np.exp(-((FLUX_TUBE_RADIUS_CM / width_cm) ** 2))
+    )
 
 
 def test_a_gaussian_column_gives_the_analytic_share_outside_the_tube():
     """A profile with a KNOWN fraction outside the tube, end to end.
 
     The tolerance is the 1 cm trapezoid's own discretization error against the
-    closed form, measured at 2.5e-4 relative; nothing here is fitted to the
-    implementation.
+    closed form; nothing here is fitted to the implementation.
     """
     width_cm = 15.0
     profile = np.exp(-((X_CM / width_cm) ** 2))
 
     column = _column_density_stats(profile)
-    flux_tube = _flux_tube_profile_stats(profile, X_CM)
+    flux_tube = _flux_tube_profile_stats(
+        profile, X_CM, subtract_background=False
+    )
     expected = _gaussian_column_over_ftavg(width_cm)
 
     assert flux_tube["n_despiked"] == 0
@@ -577,7 +623,7 @@ def test_a_gaussian_column_gives_the_analytic_share_outside_the_tube():
         expected, rel=1e-3
     )
     # The fraction this width puts outside the tube, stated rather than implied.
-    assert 1.0 - 1.0 / expected == pytest.approx(0.0867, abs=5e-4)
+    assert 1.0 - 1.0 / expected == pytest.approx(0.1699, abs=5e-4)
 
 
 def test_the_column_te_row_is_the_two_quadrature_sums_over_the_column_nodes():
@@ -591,11 +637,13 @@ def test_the_column_te_row_is_the_two_quadrature_sums_over_the_column_nodes():
         X_CM,
         radius_cm=None,
         normalize_radius_cm=FLUX_TUBE_RADIUS_CM,
+        subtract_background=False,
     )
 
-    subtracted = _subtract_background(_despike_profile(density)[0])
-    finite = np.isfinite(subtracted) & np.isfinite(te)
-    values = np.clip(subtracted[finite], 0.0, None)
+    # The comparand chain: despiked, nothing subtracted, nothing clipped.
+    prepared = _despike_profile(density)[0]
+    finite = np.isfinite(prepared) & np.isfinite(te)
+    values = prepared[finite]
     positions = X_CM[finite]
     centroid = float(np.sum(values * positions) / np.sum(values))
     folded = np.abs(positions - centroid)
@@ -1488,6 +1536,10 @@ def test_the_exported_overlay_carries_the_whole_column_comparand():
         "te_column_plain_sem_ev",
         "te_column_plain_radial_sem_ev",
         "te_column_edge_cm",
+        "te_column_prior_weight",
+        "te_column_pure_prior_weight",
+        "te_column_plain_prior_weight",
+        "te_column_plain_pure_prior_weight",
         "column_coverage_cm",
         "column_prior_beyond_coverage",
     ):
@@ -1513,6 +1565,68 @@ def test_the_exported_overlay_carries_the_whole_column_comparand():
     comparand_map = str(overlay["ftavg_comparand_map"])
     for name in ("density_mean_cm3", "density_ftavg_cm3", "density_column_cm3"):
         assert name in comparand_map, name
+
+
+#: The ES1 and ES3 p11 shares of the column T_e's density-weighted quadrature
+#: weight lying beyond that port's trust radius, over the scoring plateau.
+#: ES1 p11 is an 18.415 cm aperture port and ES3 p11 keeps the historical
+#: 10 cm, which is the whole spread of the trust model in two numbers.
+PLATEAU_PRIOR_WEIGHT_P11 = {1: 0.247, 3: 0.735}
+
+
+def _plateau_mask(time_ms):
+    return (time_ms >= RAW_PLATEAU_WINDOW_MS[0]) & (
+        time_ms <= RAW_PLATEAU_WINDOW_MS[1]
+    )
+
+
+@pytest.mark.parametrize("experiment_set", sorted(PLATEAU_PRIOR_WEIGHT_P11))
+def test_the_column_te_prior_weight_is_the_measured_share(experiment_set):
+    """How much of each column T_e is the SOL prior, pinned on the product."""
+    path = Path(f"processed/es{experiment_set}_sim1d_overlay.npz")
+    if not path.exists():
+        pytest.skip(f"no ES{experiment_set} overlay on disk")
+    overlay = np.load(path, allow_pickle=True)
+    if "te_column_prior_weight" not in overlay.files:
+        pytest.skip("the overlay on disk predates the column prior weight")
+
+    share = overlay["te_column_prior_weight"]
+    pure = overlay["te_column_pure_prior_weight"]
+    finite = np.isfinite(share)
+
+    # A share of a positive total: in [0, 1] wherever it is defined at all.
+    assert finite.any()
+    assert np.all((share[finite] >= 0.0) & (share[finite] <= 1.0))
+    # Past the blend radius is a subset of past the trust radius.
+    assert np.all(pure[finite] <= share[finite] + 1e-12)
+
+    p11 = int(np.flatnonzero(overlay["port"] == 11)[0])
+    window = _plateau_mask(overlay["te_time_ms"])
+    assert np.nanmean(share[p11, window]) == pytest.approx(
+        PLATEAU_PRIOR_WEIGHT_P11[experiment_set], abs=0.005
+    )
+
+
+def test_the_legacy_subtracted_rows_sit_below_the_comparand_rows():
+    """The retired convention is kept, named, and is NOT the comparand."""
+    overlay = _overlay_or_skip()
+    if "density_ftavg_subtracted_cm3" not in overlay.files:
+        pytest.skip("the ES1 overlay on disk predates the background ruling")
+
+    for legacy, comparand in (
+        ("density_ftavg_subtracted_cm3", "density_ftavg_cm3"),
+        ("density_column_subtracted_cm3", "density_column_cm3"),
+    ):
+        both = np.isfinite(overlay[legacy]) & np.isfinite(overlay[comparand])
+        assert both.any(), legacy
+        # Removing a non-negative pedestal can only take density away.
+        assert np.all(overlay[legacy][both] <= overlay[comparand][both] + 1e-6)
+        # And it is not a no-op: the pedestal is real plasma at these scans.
+        assert np.any(overlay[legacy][both] < overlay[comparand][both])
+
+    ruling = str(overlay["ftavg_background"])
+    assert "NO BACKGROUND IS SUBTRACTED" in ruling
+    assert "end of the shot" in ruling.lower() or "END OF THE SHOT" in ruling
 
 
 TE_FILLED_HDF5 = Path("processed/te_filled.hdf5")
