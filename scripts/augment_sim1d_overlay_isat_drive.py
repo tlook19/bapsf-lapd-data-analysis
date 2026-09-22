@@ -1,4 +1,4 @@
-"""Append the raw drive-window Isat family to a sim1d overlay (v2..v27 odd).
+"""Append the raw drive-window Isat family to a sim1d overlay (v2..v43 odd, less v39).
 
 Adds ``isat_drive_*`` — the upstream ion-saturation current from the
 inter-sweep dead-time cells DURING the drive — to an existing
