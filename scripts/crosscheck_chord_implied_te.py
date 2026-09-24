@@ -609,8 +609,14 @@ def make_figure(
     path: Path,
     window_ms: tuple[float, float],
 ) -> Path:
-    """Per experiment set: the T_e pair with its band, and the ratio."""
+    """Per experiment set: the T_e pair with its band, and the ratio.
+
+    A row whose ``te_row_measured_fraction`` is zero is drawn with an OPEN
+    marker face and no filled band: its ``T_e`` was reconstructed, so the
+    implied temperature beside it is not a measurement of that probe.
+    """
     import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
 
     aggregates = window_rows(rows)
     set_ids = sorted({row["es"] for row in aggregates})
@@ -631,32 +637,47 @@ def make_figure(
         te_implied = np.array([row["te_implied_ev"] for row in set_rows])
         sigma = np.array([row["te_sigma_sys_ev"] for row in set_rows])
         ratio = np.array([row["ratio"] for row in set_rows])
+        measured = np.array(
+            [row["te_row_measured_fraction"] > 0.0 for row in set_rows]
+        )
 
         top = axes[0, column]
-        top.errorbar(
-            positions,
-            te_used,
-            yerr=sigma,
-            fmt="o",
-            color="tab:blue",
-            capsize=4,
-            label=r"$T_e$ used $\pm\,\sigma_{\rm sys}$",
-        )
-        top.plot(
-            positions,
-            te_implied,
-            "s",
-            color="tab:red",
-            label=r"$T_e$ implied by the chord",
-        )
+        for mask, face in ((measured, None), (~measured, "none")):
+            if not mask.any():
+                continue
+            top.errorbar(
+                positions[mask],
+                te_used[mask],
+                yerr=sigma[mask],
+                fmt="o",
+                color="tab:blue",
+                markerfacecolor=face,
+                capsize=4,
+            )
+            top.plot(
+                positions[mask],
+                te_implied[mask],
+                "s",
+                color="tab:red",
+                markerfacecolor=face,
+            )
         top.set_title(f"ES{set_id}")
         top.grid(True, alpha=0.25)
         if column == 0:
             top.set_ylabel(r"$T_e$ (eV)")
-            top.legend(loc="best", fontsize=8, frameon=False)
 
         bottom = axes[1, column]
-        bottom.plot(positions, ratio, "D-", color="tab:green")
+        bottom.plot(positions, ratio, "-", color="tab:green")
+        for mask, face in ((measured, None), (~measured, "none")):
+            if not mask.any():
+                continue
+            bottom.plot(
+                positions[mask],
+                ratio[mask],
+                "D",
+                color="tab:green",
+                markerfacecolor=face,
+            )
         bottom.axhline(1.0, color="0.4", lw=1.0, ls="--")
         bottom.set_xticks(positions)
         bottom.set_xticklabels(labels, fontsize=8)
@@ -670,10 +691,49 @@ def make_figure(
         rf"$T_e$ ({window_ms[0]:g}-{window_ms[1]:g} ms)"
         "\n"
         r"$L_{\rm probe}$ integrates the measured scan only "
-        r"($|x| \leq 25$ cm); a wider column biases $r$ down",
+        r"($|x| \leq 25$ cm); a wider column biases $r$ down"
+        "\n"
+        r"Open markers: the port's $T_e$ row carries no measured cell, so the "
+        r"implied $T_e$ is not a measurement of that probe",
         fontsize=11,
     )
-    fig.tight_layout(rect=(0, 0, 1, 0.93))
+    # A figure-level legend: the panels are narrow and the prior-derived entry
+    # is long, so an in-axes legend covers the first port's markers.
+    fig.legend(
+        handles=[
+            Line2D(
+                [],
+                [],
+                marker="o",
+                color="tab:blue",
+                linestyle="none",
+                label=r"$T_e$ used $\pm\,\sigma_{\rm sys}$",
+            ),
+            Line2D(
+                [],
+                [],
+                marker="s",
+                color="tab:red",
+                linestyle="none",
+                label=r"$T_e$ implied by the chord",
+            ),
+            Line2D(
+                [],
+                [],
+                marker="o",
+                color="0.35",
+                markerfacecolor="none",
+                linestyle="none",
+                label=r"$T_e$ prior-derived (no measured cells)",
+            ),
+        ],
+        loc="upper center",
+        bbox_to_anchor=(0.5, 0.875),
+        ncol=3,
+        fontsize=9,
+        frameon=False,
+    )
+    fig.tight_layout(rect=(0, 0, 1, 0.85))
     fig.savefig(path, dpi=150)
     plt.close(fig)
     return path
