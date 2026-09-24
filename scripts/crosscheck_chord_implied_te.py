@@ -72,6 +72,18 @@ same convention the overlay's ``te_column_ev`` uses; where negative skirt cells
 carry weight the result is not a convex combination of its own nodes and can
 sit outside the range of the row's ``T_e``.
 
+A row with ``te_row_measured_fraction = 0`` reads back on a RECONSTRUCTED
+``T_e`` -- that port's filled row carries no measured cell at any sample in the
+window, so it was built from its neighbours, the scrape-off-layer anchors and
+the end-plate sentinels -- and its ``pull`` is therefore not a measurement of
+that probe.  The fraction is the share of the window's samples at which the row
+carries at least one measured cell (``te_row_measured_cells`` in
+``te_filled.hdf5``), so a row that loses its measurement part-way through the
+window degrades to an intermediate value rather than flipping.  It is a
+PROVENANCE statement and is independent of ``te_semiquant_fraction``, which is
+an uncertainty class a measured cell can carry and a reconstructed one can
+lack: the two do not substitute for each other.
+
 Scan extent LIMITATION
 ----------------------
 ``L_probe`` is an integral over the MEASURED SCAN ONLY: 51 points at 1 cm
@@ -164,6 +176,7 @@ CSV_FIELDS = (
     "pull",
     "n_edge_left_over_axis",
     "n_edge_right_over_axis",
+    "te_row_measured_fraction",
 )
 
 
@@ -378,6 +391,12 @@ def collect_port(
         te_row, te_cycle_time_ms, sample_time_ms
     )
     semiquant_row = np.asarray(te_set["te_semi_quantitative"][()][te_index], dtype=bool)
+    # Per-sample count of cells this port's row carries a MEASUREMENT for; zero
+    # means the row at that sample was reconstructed from its neighbours and
+    # the boundary anchors, and is not a measurement of this port.
+    measured_row = np.asarray(
+        te_set["te_row_measured_cells"][()][te_index], dtype=np.int64
+    )
 
     chord_time_ms, chord_cm2 = _chord_line_integrated_cm2(npz, set_id, chord_port)
 
@@ -430,6 +449,7 @@ def collect_port(
             "pull": te_pull(te_used, te_implied, sigma),
             "n_edge_left_over_axis": left,
             "n_edge_right_over_axis": right,
+            "te_row_measured_fraction": float(measured_row[cycle] >= 1),
         })
         probe_values.append(probe_cm2)
         chord_values.append(chord_value_cm2)
@@ -465,6 +485,9 @@ def collect_port(
         "pull": te_pull(te_used_window, te_implied_window, sigma_window),
         "n_edge_left_over_axis": left_window,
         "n_edge_right_over_axis": right_window,
+        "te_row_measured_fraction": float(
+            np.mean(measured_row[te_cycles_in_window] >= 1)
+        ),
     }
     return [window_row, *sample_rows]
 
@@ -551,11 +574,17 @@ def print_table(rows: list[dict[str, Any]], window_ms: tuple[float, float]) -> N
         "column wider than the scan biases r down.  n(edge)/n(0) says how "
         "much density is still standing at the scan edge."
     )
+    print(
+        "  f_meas is the share of the window's samples at which this port's "
+        "filled T_e row carries a measured cell.  A row marked PRIOR "
+        "(f_meas = 0) reads back on a RECONSTRUCTED T_e and its pull is not a "
+        "measurement of that probe."
+    )
     header = (
         f"{'ES':>3} {'chord':>6} {'probe':>6} {'z_ch':>8} {'z_pr':>8} "
         f"{'L_probe':>11} {'L_chord':>11} {'r':>7} {'Te_used':>8} "
         f"{'Te_impl':>8} {'sig_sys':>8} {'pull':>7} {'semiq':>6} "
-        f"{'n_L/n0':>7} {'n_R/n0':>7}"
+        f"{'n_L/n0':>7} {'n_R/n0':>7} {'f_meas':>7} {'prov':>5}"
     )
     print()
     print(header)
@@ -569,7 +598,9 @@ def print_table(rows: list[dict[str, Any]], window_ms: tuple[float, float]) -> N
             f"{row['te_implied_ev']:>8.3f} {row['te_sigma_sys_ev']:>8.3f} "
             f"{row['pull']:>7.2f} {row['te_semiquant_fraction']:>6.2f} "
             f"{row['n_edge_left_over_axis']:>7.3f} "
-            f"{row['n_edge_right_over_axis']:>7.3f}"
+            f"{row['n_edge_right_over_axis']:>7.3f} "
+            f"{row['te_row_measured_fraction']:>7.2f} "
+            f"{'PRIOR' if row['te_row_measured_fraction'] == 0.0 else '':>5}"
         )
 
 

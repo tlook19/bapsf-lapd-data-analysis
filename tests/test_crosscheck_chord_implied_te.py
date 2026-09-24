@@ -48,8 +48,14 @@ def _flat_probe_line_integral_cm2() -> float:
     return DENSITY_M3 * SCAN_WIDTH_M / 1e4
 
 
-def _write_products(tmp_path, ratio: float):
-    """Write density, filled-T_e and chord products whose r is ``ratio``."""
+def _write_products(tmp_path, ratio: float, *, measured_cells: int = 51):
+    """Write density, filled-T_e and chord products whose r is ``ratio``.
+
+    ``measured_cells`` is the per-sample ``te_row_measured_cells`` count the
+    synthetic filled-T_e row claims: the default is a fully measured row, and
+    zero is a PRIOR-DERIVED row reconstructed from its neighbours and the
+    boundary anchors.
+    """
     density_path = tmp_path / "density_profiles_isweep.hdf5"
     te_path = tmp_path / "te_filled.hdf5"
     interf_path = tmp_path / "interferometer_experiment_set_stats.npz"
@@ -78,6 +84,10 @@ def _write_products(tmp_path, ratio: float):
             "te_semi_quantitative",
             data=np.zeros((1, X_CM.size, n_cycles), dtype=bool),
         )
+        group.create_dataset(
+            "te_row_measured_cells",
+            data=np.full((1, n_cycles), measured_cells, dtype=np.int16),
+        )
 
     chord_cm2 = _flat_probe_line_integral_cm2() / ratio
     np.savez(
@@ -92,8 +102,10 @@ def _write_products(tmp_path, ratio: float):
     return density_path, te_path, interf_path
 
 
-def _window_row(tmp_path, ratio: float) -> dict:
-    density_path, te_path, interf_path = _write_products(tmp_path, ratio)
+def _window_row(tmp_path, ratio: float, *, measured_cells: int = 51) -> dict:
+    density_path, te_path, interf_path = _write_products(
+        tmp_path, ratio, measured_cells=measured_cells
+    )
     rows = collect_rows(density_path, te_path, interf_path, (15.0, 19.5))
     aggregates = window_rows(rows)
     assert len(aggregates) == 1
@@ -165,6 +177,24 @@ def test_synthetic_low_ratio_implies_sixty_four_percent_of_it(tmp_path):
     assert row["pull"] == pytest.approx(
         (TE_EV - 0.64 * TE_EV) / te_sigma_sys_ev(TE_EV), rel=1e-12
     )
+
+
+def test_a_measured_row_reports_a_measured_fraction_of_one(tmp_path):
+    row = _window_row(tmp_path, 1.0, measured_cells=51)
+    assert row["te_row_measured_fraction"] == pytest.approx(1.0, rel=1e-12)
+
+
+def test_a_prior_derived_row_reports_a_measured_fraction_of_zero(tmp_path):
+    """A row with no measured cell is reconstructed, and the CSV must say so.
+
+    Its arithmetic is unchanged -- the same ratio, the same implied
+    temperature -- because the fraction is a provenance statement about the
+    ``T_e`` the arithmetic ran on, not an input to it.
+    """
+    row = _window_row(tmp_path, 0.8, measured_cells=0)
+    assert row["te_row_measured_fraction"] == pytest.approx(0.0, abs=1e-12)
+    assert row["ratio"] == pytest.approx(0.8, rel=1e-12)
+    assert row["te_implied_ev"] == pytest.approx(0.64 * TE_EV, rel=1e-12)
 
 
 def test_csv_carries_every_row(tmp_path):
